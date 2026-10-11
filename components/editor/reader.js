@@ -6,7 +6,7 @@ import { LexicalExtensionComposer } from '@lexical/react/LexicalExtensionCompose
 import { TableExtension } from '@lexical/table'
 import { CodeShikiSNExtension } from '@/lib/lexical/exts/shiki'
 import { CodeThemePlugin } from './plugins/core/code-theme'
-import DefaultNodes from '@/lib/lexical/nodes'
+import { ReaderNodes } from '@/lib/lexical/nodes'
 import { markdownToLexical } from '@/lib/lexical/utils/mdast'
 import { EditorRefPlugin } from '@lexical/react/LexicalEditorRefPlugin'
 import { GalleryExtension } from '@/lib/lexical/exts/gallery'
@@ -98,7 +98,7 @@ function ComposedReader ({ topLevel, state, text, html, readerRef, innerClassNam
       name: 'reader',
       namespace: 'sn-rich',
       editable: false,
-      nodes: DefaultNodes,
+      nodes: ReaderNodes,
       dependencies: [
         RichTextExtension,
         TableExtension,

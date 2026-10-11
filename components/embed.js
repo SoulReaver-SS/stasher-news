@@ -2,9 +2,9 @@ import { memo, useEffect, useRef, useState } from 'react'
 import classNames from 'classnames'
 import useDarkMode from './dark-mode'
 import { Button } from 'react-bootstrap'
-import LiteYouTubeEmbed from 'react-lite-youtube-embed'
-import 'react-lite-youtube-embed/dist/LiteYouTubeEmbed.css'
 import { XPreviewCard } from './x-preview'
+import { privacyEmbed } from '@/lib/privacy'
+import { removeYoutubeTracking } from '@/lib/url'
 
 export const NostrEmbed = memo(function NostrEmbed ({ className, darkMode, id }) {
   const [show, setShow] = useState(false)
@@ -102,6 +102,33 @@ const SpotifyEmbed = function SpotifyEmbed ({ src, className }) {
   )
 }
 
+function YouTubePlayback ({ src, watch, alternate, original }) {
+  const [play, setPlay] = useState(false)
+
+  return (
+    <div className='sn-privacy-embed'>
+      <div className='sn-privacy-embed__links'>
+        {watch && <a className='fw-bold' href={watch} target='_blank' rel='noopener noreferrer'>open privately ↗</a>}
+        {alternate && <a href={alternate} target='_blank' rel='noopener noreferrer'>try another instance ↗</a>}
+        <a href={original} target='_blank' rel='noopener noreferrer'>original on youtube ↗</a>
+        <button type='button' className='btn btn-link p-0' onClick={() => setPlay(!play)} title='Loads content directly from YouTube' aria-expanded={play}>
+          {play ? 'Hide embedded Youtube video player' : 'Show embedded Youtube video player'}
+        </button>
+      </div>
+      {play && (
+        <div className='sn-video-container'>
+          <iframe
+            title='YouTube video player'
+            src={src}
+            allowFullScreen
+            allow='autoplay; encrypted-media; picture-in-picture'
+            sandbox='allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-presentation'
+          />
+        </div>)}
+    </div>
+  )
+}
+
 const Embed = memo(function Embed ({ src, provider, id, meta, className, topLevel }) {
   const [darkMode] = useDarkMode()
   const embedClass = className || `sn-embed--${provider}`
@@ -142,15 +169,15 @@ const Embed = memo(function Embed ({ src, provider, id, meta, className, topLeve
   }
 
   if (provider === 'youtube') {
+    const playback = privacyEmbed(id, meta?.start, src)
+    if (!playback) {
+      return (
+        <p>video unavailable · <a href={removeYoutubeTracking(src)} target='_blank' rel='noopener noreferrer'>original on youtube ↗</a></p>
+      )
+    }
     return (
       <div className={classNames('sn-video-wrapper', embedClass)}>
-        <LiteYouTubeEmbed
-          id={id}
-          title='YouTube Video'
-          aspectWidth={16}
-          aspectHeight={9}
-          params={`start=${meta?.start || 0}`}
-        />
+        <YouTubePlayback key={playback.src} {...playback} />
       </div>
     )
   }

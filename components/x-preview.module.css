@@ -65,3 +65,4 @@
   color: var(--stealth-muted);
 }
 .foot a { color: var(--stealth-muted); text-decoration: none; }
+.links { display: flex; flex-wrap: wrap; gap: 4px 10px; }

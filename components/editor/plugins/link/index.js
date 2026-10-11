@@ -101,7 +101,7 @@ export default function LinkEditorPlugin ({ anchorElem }) {
 
           event.preventDefault()
 
-          const href = ensureProtocol(removeTracking(text))
+          const href = removeTracking(ensureProtocol(text))
           if (!href) return false
 
           if (!selection.isCollapsed()) {

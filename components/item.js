@@ -20,7 +20,9 @@ import { useRouter } from 'next/router'
 import { timeLeft } from '@/lib/time'
 import classNames from 'classnames'
 import removeMd from 'remove-markdown'
-import { decodeProxyUrl, IMGPROXY_URL_REGEXP, parseInternalLinks } from '@/lib/url'
+import { decodeProxyUrl, IMGPROXY_URL_REGEXP, parseInternalLinks, parseEmbedUrl, removeYoutubeTracking } from '@/lib/url'
+import Embed from './embed'
+import { privacyUrls } from '@/lib/privacy'
 import ItemPopover from './item-popover'
 import Boost from './boost-button'
 import MoneroWallRatingBadge from './monero-wall-rating-badge'
@@ -66,6 +68,7 @@ function mediaType ({ url, imgproxyUrls }) {
 
 function ItemLink ({ url, rel }) {
   try {
+    url = removeYoutubeTracking(url)
     const { linkText } = parseInternalLinks(url)
     if (linkText) {
       return (
@@ -75,14 +78,18 @@ function ItemLink ({ url, rel }) {
       )
     }
 
+    // the visible text stays the original url; only the destination is
+    // rewritten to the configured privacy frontend (youtube/x)
+    const privacy = privacyUrls(url)
+
     return (
-      // eslint-disable-next-line
-      <a
-        className={styles.link} target='_blank' href={url}
-        rel={rel ?? UNKNOWN_LINK_REL}
-      >
-        {url.replace(/(^https?:|^)\/\//, '')}
-      </a>
+      <span>
+        {/* eslint-disable-next-line react/jsx-no-target-blank */}
+        <a className={styles.link} target='_blank' href={privacy?.primary ?? url} rel={rel ?? UNKNOWN_LINK_REL}>
+          {url.replace(/(^https?:|^)\/\//, '')}
+        </a>
+        {privacy && <a className='sn-private-original' href={url} target='_blank' rel='noopener noreferrer nofollow'> original ↗</a>}
+      </span>
     )
   } catch {
     return null
@@ -99,7 +106,8 @@ export default function Item ({
   const media = mediaType({ url: item.url, imgproxyUrls: item.imgproxyUrls })
   const hasVideo = hasVideoUpload(item.imgproxyUrls)
   const { me } = useMe()
-  const showXPreview = !!item.xPreview && me?.privates?.showImagesAndVideos !== false
+  const embed = parseEmbedUrl(item.url)
+  const showXPreview = !!item.xPreview || embed?.provider === 'twitter'
 
   return (
     <>
@@ -142,13 +150,14 @@ export default function Item ({
           {!full && item.moneroWall?.locked && !props.noMoneroWallChip && (
             <span className={`badge ms-2 ${styles.moneroWallChip}`}>monerowalled</span>
           )}
-          {!full && showXPreview && <XPreviewCard xPreview={item.xPreview} url={item.url} feed />}
+          {!full && showXPreview && <XPreviewCard xPreview={item.xPreview} url={item.url} showImage={!noMedia && me?.privates?.showImagesAndVideos !== false} feed />}
           <ItemInfo
             full={full} item={item}
             onQuoteReply={onQuoteReply}
             pinnable={pinnable}
             {...props}
           />
+          {!full && embed?.provider === 'youtube' && <Embed src={item.url} {...embed} />}
           {!full && !noMedia && <CardMedia item={item} onClick={(e) => onItemClick(e, router, item)} />}
           {belowTitle}
           {item.searchText && (
