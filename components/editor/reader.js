@@ -27,9 +27,9 @@ import { SSR } from '@/lib/constants'
 const initialContentEditable = (editor, html) => {
   try {
     if (SSR) {
-      return withDOM(() => generateHTML(editor))
+      return withDOM(() => generateHTML(editor, null, true, undefined, true))
     }
-    return html || generateHTML(editor)
+    return html || generateHTML(editor, null, true, undefined, true)
   } catch (e) {
     return html || ''
   }
@@ -109,7 +109,10 @@ function ComposedReader ({ topLevel, state, text, html, readerRef, innerClassNam
       ],
       theme: {
         ...theme,
-        topLevel: topLevel && 'topLevel'
+        topLevel: topLevel && 'topLevel',
+        // read-only bodies downgrade standalone X embeds to privacy links
+        // (the item renders one cached card instead of inline embeds)
+        readerXLinks: true
       },
       $initialEditorState: (editor) => initiateEditorState(editor, state, text),
       onError: (error) => console.error('reader has encountered an error:', error)

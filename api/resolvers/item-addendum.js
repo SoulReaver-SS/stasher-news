@@ -186,7 +186,7 @@ export default {
           }
         })
         if (!lexicalState) return null
-        return lexicalHTMLGenerator(lexicalState)
+        return lexicalHTMLGenerator(lexicalState, { readerXLinks: true })
       } catch (error) {
         console.error('error generating HTML from addendum Lexical State:', error)
         return null

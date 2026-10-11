@@ -5,6 +5,8 @@ import { imgProxyEnabled, createImgproxyPath } from '@/lib/imgproxy'
 import { snFetch } from '@/lib/fetch'
 import { logInfo, logWarn } from '@/lib/logger'
 import { fetchXPreview } from '@/lib/x-preview'
+import { selectXPreviewCandidate } from '@/lib/x-preview/select'
+import { canonicalXStatus } from '@/lib/x-preview/status-url'
 
 if (!imgProxyEnabled) {
   console.warn('IMGPROXY_* env vars not set, imgproxy calls are no-ops now')
@@ -71,7 +73,25 @@ function matchUrl (matchers, url) {
 export async function imgproxy ({ data: { id, forceFetch = false }, models }) {
   const item = await models.item.findUnique({ where: { id } })
 
-  const xPreview = item.url && !isJob(item) ? await fetchXPreview(item.url) : null
+  // Publication is conditional on the content snapshot the selection used:
+  // an edit (or wall change) while this job ran must win over stale results —
+  // otherwise a stale preview could re-claim public provenance for a link the
+  // edit has since moved below the wall.
+  const contentWhere = {
+    id,
+    text: item.text,
+    url: item.url,
+    moneroWallEnabledAt: item.moneroWallEnabledAt,
+    moneroWallRemovedAt: item.moneroWallRemovedAt
+  }
+
+  // one selected status per item: the main URL first, else the first X link
+  // in the body. A failed fetch stores null and never retries a later link.
+  const candidate = !isJob(item) ? selectXPreviewCandidate(item) : null
+  const fetched = candidate ? await fetchXPreview(candidate.statusUrl) : null
+  const xPreview = fetched
+    ? { ...fetched, sourceUrl: candidate.sourceUrl, publicSource: candidate.publicSource }
+    : null
   if (xPreview?.imageUrl && imgProxyEnabled) {
     // proxy the tweet image through imgproxy so viewers never hit pbs.twimg.com
     const entries = await createImgproxyUrls(id, xPreview.imageUrl, { models, forceFetch })
@@ -82,7 +102,8 @@ export async function imgproxy ({ data: { id, forceFetch = false }, models }) {
 
   if (!imgProxyEnabled) {
     // xPreview must not depend on imgproxy env being set
-    await models.item.update({ where: { id }, data: { xPreview } })
+    const { count } = await models.item.updateMany({ where: contentWhere, data: { xPreview } })
+    if (!count) logWarn({ itemId: id }, 'imgproxy: item changed during processing, dropped stale preview')
     return
   }
 
@@ -100,7 +121,8 @@ export async function imgproxy ({ data: { id, forceFetch = false }, models }) {
 
   logInfo({ itemId: id }, 'imgproxy: updating item urls')
 
-  await models.item.update({ where: { id }, data: { imgproxyUrls, xPreview } })
+  const { count } = await models.item.updateMany({ where: contentWhere, data: { imgproxyUrls, xPreview } })
+  if (!count) logWarn({ itemId: id }, 'imgproxy: item changed during processing, dropped stale results')
 }
 
 export const createImgproxyUrls = async (id, text, { models, forceFetch }) => {
@@ -129,6 +151,9 @@ export const createImgproxyUrls = async (id, text, { models, forceFetch }) => {
       // backwards compatibility: we used to replace image urls with imgproxy urls
       url = decodeProxyUrl(url)
     }
+    // recognized X status links (native or mirror) are never media sources —
+    // probing them would fetch the submitted mirror page
+    if (canonicalXStatus(url)) continue
     // imgproxy OSS can't process videos (video thumbnails are Pro-only): /info
     // answers 422 for every video source and the resize derivatives would be
     // permanent 422s. The Upload row already knows the MIME type, so flag video

@@ -21,6 +21,7 @@ import { timeLeft } from '@/lib/time'
 import classNames from 'classnames'
 import removeMd from 'remove-markdown'
 import { decodeProxyUrl, IMGPROXY_URL_REGEXP, parseInternalLinks, parseEmbedUrl, removeYoutubeTracking } from '@/lib/url'
+import { canonicalXStatus } from '@/lib/x-preview/status-url'
 import Embed from './embed'
 import { privacyUrls } from '@/lib/privacy'
 import ItemPopover from './item-popover'
@@ -107,7 +108,9 @@ export default function Item ({
   const hasVideo = hasVideoUpload(item.imgproxyUrls)
   const { me } = useMe()
   const embed = parseEmbedUrl(item.url)
-  const showXPreview = !!item.xPreview || embed?.provider === 'twitter'
+  // hide the bare URL line only when the card shows that exact status;
+  // an unrelated main URL stays visible next to a body-derived preview
+  const mainIsSelected = canonicalXStatus(item.url)?.statusUrl === item.xPreview?.statusUrl
 
   return (
     <>
@@ -144,13 +147,13 @@ export default function Item ({
                 : media === 'image' && <span className={styles.icon}><ImageIcon className='fill-grey ms-2' height={16} width={16} /></span>}
             </Link>
             <MoneroWallRatingBadge rating={item.moneroWallRating} />
-            {item.url && !media && !showXPreview && <ItemLink url={item.url} rel={item.rel} />}
+            {item.url && !media && !mainIsSelected && <ItemLink url={item.url} rel={item.rel} />}
           </div>
           {excerpt && <p className='item-excerpt'>{excerpt}</p>}
           {!full && item.moneroWall?.locked && !props.noMoneroWallChip && (
             <span className={`badge ms-2 ${styles.moneroWallChip}`}>monerowalled</span>
           )}
-          {!full && showXPreview && <XPreviewCard xPreview={item.xPreview} url={item.url} showImage={!noMedia && me?.privates?.showImagesAndVideos !== false} feed />}
+          {!full && item.xPreview && <XPreviewCard xPreview={item.xPreview} url={item.url} showImage={!noMedia && me?.privates?.showImagesAndVideos !== false} feed />}
           <ItemInfo
             full={full} item={item}
             onQuoteReply={onQuoteReply}

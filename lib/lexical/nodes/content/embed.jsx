@@ -183,6 +183,7 @@ export class EmbedNode extends DecoratorBlockNode {
           meta={this.__meta || {}}
           className={config.theme?.embeds?.[this.__provider]?.embed}
           topLevel={!!config.theme?.topLevel}
+          readerXLinks={!!config.theme?.readerXLinks}
         />
       </BlockWithAlignableContents>
     )

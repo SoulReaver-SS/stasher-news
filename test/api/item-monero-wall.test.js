@@ -1,5 +1,7 @@
 /* eslint-env jest */
 import resolvers from '@/api/resolvers/item'
+import { Prisma } from '@prisma/client'
+import { applyItemUpdate } from '@/api/payIn/types/itemUpdate'
 
 // api/resolvers/item.js drags in heavy ESM-only transitive deps; the mocks
 // below break that chain — same pattern as test/api/resolvers/item-*.test.js.
@@ -17,6 +19,33 @@ jest.mock('../../lib/lexical/server/html', () => ({
   __esModule: true,
   lexicalHTMLGenerator: async () => ''
 }))
+
+// applyItemUpdate (Task 3 invalidation tests below) statically imports the
+// ESM-only lexical mentions chain and queries text-derived relations; stub the
+// same boundaries test/engine/payInItemUpdate.test.js stubs.
+jest.mock('../../lib/lexical/server/mentions', () => ({
+  __esModule: true,
+  extractMentions: () => ({ userNames: [], itemIds: [] })
+}))
+
+jest.mock('../../api/payIn/lib/item', () => ({
+  __esModule: true,
+  getMentions: async () => [],
+  getItemMentions: async () => [],
+  getSubs: async () => [],
+  performBotBehavior: async () => {}
+}))
+
+jest.mock('../../api/payIn/lib/upload', () => ({
+  __esModule: true,
+  getTempImgproxyUrls: async () => ({})
+}))
+
+// keep the real resolvers; only applyItemUpdate's tail getItem is stubbed
+jest.mock('../../api/resolvers/item', () => {
+  const actual = jest.requireActual('../../api/resolvers/item')
+  return { ...actual, __esModule: true, getItem: jest.fn(async () => ({})) }
+})
 
 const enabledAt = new Date('2026-09-18T00:00:00Z')
 const lockedItem = {
@@ -184,4 +213,140 @@ test('imgproxyUrls: locked viewers keep the public link (item.url) derivatives',
   }
   const urls = await resolvers.Item.imgproxyUrls(item, {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) })
   expect(Object.keys(urls)).toEqual(['https://example.com/article'])
+})
+
+// --- xPreview: one cached preview, published only when it is provably public ---
+// The worker caches the preview's `sourceUrl` and whether that source came from
+// the public main URL or the public teaser (`publicSource`). A locked viewer
+// must never receive tweet text or signed image derivatives selected from
+// below the wall; old previews without provenance fail closed unless they
+// match a validated main URL.
+const makePreview = (overrides = {}) => ({
+  statusUrl: 'https://x.com/alice/status/123',
+  sourceUrl: 'https://x.com/alice/status/123',
+  publicSource: false,
+  handle: 'alice',
+  authorName: 'Alice',
+  text: 'secret tweet text',
+  date: 'October 9, 2026',
+  image: { '640w': '/sig/tweet' },
+  ...overrides
+})
+
+const walledWithPreview = (overrides = {}) => ({
+  ...lockedItem,
+  url: 'https://example.com/article',
+  xPreview: makePreview(),
+  ...overrides
+})
+
+test('xPreview: locked viewer does not see a hidden body preview', async () => {
+  const preview = await resolvers.Item.xPreview(walledWithPreview(), {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) })
+  expect(preview).toBeNull()
+})
+
+test('xPreview: anonymous viewer does not see a hidden body preview', async () => {
+  const preview = await resolvers.Item.xPreview(walledWithPreview(), {}, { me: null, moneroWallLoader: fakeLoader(lockedState) })
+  expect(preview).toBeNull()
+})
+
+test('xPreview: entitled viewer sees the full preview', async () => {
+  const preview = await resolvers.Item.xPreview(walledWithPreview(), {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(entitledState) })
+  expect(preview.text).toBe('secret tweet text')
+  expect(preview.image['640w']).toBe('/sig/tweet')
+})
+
+test('xPreview: author sees the full preview', async () => {
+  const preview = await resolvers.Item.xPreview(walledWithPreview(), {}, { me: { id: 7 }, moneroWallLoader: fakeLoader(lockedState) })
+  expect(preview.text).toBe('secret tweet text')
+})
+
+test('xPreview: publicly unlocked item serves the full preview', async () => {
+  const item = { ...walledWithPreview(), moneroWallThresholdPiconeros: 1_000_000_000n }
+  const preview = await resolvers.Item.xPreview(item, {}, { me: null, moneroWallLoader: fakeLoader(publicState) })
+  expect(preview.text).toBe('secret tweet text')
+})
+
+test('xPreview: a preview from the public main URL passes even when locked', async () => {
+  const item = walledWithPreview({ url: 'https://x.com/alice/status/123' })
+  const preview = await resolvers.Item.xPreview(item, {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) })
+  expect(preview.statusUrl).toBe('https://x.com/alice/status/123')
+})
+
+test('xPreview: a legacy preview without provenance passes only when it matches the validated main URL', async () => {
+  const legacy = {
+    ...lockedItem,
+    url: 'https://x.com/alice/status/123',
+    xPreview: { statusUrl: 'https://x.com/alice/status/123', text: 'legacy tweet', handle: 'alice' }
+  }
+  const preview = await resolvers.Item.xPreview(legacy, {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) })
+  expect(preview.statusUrl).toBe('https://x.com/alice/status/123')
+
+  const mismatch = walledWithPreview({
+    xPreview: { statusUrl: 'https://x.com/alice/status/123', text: 'legacy tweet', handle: 'alice' }
+  })
+  expect(await resolvers.Item.xPreview(mismatch, {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) })).toBeNull()
+})
+
+test('xPreview: a teaser-derived preview is served to locked viewers', async () => {
+  const item = walledWithPreview({
+    text: 'teaser [shown](https://x.com/alice/status/123)\n[monerowall]\nsecret',
+    xPreview: makePreview({ publicSource: true })
+  })
+  const preview = await resolvers.Item.xPreview(item, {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) })
+  expect(preview.statusUrl).toBe('https://x.com/alice/status/123')
+})
+
+test('xPreview: publicSource is honored only when sourceUrl and statusUrl agree (prefix-similar data fails closed)', async () => {
+  const item = walledWithPreview({
+    xPreview: makePreview({ publicSource: true, sourceUrl: 'https://x.com/alice/status/12' })
+  })
+  expect(await resolvers.Item.xPreview(item, {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) })).toBeNull()
+})
+
+test('xPreview: non-walled items pass through untouched', async () => {
+  const item = { id: 2, userId: 7, text: 'no wall here', url: 'https://example.com/article', xPreview: makePreview() }
+  expect(await resolvers.Item.xPreview(item, {}, { me: null })).toBe(item.xPreview)
+})
+
+// --- xPreview invalidation: a content edit clears the cached preview in the
+// same write, before the async imgproxy refresh can run ---
+const editTx = (old) => ({
+  item: {
+    findUnique: jest.fn(async () => old),
+    update: jest.fn(async () => old)
+  },
+  observedTip: { findFirst: jest.fn(async () => null) },
+  $executeRaw: jest.fn(async () => 1)
+})
+
+const oldRow = {
+  ...lockedItem,
+  subNames: [],
+  imgproxyUrls: null,
+  mentions: [],
+  itemUploads: [],
+  itemReferrers: [],
+  threadSubscriptions: []
+}
+
+test('applyItemUpdate: a text edit clears the cached preview in the same write', async () => {
+  const tx = editTx(oldRow)
+  await applyItemUpdate(tx, { piconeros: 0n }, { id: 1, userId: 7, text: 'new body [t](https://x.com/alice/status/123)' })
+  const { data } = tx.item.update.mock.calls[0][0]
+  expect(data.xPreview).toBe(Prisma.DbNull)
+})
+
+test('applyItemUpdate: a url edit clears the cached preview', async () => {
+  const tx = editTx(oldRow)
+  await applyItemUpdate(tx, { piconeros: 0n }, { id: 1, userId: 7, url: 'https://x.com/new/status/9' })
+  const { data } = tx.item.update.mock.calls[0][0]
+  expect(data.xPreview).toBe(Prisma.DbNull)
+})
+
+test('applyItemUpdate: an unrelated edit leaves the cached preview alone', async () => {
+  const tx = editTx(oldRow)
+  await applyItemUpdate(tx, { piconeros: 0n }, { id: 1, userId: 7, title: 'new title' })
+  const { data } = tx.item.update.mock.calls[0][0]
+  expect('xPreview' in data).toBe(false)
 })

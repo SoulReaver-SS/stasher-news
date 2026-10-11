@@ -59,6 +59,7 @@ export const COMMENT_FIELDS = gql`
     nDirectComments
     live @client
     imgproxyUrls
+    xPreview
     rel
     apiKey
     cost
@@ -121,6 +122,7 @@ export const COMMENT_FIELDS_NO_CHILD_COMMENTS = gql`
     otsHash
     live @client
     imgproxyUrls
+    xPreview
     rel
     apiKey
     cost

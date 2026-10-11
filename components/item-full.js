@@ -58,17 +58,12 @@ function BioItem ({ item, handleClick }) {
   )
 }
 
-function ItemEmbed ({ url, imgproxyUrls, xPreview }) {
-  const { me } = useMe()
+function ItemEmbed ({ url, imgproxyUrls }) {
   const provider = parseEmbedUrl(url)
-  if (provider?.provider === 'twitter') {
-    return (
-      <div className='mt-3'>
-        <XPreviewCard xPreview={xPreview} url={url} showImage={me?.privates?.showImagesAndVideos !== false} />
-      </div>
-    )
-  }
-
+  // X previews render once at the item level next to the body — a card here
+  // would duplicate a body-derived card or show an empty faux preview when
+  // no metadata was fetched
+  if (provider?.provider === 'twitter') return null
   if (provider) {
     return (
       <div className='mt-3'>
@@ -115,11 +110,15 @@ function TopLevelItem ({ item, noReply, ...props }) {
     >
       <article className={classNames(styles.fullItemContainer, 'topLevel')} ref={textRef}>
         {item.text && <ItemText item={item} readerRef={onReaderRef} />}
+        {!item.bio && !isBelowFilter && item.xPreview &&
+          <div className='mt-3'>
+            <XPreviewCard xPreview={item.xPreview} url={item.url} showImage={me?.privates?.showImagesAndVideos !== false} />
+          </div>}
         {/* outside the item.text gate: a bodyless link/poll can carry an addendum */}
         {!item.bio && <ItemAddendum item={item} topLevel readerRef={onAddendumReaderRef} />}
         <MoneroWallPanel item={item} />
         <MoneroWallRating item={item} />
-        {item.url && !isBelowFilter && <ItemEmbed url={item.url} imgproxyUrls={item.imgproxyUrls} xPreview={item.xPreview} />}
+        {item.url && !isBelowFilter && <ItemEmbed url={item.url} imgproxyUrls={item.imgproxyUrls} />}
         {item.poll && <Poll item={item} />}
         {item.bounty &&
           <div className='fw-bold mt-2'>

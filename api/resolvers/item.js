@@ -39,6 +39,7 @@ import { itemFeeReentryFunding, feeReceivedPiconerosForPayIn } from '@/api/moner
 import {
   moneroWallEnabled, splitMoneroWallText, stripMoneroWallMarker, buildMoneroWallView, moneroWallUpdateError
 } from '@/lib/monero-wall'
+import { canonicalXStatus } from '@/lib/x-preview/status-url'
 
 export async function getItem (parent, { id }, { me, models }) {
   const [item] = await getItemsById([id], { me, models })
@@ -1060,6 +1061,21 @@ export default {
       if (item.url && item.imgproxyUrls[item.url]) filtered[item.url] = item.imgproxyUrls[item.url]
       return filtered
     },
+    // xPreview carries tweet text and signed image derivatives selected from
+    // the FULL stored text (below the wall included). A locked viewer may only
+    // see a preview proven to come from the public main URL or the public
+    // teaser; old rows written without provenance fail closed unless they
+    // match the validated main URL. One DataLoader load per walled item.
+    xPreview: async (item, args, ctx) => {
+      const preview = item.xPreview
+      if (!preview || !moneroWallEnabled(item)) return preview
+      const view = await moneroWallStateFor(item, ctx)
+      if (view && !view.locked) return preview
+      const fromPublicMain = canonicalXStatus(item.url)?.statusUrl === preview.statusUrl
+      const fromPublicTeaser = preview.publicSource === true &&
+        canonicalXStatus(preview.sourceUrl)?.statusUrl === preview.statusUrl
+      return fromPublicMain || fromPublicTeaser ? preview : null
+    },
     moneroWallRating: async (item, args, ctx) => await ctx.moneroWallRatingLoader.load(Number(item.id)),
     payIn: async (item, args, { models }) => {
       if (typeof item.payIn !== 'undefined') {
@@ -1438,7 +1454,7 @@ export default {
           }
         })
         if (!lexicalState) return null
-        return lexicalHTMLGenerator(lexicalState)
+        return lexicalHTMLGenerator(lexicalState, { readerXLinks: true })
       } catch (error) {
         console.error('error generating HTML from Lexical State:', error)
         return null

@@ -75,8 +75,17 @@ export async function imgproxyResign ({ models }) {
       const imgproxyUrls = resignImgproxyUrls(item.imgproxyUrls)
       const xPreview = resignXPreview(item.xPreview)
       if (imgproxyUrls !== item.imgproxyUrls || xPreview !== item.xPreview) {
-        await models.item.update({ where: { id: item.id }, data: { imgproxyUrls, xPreview } })
-        updated++
+        // compare-and-set on the preview the re-sign was computed from: a
+        // concurrent edit may have cleared or replaced it, and a stale write
+        // would restore a provenance claim the edit removed
+        const { count } = await models.item.updateMany({
+          where: {
+            id: item.id,
+            xPreview: { equals: item.xPreview === null ? Prisma.DbNull : item.xPreview }
+          },
+          data: { imgproxyUrls, xPreview }
+        })
+        if (count > 0) updated++
       }
     }
     cursor = items[items.length - 1].id

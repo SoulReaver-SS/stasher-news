@@ -3,7 +3,7 @@ import classNames from 'classnames'
 import useDarkMode from './dark-mode'
 import { Button } from 'react-bootstrap'
 import { XPreviewCard } from './x-preview'
-import { privacyEmbed } from '@/lib/privacy'
+import { privacyEmbed, privacyUrls } from '@/lib/privacy'
 import { removeYoutubeTracking } from '@/lib/url'
 
 export const NostrEmbed = memo(function NostrEmbed ({ className, darkMode, id }) {
@@ -129,11 +129,25 @@ function YouTubePlayback ({ src, watch, alternate, original }) {
   )
 }
 
-const Embed = memo(function Embed ({ src, provider, id, meta, className, topLevel }) {
+const Embed = memo(function Embed ({ src, provider, id, meta, className, topLevel, readerXLinks }) {
   const [darkMode] = useDarkMode()
   const embedClass = className || `sn-embed--${provider}`
 
   if (provider === 'twitter') {
+    if (readerXLinks) {
+      // read-only body: the item renders one cached card; an inline X embed
+      // becomes the same privacy-first link the server HTML paints
+      const privacy = privacyUrls(src)
+      if (!privacy) {
+        return <a href={src} target='_blank' rel='noopener noreferrer nofollow'>{src}</a>
+      }
+      return (
+        <span className='sn-private-link'>
+          <a href={privacy.primary} target='_blank' rel='noopener noreferrer nofollow'>{src}</a>{' '}
+          <a className='sn-private-original' href={privacy.original} target='_blank' rel='noopener noreferrer nofollow'>original ↗</a>
+        </span>
+      )
+    }
     return (
       <div className={classNames('sn-twitter-container', embedClass)}>
         <XPreviewCard url={src} />

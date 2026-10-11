@@ -1,4 +1,5 @@
 import { PAID_ACTION_PAYMENT_METHODS } from '@/lib/constants'
+import { Prisma } from '@prisma/client'
 import { GqlInputError } from '@/lib/error'
 import { alert } from '@/lib/alert'
 import { logWarn } from '@/lib/logger'
@@ -233,6 +234,9 @@ export async function applyItemUpdate (tx, payIn, args) {
     data: {
       ...data,
       ...(additionalCost > 0 && { cost: { increment: additionalCost } }),
+      // a content edit invalidates the cached X preview synchronously; the
+      // queued imgproxy refresh below recomputes it against the new text/url
+      ...((data.text !== undefined || data.url !== undefined) && { xPreview: Prisma.DbNull }),
       imgproxyUrls,
       pollOptions: {
         createMany: {

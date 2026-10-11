@@ -75,13 +75,33 @@ test('imgproxyResign updates only rows whose JSON changed', async () => {
         { id: 1, imgproxyUrls: { u: staleEntry }, xPreview: null },
         { id: 2, imgproxyUrls: { u2: validEntry }, xPreview: { image: staleEntry } }
       ],
-      update: async ({ where, data }) => { updates.push([where.id, data]) }
+      updateMany: async ({ where, data }) => { updates.push([where.id, data]); return { count: 1 } }
     }
   }
   await fresh.imgproxyResign({ models })
   expect(updates.map(([id]) => id)).toEqual([1, 2]) // row 2 changed via xPreview
   expect(freshLib.verifyImgproxyPath(updates[0][1].imgproxyUrls.u['640w'])).toBe(true)
   expect(freshLib.verifyImgproxyPath(updates[1][1].xPreview.image['640w'])).toBe(true)
+})
+
+test('imgproxyResign writes through a compare-and-set and skips a concurrently changed preview', async () => {
+  const staleEntry = makeEntry('http://minio:9000/uploads/1')
+  process.env.IMGPROXY_KEY = 'c'.repeat(64)
+  jest.resetModules()
+  const fresh = await import('@/worker/imgproxyResign')
+  // by write time an edit cleared/replaced the preview the resign was computed
+  // from — the CAS misses and the stale re-signed preview must NOT be restored
+  const models = {
+    item: {
+      findMany: async () => [{ id: 1, imgproxyUrls: {}, xPreview: { image: staleEntry } }],
+      updateMany: jest.fn(async () => ({ count: 0 }))
+    }
+  }
+  await fresh.imgproxyResign({ models })
+  expect(models.item.updateMany).toHaveBeenCalledTimes(1)
+  expect(models.item.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+    where: { id: 1, xPreview: { equals: { image: staleEntry } } }
+  }))
 })
 
 test('imgproxyResign with zero matching rows terminates without updates', async () => {

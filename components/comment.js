@@ -18,6 +18,7 @@ import AwardBounty from './award-bounty'
 
 import Share from './share'
 import ItemInfo from './item-info'
+import { XPreviewCard } from './x-preview'
 import Badge from 'react-bootstrap/Badge'
 import { RootProvider, useRoot } from './root'
 import { useMe } from './me'
@@ -328,6 +329,8 @@ export default function Comment ({
                 </div>
                 {/* search snippets must not present a partial original as the whole comment */}
                 {!item.searchText && <ItemAddendum item={item} readerRef={onAddendumReaderRef} />}
+                {!item.searchText && !truncate && collapse !== 'yep' && item.xPreview &&
+                  <XPreviewCard xPreview={item.xPreview} url={item.url} showImage={me?.privates?.showImagesAndVideos !== false} />}
               </>
               )}
         </div>
