@@ -5,6 +5,7 @@ import { setHealthStatus } from '@/lib/healthStatus'
 import { logWarn } from '@/lib/logger'
 import { moneroLwsUp, moneroMonerodUp, moneroMonerodHeight } from '@/lib/metrics'
 import createPrisma from '@/lib/create-prisma'
+import { monitorJobExpirations } from './jobExpiryMonitor'
 
 // healthProbe (Task D4) — periodic lws + monerod health probe.
 //
@@ -107,7 +108,21 @@ export async function runHealthProbeOnce ({
   return { lwsOk, monerodOk, height, stalled }
 }
 
-export async function healthProbe ({ persist = (result) => persistHealthSnapshot(undefined, result), ...probeOpts } = {}) {
+// The pgboss expiry monitor seam (Finding 3). The worker's jobWrapper spreads
+// `args` (incl. `models`) into the job payload, so production supplies models
+// and the default seam runs the module-singleton scan. Unit/CLI call sites
+// without models skip the scan; tests inject their own monitorJobs.
+async function defaultMonitorJobs (models) {
+  if (!models) return
+  await monitorJobExpirations(models)
+}
+
+export async function healthProbe ({
+  persist = (result) => persistHealthSnapshot(undefined, result),
+  monitorJobs = defaultMonitorJobs,
+  models,
+  ...probeOpts
+} = {}) {
   // Recurrence is cron-owned (pgboss.schedule row healthProbe); no self-requeue.
   const result = await runHealthProbeOnce(probeOpts)
   try {
@@ -118,6 +133,17 @@ export async function healthProbe ({ persist = (result) => persistHealthSnapshot
     // (the next 60s cycle retries; the app side just reads a stale row until
     // then, which its staleness window already handles).
     logWarn('healthProbe: HealthSnapshot persist failed — app-side gauges stale until the next cycle', err)
+  }
+  // The expiry monitor is an INDEPENDENT action awaited in its own try/catch:
+  // it runs on every tick regardless of the lws/monerod verdicts (the probes
+  // above already record those), a scan failure must not suppress the snapshot
+  // persist, and a persist failure must not suppress the scan. Fixed-category
+  // diagnostics only: the scan error text is never logged (it can carry SQL /
+  // connection detail) and the monitor alerts on the incidents it finds.
+  try {
+    await monitorJobs(models)
+  } catch {
+    logWarn('healthProbe: job expiry monitor failed — pgboss expirations unobserved until the next cycle')
   }
 }
 

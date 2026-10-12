@@ -1,6 +1,8 @@
 /* eslint-env jest */
-// Retry policy: every boss.send seed and self-requeue must spread BOSS_RETRY,
-// and payWeeklyPostBounty must claim via CAS (no read-then-pay).
+// Retry policy: every retry-safe boss.send seed and self-requeue spreads
+// BOSS_RETRY; money handlers that are not retry-safe opt out explicitly (see
+// rewardsDistributor below). payWeeklyPostBounty must claim via CAS (no
+// read-then-pay).
 //
 // STEP 1 AUDIT — idempotency verdicts (full evidence in
 // .superpowers/sdd/task-4-report.md):
@@ -30,11 +32,17 @@
 //     withheld for reconciliation (retryLimit stays 0: an immediate job retry
 //     would only re-scan the same sweep, the next cron tick re-runs it with
 //     fresh state).
-//   - dbBackup / rewardsDistributor: cron-owned (pgboss.schedule migrations
-//     20260808160000_schedule_db_backup / 20260807160000_schedule_rewards_distributor)
-//     — left as-is this pass; handler-side alerts + nightly/weekly cadence cover
-//     failures. dbBackup rerun is harmless (overwrites same-night file);
-//     rewardsDistributor resumable per review.
+//   - dbBackup: cron-owned (pgboss.schedule migration
+//     20260808160000_schedule_db_backup) — left as-is this pass; handler-side
+//     alerts + nightly cadence cover failures, and a rerun is harmless
+//     (overwrites same-night file).
+//   - rewardsDistributor: cron-owned, but deliberately retry-free — a retried
+//     distribution could double-pay, so every rewards job carries
+//     expireInHours 4, retryLimit 0, retryDelay 0, retryBackoff false
+//     (worker/rewardsDistributorSchedule.js; migration
+//     20261012100100_rewards_job_execution_budget). It must NOT spread
+//     BOSS_RETRY: even a nonzero retryDelay alone would imply a retry in
+//     pg-boss 9.
 //   - Not audited, out of scope this pass (still default retryLimit 0):
 //     webhookCleanup, rotateViewKeys, search indexAllItems.
 import { BOSS_RETRY } from '@/lib/constants'

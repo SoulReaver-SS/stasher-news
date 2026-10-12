@@ -159,3 +159,49 @@ test('persistHealthSnapshot upserts row id=1 with the probe fields (balance colu
     update: { lws: false, monerod: true, height: 77, stalled: false }
   })
 })
+
+// --- healthProbe() job wrapper: the pgboss expiry-monitor seam. The monitor
+// rides the same 60s tick (no new schedule) and must not be suppressed by — or
+// suppress — the HealthSnapshot persist. ---
+
+test('the pgboss expiry monitor runs even when the lws and monerod probes are down', async () => {
+  const persist = jest.fn().mockResolvedValue(undefined)
+  const monitorJobs = jest.fn().mockResolvedValue(undefined)
+  await healthProbe({ persist, monitorJobs, ...wrapperOpts(), lwsClient: lwsDown(), daemonClient: monerodDown() })
+  expect(monitorJobs).toHaveBeenCalledTimes(1)
+  expect(persist).toHaveBeenCalledWith({ lwsOk: false, monerodOk: false, height: 0, stalled: false })
+})
+
+test('a monitor failure does not skip snapshot persistence (fixed-category log, job stays green)', async () => {
+  const persist = jest.fn().mockResolvedValue(undefined)
+  const monitorJobs = jest.fn().mockRejectedValue(new Error('pgboss scan failed'))
+  await expect(healthProbe({ persist, monitorJobs, ...wrapperOpts() })).resolves.toBeUndefined()
+  expect(persist).toHaveBeenCalledTimes(1)
+  // The snapshot write is not gated on the scan: it is attempted (and here
+  // completes) before the failing monitor action runs.
+  expect(persist.mock.invocationCallOrder[0]).toBeLessThan(monitorJobs.mock.invocationCallOrder[0])
+  expect(logWarn).toHaveBeenCalledWith(expect.stringContaining('job expiry monitor failed'))
+})
+
+test('a persistence failure does not skip the pgboss expiry monitor', async () => {
+  const persist = jest.fn().mockRejectedValue(new Error('db down'))
+  const monitorJobs = jest.fn().mockResolvedValue(undefined)
+  await expect(healthProbe({ persist, monitorJobs, ...wrapperOpts() })).resolves.toBeUndefined()
+  expect(monitorJobs).toHaveBeenCalledTimes(1)
+})
+
+test('the production monitor seam scans pgboss expirations when worker models are supplied', async () => {
+  const persist = jest.fn().mockResolvedValue(undefined)
+  const models = { $queryRaw: jest.fn().mockResolvedValue([]) }
+  await healthProbe({ persist, models, ...wrapperOpts() })
+  expect(persist).toHaveBeenCalledTimes(1)
+  expect(models.$queryRaw).toHaveBeenCalledTimes(1)
+})
+
+test('without worker models the production monitor seam no-ops (job stays green)', async () => {
+  const persist = jest.fn().mockResolvedValue(undefined)
+  logWarn.mockClear()
+  await expect(healthProbe({ persist, ...wrapperOpts() })).resolves.toBeUndefined()
+  expect(persist).toHaveBeenCalledTimes(1)
+  expect(logWarn).not.toHaveBeenCalledWith(expect.stringContaining('job expiry monitor failed'))
+})

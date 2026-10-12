@@ -35,6 +35,7 @@ import { confirmFinalizer } from './confirmFinalizer'
 import { bounties } from './bounties'
 import { rewardsWalletObserver } from './rewardsWalletObserver'
 import { rewardsDistributor } from './rewardsDistributor'
+import { seedRewardsDistributor } from './rewardsDistributorSchedule'
 import { opsSweep } from './opsSweep'
 import { rotateViewKeys } from './rotateViewKeys'
 import { reconcilePendingTips } from './reconcilePendingTips'
@@ -287,10 +288,9 @@ async function work () {
   // accumulate, so on a brand-new stack we defer one run 7d (the cron then owns
   // every subsequent week). The handler does NOT self-requeue, so this cannot
   // create recurring double scheduling. `sndev monero distribute` covers any
-  // out-of-band run before that.
-  if (await boss.getQueueSize('rewardsDistributor') === 0) {
-    await boss.send('rewardsDistributor', {}, { ...BOSS_RETRY, startAfter: 7 * 24 * 60 * 60 })
-  }
+  // out-of-band run before that. The seed carries the four-hour, zero-retry
+  // execution policy (worker/rewardsDistributorSchedule.js).
+  await seedRewardsDistributor({ boss })
 
   // opsSweep: one-shot delayed cold-storage sweep of the rewards-wallet ops
   // earmark (2026-09-14 A′ decoupling). Enqueued by the rewardsDistributor

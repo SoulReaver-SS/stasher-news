@@ -9,6 +9,7 @@ import { moneroDistributionStatus } from '@/lib/metrics'
 import { opsCarry, walletScope } from '@/lib/rewardsAccounting'
 import { readRewardsInflow } from '@/api/monero/rewardsInflow'
 import { readRewardsWalletLedger } from '@/api/monero/rewardsLedger'
+import { withRewardsPhase } from './rewardsPhase'
 
 // rewardsDistributor — StasherNews' weekly rewards-pool distribution job
 // (Phase 4 Task 8 / design spec §5, §6.2). Each week it:
@@ -72,8 +73,16 @@ export async function runDistributionOnce ({ models, sendPayouts: injectSendPayo
     // this run's own work, so their QUEUED payouts are re-driven.
     await recoverStaleDistributions(db, { sendPayouts, boss, scheduleOpsSweep, getWallet })
     await warnUndeliveredDistributions(db)
-    const distribution = await distribute(db)
-    return await completeAndEnqueue(db, distribution, sendPayouts, { boss, scheduleOpsSweep, getWallet })
+    // Phase timings (Finding 3): the ledger transaction and the completion
+    // (signer + terminal flips) are timed separately so a slow-but-legitimate
+    // run is distinguishable from a hang in the phase logs. Wrapping in place
+    // preserves return/throw identity; context carries only code-owned ids.
+    const distribution = await withRewardsPhase('distribution-ledger', () => distribute(db))
+    return await withRewardsPhase(
+      'distribution-completion',
+      () => completeAndEnqueue(db, distribution, sendPayouts, { boss, scheduleOpsSweep, getWallet }),
+      { distributionId: distribution?.id }
+    )
   } finally {
     if (ownsClient) db.$disconnect().catch(logError)
   }

@@ -122,25 +122,53 @@ describe('no-op when webhook unset', () => {
   test('does not throw and does not call fetch', () => {
     delete process.env.ALERT_WEBHOOK_URL
     expect(() => alert('critical', 'x', 'y')).not.toThrow()
-    expect(alert('critical', 'x', 'y')).toBeUndefined()
+    expect(alert('critical', 'x', 'y')).toBe(false)
     expect(fetchSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('delivery outcome is observable (Finding 2)', () => {
+  // worker/jobExpiryMonitor marks a job notified only when delivery succeeded,
+  // so alert() must resolve true/false rather than undefined. Existing callers
+  // ignore the return value, so nothing else changes.
+  test('resolves true when the POST receives an OK response', async () => {
+    await expect(alert('critical', 'x', 'y')).resolves.toBe(true)
+  })
+
+  test('resolves false on a non-OK status (503)', async () => {
+    fetchSpy.mockResolvedValueOnce({ ok: false, status: 503 })
+    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
+  })
+
+  test('resolves false on a caught transport error', async () => {
+    fetchSpy.mockRejectedValueOnce(new Error('ECONNREFUSED'))
+    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
+  })
+
+  test('returns false on every skip path (unset URL, invalid level, deduped)', async () => {
+    delete process.env.ALERT_WEBHOOK_URL
+    expect(alert('critical', 'x', 'y')).toBe(false)
+    process.env.ALERT_WEBHOOK_URL = URL
+    expect(alert('boom', 'x', 'y')).toBe(false)
+    await expect(alert('critical', 'x', 'y', { dedupeKey: 'k' })).resolves.toBe(true)
+    expect(alert('critical', 'x', 'y', { dedupeKey: 'k' })).toBe(false)
   })
 })
 
 describe('alert failure never throws', () => {
   test('network rejection is swallowed', async () => {
     fetchSpy.mockRejectedValueOnce(new Error('ECONNREFUSED'))
-    await expect(alert('critical', 'x', 'y')).resolves.toBeUndefined()
+    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
   })
 
   test('non-ok HTTP response is swallowed', async () => {
     fetchSpy.mockResolvedValueOnce({ ok: false, status: 500 })
-    await expect(alert('critical', 'x', 'y')).resolves.toBeUndefined()
+    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
   })
 
   test('fetch throwing synchronously is swallowed', async () => {
     fetchSpy.mockImplementationOnce(() => { throw new Error('sync boom') })
-    await expect(alert('critical', 'x', 'y')).resolves.toBeUndefined()
+    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
   })
 })
 

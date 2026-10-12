@@ -15,6 +15,7 @@ import {
   reconcileWalletTransactions
 } from '@/api/monero/rewardsTransactions'
 import { createPaymentProofKeyProvider } from '@/api/monero/paymentProofKeys'
+import { withRewardsPhase } from '@/worker/rewardsPhase'
 
 // Rewards hot-wallet signer (Phase 4 Task 9 / design spec §5.6, §6.2).
 //
@@ -209,7 +210,10 @@ async function openRewardsWallet (models) {
     proxyToWorker: false
   })
   await ensureFeeAccounts(wallet, models)
-  await wallet.sync()
+  // wallet-initial-sync: the dominant cost of a cold open (restore-height scan,
+  // minutes to hours). Timed so a long weekly run can be attributed here rather
+  // than read as a hang. Wrapping in place preserves the error identity.
+  await withRewardsPhase('wallet-initial-sync', () => wallet.sync())
   return wallet
 }
 
@@ -300,8 +304,8 @@ export async function sendPayouts (payouts, { models, wallet } = {}) {
   // wallet's last processed height, and this only runs in the weekly
   // rewardsDistributor cron — never a web hot path. A sync error propagates to
   // finalizeDistribution (FAILED + CRITICAL, resumable next run) exactly like
-  // the balance read.
-  await w.sync()
+  // the balance read. Timed as wallet-incremental-sync (Finding 3).
+  await withRewardsPhase('wallet-incremental-sync', () => w.sync())
 
   // Journal recovery runs BEFORE live-row selection: the wallet must prove it
   // is the configured rewards wallet (accounting authority), and every
@@ -835,7 +839,14 @@ async function relayBucketTx (w, models, accountIndex, payouts, planInfo = {}) {
     return { txHash: null, sent: [], skipped: [], failed: 0, unpersisted: 0, accountingUnpersisted: 0, dropped: [], retryableSkipped: [], filled: [], retryableBuildFailure: false }
   }
   const scope = planInfo.scope || walletScope()
-  const build = await buildBucketBatch(w, accountIndex, payouts, planInfo)
+  // payout-build: create-then-relay batch construction (incl. true-fee fill
+  // retries). Timed per account so a slow build is distinguishable from a slow
+  // relay. Context is code-owned numerics only.
+  const build = await withRewardsPhase(
+    'payout-build',
+    () => buildBucketBatch(w, accountIndex, payouts, planInfo),
+    { accountIndex, payoutCount: payouts.length }
+  )
 
   if (build.failed.length > 0) {
     for (const payout of build.failed) {
@@ -893,7 +904,14 @@ async function relayBucketTx (w, models, accountIndex, payouts, planInfo = {}) {
 
   let relay
   try {
-    relay = await relayWalletTransaction({ models, wallet: w, journal, tx, keyProvider: paymentProofKeys() })
+    // payout-relay: the claim + broadcast step. Timed per account so a slow
+    // broadcast/claim is distinguishable from a slow build. Context is
+    // code-owned numerics only; the thrown error keeps its identity.
+    relay = await withRewardsPhase(
+      'payout-relay',
+      () => relayWalletTransaction({ models, wallet: w, journal, tx, keyProvider: paymentProofKeys() }),
+      { accountIndex, payoutCount: batch.length }
+    )
   } catch (err) {
     // Pair/claim failure (including an unknown claim acknowledgement): this
     // built tx was NOT broadcast, but the journal row may already be attempted
