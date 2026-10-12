@@ -10,6 +10,15 @@ jest.mock('../../lib/webPush', () => ({
   notifyStreakLost: jest.fn(() => Promise.resolve())
 }))
 
+// The scheduled-retry timing diagnostics run through this logger; mock it so
+// expected-failure tests stay quiet and no pino output leaks into test output.
+jest.mock('../../lib/logger', () => ({
+  __esModule: true,
+  logInfo: jest.fn(),
+  logWarn: jest.fn(),
+  logError: jest.fn()
+}))
+
 const prisma = new PrismaClient()
 const yesterday = utcDay(new Date(Date.now() - 86_400_000))
 const created = { users: [], streaks: [] }
@@ -524,4 +533,103 @@ test('concurrent advances for different users stay isolated', async () => {
     expect(notifications[i]?.level).toBe(5)
     expect(await prisma.streakReward.count({ where: { userId: ids[i], type: 'BOOST' } })).toBe(1)
   }
+})
+
+// --- scheduled-retry safety (2026-10-12 incident, Finding 2): pg-boss now
+// redelivers the nightly evaluation (retryLimit 3, anchored to the job's
+// original creation day). Every real-DB regression below is scoped to its own
+// fixtures and proves a redelivery can neither double-settle a day that
+// already committed nor lose a day whose transaction rolled back ---
+
+test('a scoped retry cannot consume a shield twice', async () => {
+  notifyShieldUsed.mockClear()
+  const userId = await mkUser(4)
+  const streak = await mkStreak(userId, { goldActive: true })
+  const options = { models: prisma, userIds: [userId] }
+  await evaluateQuestStreaks(options)
+  await evaluateQuestStreaks(options)
+  const after = await prisma.streak.findUnique({ where: { id: streak.id } })
+  expect(after.goldActive).toBe(false)
+  expect(after.endedAt).toBeNull()
+  expect(notifyShieldUsed).toHaveBeenCalledTimes(1)
+})
+
+test('a partial run settles the committed user once and the rest on retry', async () => {
+  notifyFlameAdvanced.mockClear()
+  const userA = await mkUser(1)
+  const streakA = await mkStreak(userA, { rewardLevel: 1 })
+  const userB = await mkUser(1)
+  const streakB = await mkStreak(userB, { rewardLevel: 1 })
+  await bothCleared(userA)
+  await bothCleared(userB)
+  const dayDate = new Date(`${yesterday}T00:00:00.000Z`)
+
+  // One-shot failure on the marker write of whichever fixture user is settled
+  // second: the first user's day commits, the second user's transaction rolls
+  // back whole — no marker, no grants, no publication.
+  const fixtureStreaks = new Set([streakA.id, streakB.id])
+  const markerWrites = new Set()
+  let injected = false
+  const faulty = prisma.$extends({
+    query: {
+      streak: {
+        async update ({ args, query }) {
+          const isMarker = args.data?.lastEvaluatedDay != null && fixtureStreaks.has(args.where.id)
+          if (isMarker && markerWrites.size > 0 && !injected) {
+            injected = true
+            throw new Error('injected retry-safety failure')
+          }
+          const result = await query(args)
+          if (isMarker) markerWrites.add(args.where.id)
+          return result
+        }
+      }
+    }
+  })
+
+  await expect(evaluateQuestStreaks({ models: faulty, userIds: [userA, userB] }))
+    .rejects.toThrow('injected retry-safety failure')
+  expect(injected).toBe(true)
+  expect(markerWrites.size).toBe(1)
+
+  const states = await prisma.streak.findMany({ where: { id: { in: [streakA.id, streakB.id] } } })
+  const committed = states.filter(s => s.lastEvaluatedDay?.getTime() === dayDate.getTime())
+  const rolledBack = states.filter(s => s.lastEvaluatedDay == null)
+  expect(committed).toHaveLength(1)
+  expect(rolledBack).toHaveLength(1)
+  const committedUser = committed[0].userId
+  const failedUser = rolledBack[0].userId
+
+  // the rolled-back attempt left no trace: no count, no ladder row, no push
+  const [failedRow] = await prisma.$queryRaw`SELECT streak FROM users WHERE id = ${failedUser}::int`
+  expect(failedRow.streak).toBe(1)
+  expect(await prisma.streakReward.count({ where: { userId: failedUser } })).toBe(0)
+  expect(notifyFlameAdvanced.mock.calls.filter(([id]) => id === failedUser)).toHaveLength(0)
+  expect(notifyFlameAdvanced.mock.calls.filter(([id]) => id === committedUser)).toHaveLength(1)
+
+  // the retry settles only the outstanding user and never re-grants for the
+  // already-committed one
+  await evaluateQuestStreaks({ models: prisma, userIds: [userA, userB] })
+  for (const id of [userA, userB]) {
+    const [row] = await prisma.$queryRaw`SELECT streak FROM users WHERE id = ${id}::int`
+    expect(row.streak).toBe(2)
+    expect(await prisma.streakReward.count({ where: { userId: id, type: 'POST' } })).toBe(1)
+    expect(notifyFlameAdvanced.mock.calls.filter(([callId]) => callId === id)).toHaveLength(1)
+  }
+  const after = await prisma.streak.findMany({ where: { id: { in: [streakA.id, streakB.id] } } })
+  for (const s of after) {
+    expect(s.lastEvaluatedDay.getTime()).toBe(dayDate.getTime())
+    expect(s.rewardLevel).toBe(2)
+  }
+  // the committed user's ladder reward count is unchanged by the retry
+  expect(await prisma.streakReward.count({ where: { userId: committedUser } })).toBe(1)
+})
+
+test('an allowlisted user with no rows is a no-op', async () => {
+  notifyFlameAdvanced.mockClear()
+  const missing = 2_000_000_000
+  await expect(evaluateQuestStreaks({ models: prisma, userIds: [missing] })).resolves.toBeUndefined()
+  expect(await prisma.streak.count({ where: { userId: missing } })).toBe(0)
+  expect(await prisma.streakReward.count({ where: { userId: missing } })).toBe(0)
+  expect(notifyFlameAdvanced).not.toHaveBeenCalled()
 })

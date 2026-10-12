@@ -2,10 +2,36 @@ import { notifyFlameAdvanced, notifyShieldUsed, notifyStreakLost } from '@/lib/w
 import { cycleDay, ladderRewardForLevel, MAX_BANKED_BOOSTS, MAX_BANKED_POSTS, MAX_BANKED_REPLIES } from '@/lib/quests'
 import { lockRewardUser, rewardNow } from '@/api/quests/boost-credit'
 import { questDay } from '@/lib/questClock'
+import { logInfo, logWarn } from '@/lib/logger'
 
 const REWARD_TYPE = { post: 'POST', reply: 'REPLY', boost: 'BOOST', turfdiscount: 'TURF_DISCOUNT' }
 const BANKED_CAP = { POST: MAX_BANKED_POSTS, REPLY: MAX_BANKED_REPLIES }
 const DAY_MS = 86_400_000
+const SLOW_TRANSACTION_MS = 1000
+
+/**
+ * Best-effort slow/failure diagnostics for one streak transaction path
+ * (2026-10-12 incident: the nightly evaluation exceeded the 10s interactive
+ * transaction timeout while a rewards distribution was running). Fields are
+ * fixed: `{ userId, day, path, lockAcquireMs, transactionMs, outcome }`, where
+ * `path` is 'advance' (cleared-day advance) or 'missed' (missed-day settle)
+ * and `lockAcquireMs` is the caller-sampled interval AROUND lockRewardUser —
+ * it includes network/event-loop delay, so it is lock ACQUISITION time, not
+ * proven PostgreSQL lock wait. A committed transaction is logged (logInfo)
+ * only when it took at least SLOW_TRANSACTION_MS; a failed one is logged
+ * (logWarn) regardless of elapsed time. Emission is best-effort: a logger
+ * failure must never mask a transaction failure or a committed outcome, so it
+ * is swallowed here. Never receives exception text or query parameters.
+ */
+function logStreakTransactionTiming (fields) {
+  try {
+    if (fields.outcome === 'committed') {
+      if (fields.transactionMs >= SLOW_TRANSACTION_MS) logInfo(fields, 'streak transaction slow')
+    } else {
+      logWarn(fields, 'streak transaction failed')
+    }
+  } catch { /* diagnostics never change the transaction outcome */ }
+}
 
 /**
  * Advance the flame for a UTC day whose quests are cleared (spec §4.5). The
@@ -25,44 +51,62 @@ export async function advanceQuestStreak ({ models, userId, day, requirePrevSett
   const prevDate = new Date(dayDate.getTime() - DAY_MS)
   let notification = null
 
-  await models.$transaction(async tx => {
-    // Serialize reward writes for the user first (task 3): the row lock must
-    // precede every read below, so a concurrent sweep/evaluation of the same
-    // day blocks until this transaction commits and then re-reads the settled
-    // guard, seeing the day already advanced instead of double-granting.
-    if (!await lockRewardUser(tx, userId)) return
-    const user = await tx.user.findUnique({ where: { id: userId }, select: { streak: true } })
-    if (!user) return
-    const streak = await tx.streak.findFirst({ where: { userId, type: 'FLAME', endedAt: null } })
+  const transactionStart = Date.now()
+  let lockAcquireMs = null
+  let outcome = 'failed'
+  try {
+    await models.$transaction(async tx => {
+      // Serialize reward writes for the user first (task 3): the row lock must
+      // precede every read below, so a concurrent sweep/evaluation of the same
+      // day blocks until this transaction commits and then re-reads the settled
+      // guard, seeing the day already advanced instead of double-granting.
+      const lockStart = Date.now()
+      const locked = await lockRewardUser(tx, userId)
+      lockAcquireMs = Date.now() - lockStart
+      if (!locked) return
+      const user = await tx.user.findUnique({ where: { id: userId }, select: { streak: true } })
+      if (!user) return
+      const streak = await tx.streak.findFirst({ where: { userId, type: 'FLAME', endedAt: null } })
 
-    // Day guard: never count the same UTC day twice for one streak run.
-    if (streak?.lastEvaluatedDay && streak.lastEvaluatedDay >= dayDate) return
-    // Settled-run guard: with no active streak, a day at or before the last
-    // (ended) run's settled day already belongs to that run — re-advancing it
-    // would phantom-restart the run and collide with its row on the unique key.
-    if (!streak) {
-      const last = await tx.streak.findFirst({
-        where: { userId, type: 'FLAME', endedAt: { not: null } },
-        orderBy: { startedAt: 'desc' },
-        select: { lastEvaluatedDay: true }
+      // Day guard: never count the same UTC day twice for one streak run.
+      if (streak?.lastEvaluatedDay && streak.lastEvaluatedDay >= dayDate) return
+      // Settled-run guard: with no active streak, a day at or before the last
+      // (ended) run's settled day already belongs to that run — re-advancing it
+      // would phantom-restart the run and collide with its row on the unique key.
+      if (!streak) {
+        const last = await tx.streak.findFirst({
+          where: { userId, type: 'FLAME', endedAt: { not: null } },
+          orderBy: { startedAt: 'desc' },
+          select: { lastEvaluatedDay: true }
+        })
+        if (last?.lastEvaluatedDay && last.lastEvaluatedDay >= dayDate) return
+      }
+      // Deferral guard: the previous day's outcome is still pending, so this day's
+      // level is not knowable yet.
+      if (requirePrevSettled && streak && (!streak.lastEvaluatedDay || streak.lastEvaluatedDay < prevDate)) return
+
+      const level = (user.streak ?? 0) + 1
+      const row = streak ?? await tx.streak.create({
+        data: { userId, type: 'FLAME', startedAt: dayDate }
       })
-      if (last?.lastEvaluatedDay && last.lastEvaluatedDay >= dayDate) return
-    }
-    // Deferral guard: the previous day's outcome is still pending, so this day's
-    // level is not knowable yet.
-    if (requirePrevSettled && streak && (!streak.lastEvaluatedDay || streak.lastEvaluatedDay < prevDate)) return
-
-    const level = (user.streak ?? 0) + 1
-    const row = streak ?? await tx.streak.create({
-      data: { userId, type: 'FLAME', startedAt: dayDate }
+      await tx.user.update({ where: { id: userId }, data: { streak: level } })
+      const rewards = await grantLadderRewards({ models: tx, userId, streak: row, from: row.rewardLevel, to: level })
+      // Read the row back AFTER the grants: grantLadderRewards may have armed the
+      // shield, and the arming advance must report the post-grant goldFlame.
+      const settled = await tx.streak.update({ where: { id: row.id }, data: { lastEvaluatedDay: dayDate } })
+      notification = { kind: 'advanced', level, cycleDay: cycleDay(level), goldFlame: settled.goldActive, rewards }
     })
-    await tx.user.update({ where: { id: userId }, data: { streak: level } })
-    const rewards = await grantLadderRewards({ models: tx, userId, streak: row, from: row.rewardLevel, to: level })
-    // Read the row back AFTER the grants: grantLadderRewards may have armed the
-    // shield, and the arming advance must report the post-grant goldFlame.
-    const settled = await tx.streak.update({ where: { id: row.id }, data: { lastEvaluatedDay: dayDate } })
-    notification = { kind: 'advanced', level, cycleDay: cycleDay(level), goldFlame: settled.goldActive, rewards }
-  })
+    outcome = 'committed'
+  } finally {
+    logStreakTransactionTiming({
+      userId,
+      day,
+      path: 'advance',
+      lockAcquireMs,
+      transactionMs: Date.now() - transactionStart,
+      outcome
+    })
+  }
 
   return notification
 }
@@ -117,30 +161,66 @@ export async function evaluateQuestStreaks ({ models, now = new Date(), userIds 
       // re-read under it, so this cannot interleave with a concurrent advance
       // of the same day. `user.streak` from the outer loop is stale by design:
       // the shield payload uses the re-read value.
-      await models.$transaction(async tx => {
-        if (!await lockRewardUser(tx, userId)) return
-        const current = await tx.user.findUnique({ where: { id: userId }, select: { streak: true } })
-        if (!current) return
-        const streak = await tx.streak.findFirst({ where: { userId, type: 'FLAME', endedAt: null } })
-        if (!streak) return
-        if (streak.lastEvaluatedDay && streak.lastEvaluatedDay >= dayDate) return
+      const transactionStart = Date.now()
+      let lockAcquireMs = null
+      let outcome = 'failed'
+      try {
+        await models.$transaction(async tx => {
+          const lockStart = Date.now()
+          const locked = await lockRewardUser(tx, userId)
+          lockAcquireMs = Date.now() - lockStart
+          if (!locked) return
+          const current = await tx.user.findUnique({ where: { id: userId }, select: { streak: true } })
+          if (!current) return
+          const streak = await tx.streak.findFirst({ where: { userId, type: 'FLAME', endedAt: null } })
+          if (!streak) return
+          if (streak.lastEvaluatedDay && streak.lastEvaluatedDay >= dayDate) return
 
-        await tx.streak.update({ where: { id: streak.id }, data: { lastEvaluatedDay: dayDate } })
-        if (streak.goldActive) {
-          await tx.streak.update({ where: { id: streak.id }, data: { goldActive: false } })
-          notification = { kind: 'shield', day: cycleDay(current.streak) }
-        } else {
-          await tx.streak.update({ where: { id: streak.id }, data: { endedAt: dayDate } })
-          await tx.user.update({ where: { id: userId }, data: { streak: null } })
-          notification = { kind: 'lost', streak }
-        }
-      })
+          await tx.streak.update({ where: { id: streak.id }, data: { lastEvaluatedDay: dayDate } })
+          if (streak.goldActive) {
+            await tx.streak.update({ where: { id: streak.id }, data: { goldActive: false } })
+            notification = { kind: 'shield', day: cycleDay(current.streak) }
+          } else {
+            await tx.streak.update({ where: { id: streak.id }, data: { endedAt: dayDate } })
+            await tx.user.update({ where: { id: userId }, data: { streak: null } })
+            notification = { kind: 'lost', streak }
+          }
+        })
+        outcome = 'committed'
+      } finally {
+        logStreakTransactionTiming({
+          userId,
+          day,
+          path: 'missed',
+          lockAcquireMs,
+          transactionMs: Date.now() - transactionStart,
+          outcome
+        })
+      }
     }
 
     if (notification?.kind === 'advanced') notifyFlameAdvanced(userId, notification).catch(console.error)
     else if (notification?.kind === 'shield') notifyShieldUsed(userId).catch(console.error)
     else if (notification?.kind === 'lost') notifyStreakLost(userId, notification.streak).catch(console.error)
   }
+}
+
+/**
+ * Scheduled 'streak' entry point (worker/index.js). pg-boss retries redeliver
+ * the SAME job and, because the work registration enables includeMetadata,
+ * expose its original creation time as `createdon` (Job.createdon — the row's
+ * createdOn column). Anchoring to that timestamp means an attempt that lands
+ * after 00:00 UTC still evaluates the day the cron fired for: the evaluator's
+ * day guards make any newer settled day a clean no-op, never a backdated
+ * replay. Missing or malformed metadata fails loudly with a fixed error code
+ * instead of silently evaluating a different day. Direct callers keep calling
+ * evaluateQuestStreaks with an explicit `now`.
+ */
+export async function runScheduledStreak ({ models, createdon, evaluate = evaluateQuestStreaks }) {
+  if (createdon == null) throw new Error('STREAK_JOB_CREATION_TIME_REQUIRED')
+  const now = new Date(createdon)
+  if (!Number.isFinite(now.getTime())) throw new Error('STREAK_JOB_CREATION_TIME_INVALID')
+  await evaluate({ models, now })
 }
 
 /**

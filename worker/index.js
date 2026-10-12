@@ -8,7 +8,7 @@ import { trust } from './trust'
 import { ApolloClient, HttpLink, InMemoryCache } from '@apollo/client'
 import { indexItem, indexAllItems } from './search'
 import { timestampItem } from './ots'
-import { evaluateQuestStreaks } from './streak'
+import { runScheduledStreak } from './streak'
 import { sweepQuestCompletions } from './quests'
 import { nip57 } from './nostr'
 import fetch from 'cross-fetch'
@@ -168,7 +168,10 @@ async function work () {
     await boss.send('trust', {}, { ...BOSS_RETRY, startAfter: 24 * 60 * 60 })
   }
   await boss.work('timestampItem', { includeMetadata: true }, jobWrapper(timestampItem))
-  await boss.work('streak', { includeMetadata: true }, jobWrapper(evaluateQuestStreaks))
+  // runScheduledStreak anchors each attempt (including a pg-boss retry that
+  // lands after UTC midnight) to the job's original createdon, so a retry still
+  // evaluates the day the 00:10 UTC cron fired for — see worker/streak.js.
+  await boss.work('streak', { includeMetadata: true }, jobWrapper(runScheduledStreak))
   await boss.work('questSweep', { includeMetadata: true }, jobWrapper(sweepQuestCompletions))
   await boss.work('nip57', { includeMetadata: true }, jobWrapper(nip57))
   await boss.work('deleteItem', { includeMetadata: true }, jobWrapper(deleteItem))
