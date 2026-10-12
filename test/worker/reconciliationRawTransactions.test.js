@@ -20,6 +20,21 @@ const rawBytes = (h, bytes) => ({ hash: h, extra: Buffer.from(bytes) })
 
 const stubSleep = () => jest.fn(async () => {})
 
+test('warm raw-cache reads yield without losing cached evidence', async () => {
+  const hashes = [hash(1), hash(2)]
+  const daemon = makeDaemon(async batch => batch.map(raw))
+  const reader = createReconciliationRawReader({ daemon })
+  await reader.read(hashes)
+  let heartbeat = false
+  setImmediate(() => { heartbeat = true })
+  const checkpoint = () => new Promise(resolve => setImmediate(resolve))
+  const out = await reader.read(hashes, checkpoint)
+  expect(heartbeat).toBe(true)
+  expect(out.raws.map(r => r.hash)).toEqual(hashes)
+  expect(out.stats.cached).toBe(2)
+  expect(daemon.getTransactions).toHaveBeenCalledTimes(1)
+})
+
 function makeDaemon (responder) {
   return { getTransactions: jest.fn(responder) }
 }

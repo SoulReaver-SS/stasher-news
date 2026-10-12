@@ -613,6 +613,26 @@ test('fallback recovers a PENDING tip when lws serves the sender-side pid (raw-d
     expect.objectContaining({ dedupeKey: 'lws-pid-misattribution' }))
 })
 
+test('raw recovery yields before processing the remaining history', async () => {
+  const t = tip({ paymentId: '661bf254912cb9f7', tipperId: 6 })
+  const fx = wrongPidFixture({ pidHex: t.paymentId, txHash: 'paid' })
+  let heartbeat = false
+  const checkpoint = () => new Promise(resolve => setImmediate(() => { heartbeat = true; resolve() }))
+  const models = {
+    observedTip: { findMany: async () => [t], updateMany: jest.fn() },
+    moneroAccount: { findMany: async () => [fx.account({ viewKey: fx.viewKey })] },
+    $transaction: async fn => fn({ $executeRaw: async () => 1 })
+  }
+  const out = await runReconcilePendingTipsOnce({
+    models, checkpoint,
+    lwsClient: { getAddressTxs: async () => ({ transactions: [{ hash: 'paid', payment_id: 'wrong', timestamp: '2020-01-01T00:00:00Z', piconeros: 1n }] }) },
+    daemonClient: fx.daemon,
+    apply: async () => { expect(heartbeat).toBe(true); return 1n }
+  })
+  expect(out.recovered).toBe(1)
+  expect(models.observedTip.updateMany).not.toHaveBeenCalled()
+})
+
 test('fallback recovery goes through the self-send exclusion check (spent_outputs honored)', async () => {
   const realPid = 'a0211a0a2c1217c6'
   const servedPid = '871967eaeb0fa5e4'

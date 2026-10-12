@@ -3,7 +3,7 @@ import { daemonClient } from '@/api/monero/daemonClient'
 import { applySubFeeReceipt } from '@/api/monero/subFeeObservation'
 import { isSelfSend } from '@/api/monero/selfTip'
 import { decryptViewKey } from '@/api/monero/viewkey'
-import { paymentIdCandidates } from '@/api/monero/pidDecrypt'
+import { createReconciliationCheckpoint, scanRawPaymentIds } from '@/worker/reconciliationScan'
 import { getReconciliationRawReader } from '@/worker/reconciliationRawTransactions'
 import { alert } from '@/lib/alert'
 
@@ -87,7 +87,7 @@ async function replayOwnerReceipt ({ models, account, leg, tx }) {
 // response that omits or invents hashes can never stand in for the requested
 // transaction. A candidate hash yielding more than one distinct active pid is
 // refused outright (ambiguous attribution is not evidence for either leg).
-async function findRawFeeMatches ({ rawReader, account, rowsByHash, legByPid }) {
+async function findRawFeeMatches ({ rawReader, account, rowsByHash, legByPid, checkpoint }) {
   const hashes = [...rowsByHash.keys()]
   if (!hashes.length) return []
   const startedAt = Date.now()
@@ -97,12 +97,12 @@ async function findRawFeeMatches ({ rawReader, account, rowsByHash, legByPid }) 
   const viewKeyHex = decryptViewKey(account.viewKey)
   const matches = []
   const seen = new Set()
-  for (const raw of raws) {
+  for await (const { raw, pids: candidates } of scanRawPaymentIds(raws, viewKeyHex, checkpoint)) {
     const hash = String(raw.hash ?? '').toLowerCase()
     const tx = rowsByHash.get(hash)
     if (!tx || seen.has(hash)) continue
     seen.add(hash)
-    const pids = [...new Set(paymentIdCandidates(raw.extra, viewKeyHex))].filter(pid => legByPid.has(pid))
+    const pids = [...new Set(candidates)].filter(pid => legByPid.has(pid))
     if (pids.length === 1) matches.push({ tx, leg: legByPid.get(pids[0]) })
     if (pids.length > 1) {
       alert('warn', 'owner-fee ambiguous raw payment id refused',
@@ -122,7 +122,7 @@ async function findRawFeeMatches ({ rawReader, account, rowsByHash, legByPid }) 
   return matches
 }
 
-export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient, daemonClient: daemon = null, rawReader = null }) {
+export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient, daemonClient: daemon = null, rawReader = null, checkpoint = createReconciliationCheckpoint() }) {
   // Injected reader wins; otherwise the shared per-daemon reader; with neither
   // the raw pass keeps its legacy no-op (existing core callers/tests).
   const reader = rawReader ?? (daemon ? getReconciliationRawReader(daemon) : null)
@@ -158,6 +158,8 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
   let replayed = 0
   let pidFallback = 0
   for (const [ownerUserId, ownerLegs] of byOwner) {
+    const pause = checkpoint()
+    if (pause) await pause
     const account = await models.moneroAccount.findFirst({
       where: { ownerUserId, status: 'ACTIVE' },
       include: { viewKey: true, subaddresses: true }
@@ -210,7 +212,7 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
     let rawMatches = []
     if (reader && rawRows.size) {
       try {
-        rawMatches = await findRawFeeMatches({ rawReader: reader, account, rowsByHash: rawRows, legByPid })
+        rawMatches = await findRawFeeMatches({ rawReader: reader, account, rowsByHash: rawRows, legByPid, checkpoint })
       } catch {
         // Fixed-category diagnostics only: transport/crypto error text can
         // embed sensitive input (key material, raw payloads), so neither this

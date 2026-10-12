@@ -1,6 +1,7 @@
 import { Mutex } from 'async-mutex'
 import { setTimeout as defaultSleep } from 'node:timers/promises'
 import { MAX_TX_HASHES_PER_REQUEST } from '@/api/monero/daemonClient'
+import { createReconciliationCheckpoint } from '@/worker/reconciliationScan'
 
 // reconciliationRawTransactions — shared bounded raw-`extra` reader for the
 // reconciliation workers (Finding 1).
@@ -198,7 +199,7 @@ export function createReconciliationRawReader ({
    *   RAW_SCAN_BUDGET_EXHAUSTED, or a typed daemon error
    *   (DAEMON_TIMEOUT / DaemonHttpError / DaemonRpcError) untouched.
    */
-  async function read (hashes) {
+  async function read (hashes, checkpoint = createReconciliationCheckpoint()) {
     const requested = normalizeRequestedHashes(hashes)
     const stats = { requested: requested.length, cached: 0, fetched: 0, batches: 0, retries: 0 }
     // Caller-local pinned results. Snapshot hits BEFORE fetching so a later
@@ -207,6 +208,8 @@ export function createReconciliationRawReader ({
     const pinned = new Map()
 
     for (const hash of requested) {
+      const pause = checkpoint()
+      if (pause) await pause
       const hit = cache.get(hash)
       if (hit) {
         pinned.set(hash, promote(hash))
@@ -223,6 +226,8 @@ export function createReconciliationRawReader ({
         // the acquisition pass; those count as cache hits, not fetches.
         const stillMissing = []
         for (const hash of misses) {
+          const pause = checkpoint()
+          if (pause) await pause
           const hit = cache.get(hash)
           if (hit) {
             pinned.set(hash, promote(hash))
@@ -247,6 +252,8 @@ export function createReconciliationRawReader ({
     const raws = []
     const missingHashes = []
     for (const hash of requested) {
+      const pause = checkpoint()
+      if (pause) await pause
       const record = pinned.get(hash)
       if (record) raws.push({ hash, extra: Buffer.from(record.extra) })
       else missingHashes.push(hash)

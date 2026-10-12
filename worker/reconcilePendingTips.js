@@ -2,7 +2,7 @@ import { Prisma } from '@prisma/client'
 import { lwsClient } from '@/api/monero/lwsClient'
 import { daemonClient } from '@/api/monero/daemonClient'
 import { decryptViewKey } from '@/api/monero/viewkey'
-import { paymentIdCandidates } from '@/api/monero/pidDecrypt'
+import { createReconciliationCheckpoint, scanRawPaymentIds, prioritizeRecentTransactions } from '@/worker/reconciliationScan'
 import { getReconciliationRawReader } from '@/worker/reconciliationRawTransactions'
 import { applyTipDetected } from '@/api/monero/ranking'
 import { shouldExcludeTip, resolveItemSubName } from '@/api/monero/selfTip'
@@ -173,10 +173,10 @@ async function claimTip ({ models, apply, tip, tx, amount, direct, isExcluded })
 // them) + `complete`: every candidate hash had usable raw evidence right now.
 // THROWS on daemon/view-key failure so the caller can defer the expiry decision
 // (a paid tip must never be expired because a lookup failed).
-async function recoverByRawDecrypt ({ models, apply, rawReader, account, transactions, tips }) {
+async function recoverByRawDecrypt ({ models, apply, rawReader, account, transactions, tips, checkpoint }) {
   const pendingPids = new Set(tips.map(t => String(t.paymentId).toLowerCase()))
   const rowByHash = new Map()
-  for (const row of transactions || []) {
+  for (const row of prioritizeRecentTransactions(transactions || [], tips)) {
     if (!row.hash) continue
     const h = String(row.hash).toLowerCase()
     if (!rowByHash.has(h)) rowByHash.set(h, row)
@@ -203,12 +203,17 @@ async function recoverByRawDecrypt ({ models, apply, rawReader, account, transac
   // recipient-side pid -> tx row (first hit wins; 8-byte pid collisions
   // between different txs of one account are 2^-64-negligible)
   const rowByCandidatePid = new Map()
-  for (const raw of raws) {
+  let scanned = 0
+  for await (const { raw, pids } of scanRawPaymentIds(raws, viewKeyHex, checkpoint)) {
+    scanned++
     const row = rowByHash.get(String(raw.hash).toLowerCase())
     if (!row) continue
-    for (const pid of paymentIdCandidates(raw.extra, viewKeyHex)) {
-      if (!rowByCandidatePid.has(pid)) rowByCandidatePid.set(pid, row)
+    for (const pid of pids) {
+      if (pendingPids.has(pid) && !rowByCandidatePid.has(pid)) rowByCandidatePid.set(pid, row)
     }
+    // Positive proof for every pending PID needs no more crypto. A losing
+    // claim below still defers expiry unless we exhausted all raw evidence.
+    if (rowByCandidatePid.size === pendingPids.size) break
   }
 
   let recovered = 0
@@ -233,11 +238,13 @@ async function recoverByRawDecrypt ({ models, apply, rawReader, account, transac
   // A partial response still yields every positively proven claim above, but
   // the missing subset means the remaining unmatched tips are NOT proven
   // nonpayers: the caller defers their expiry to the next 2-min run.
-  return { recovered, excluded, claimedTipIds, complete: missingHashes.length === 0 }
+  const complete = claimedTipIds.size === tips.length || (scanned === raws.length && missingHashes.length === 0)
+  return { recovered, excluded, claimedTipIds, complete }
 }
 
 export async function runReconcilePendingTipsOnce ({
-  models, lwsClient: client = lwsClient, apply = applyTipDetected, daemonClient: daemon = null, rawReader = null
+  models, lwsClient: client = lwsClient, apply = applyTipDetected, daemonClient: daemon = null, rawReader = null,
+  checkpoint = createReconciliationCheckpoint()
 }) {
   // Injected reader wins; otherwise the shared per-daemon reader; with neither
   // the raw pass keeps its legacy no-op (existing core callers/tests).
@@ -269,6 +276,8 @@ export async function runReconcilePendingTipsOnce ({
   let excluded = 0
   let pidFallback = 0
   for (const account of accounts) {
+    const pause = checkpoint()
+    if (pause) await pause
     const tips = byAccount.get(account.id) || []
     // Unregistered/soft-deleted accounts (view key wiped, status INACTIVE) can't be
     // scanned — walletLogin throws on a missing viewKey relation, which would abort
@@ -314,7 +323,7 @@ export async function runReconcilePendingTipsOnce ({
     if (unmatched.length && reader && !unscannable) {
       try {
         const out = await recoverByRawDecrypt({
-          models, apply, rawReader: reader, account, transactions: scanTxs, tips: unmatched
+          models, apply, rawReader: reader, account, transactions: scanTxs, tips: unmatched, checkpoint
         })
         recovered += out.recovered
         excluded += out.excluded
