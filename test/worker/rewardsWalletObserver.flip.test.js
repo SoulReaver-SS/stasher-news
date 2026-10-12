@@ -19,10 +19,11 @@
 
 import { randomUUID } from 'node:crypto'
 import { PrismaClient } from '@prisma/client'
-import { runRewardsWalletObserverOnce } from '@/worker/rewardsWalletObserver'
+import { runRewardsWalletObserverOnce, flipPendingToLive } from '@/worker/rewardsWalletObserver'
+import { runAbandonFeeItemsOnce } from '@/worker/abandonFeeItems'
 import { alert } from '@/lib/alert'
 import { logError } from '@/lib/logger'
-import { denormalizeComment } from '@/lib/itemLiveEffects'
+import { denormalizeComment, runItemLiveSideEffects } from '@/lib/itemLiveEffects'
 import { consumeQuotaForFlippedItem } from '@/api/payIn/lib/freebie'
 import { sweepFakeRewardsWallets } from '../helpers/sweepRewardsWallets'
 
@@ -63,6 +64,7 @@ beforeEach(() => {
   jest.clearAllMocks()
   denormalizeComment.mockReset()
   consumeQuotaForFlippedItem.mockReset()
+  runItemLiveSideEffects.mockReset()
 })
 
 afterEach(async () => {
@@ -291,4 +293,129 @@ test('a throwing quota consumption cannot roll back the flip or wedge the pass (
 
   // the pass continued
   expect((await prisma.item.findUnique({ where: { id: later.item.id } })).feeStatus).toBe('FEE_PAID')
+})
+
+// --- Finding 5: deleted content must never enter the live path ---
+// deleteItemByAuthor keeps feeStatus PENDING_FEE + feePayInId, so a fee that
+// lands after the deletion used to win the ITEM_CREATE pending-to-paid claim:
+// the deleted item flipped FEE_PAID, consumed quota, denormalized its ancestors
+// and fired creation notifications. The receipt is still recorded (incoming
+// funds stay accounted for); only the live claim refuses.
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+test('a deleted pending post cannot flip live when its fee is observed', async () => {
+  const { item, payIn, major, minor } = await seedPendingFeePost(309)
+  const deletedAt = new Date(Date.now() - 60 * 60 * 1000)
+  await prisma.item.update({ where: { id: item.id }, data: { deletedAt } })
+
+  await runRewardsWalletObserverOnce({
+    models: prisma,
+    account: rewardsWallet,
+    txs: [lwsFeeTx(txHash(), '1000000000', major, minor)]
+  })
+
+  // the receipt itself is still recorded
+  const obs = await prisma.feeObservation.findFirst({ where: { payInId: payIn.id } })
+  expect(obs).toBeTruthy()
+
+  // ...but the deleted item never wins the pending-to-paid claim
+  const after = await prisma.item.findUnique({ where: { id: item.id } })
+  expect(after.feeStatus).toBe('PENDING_FEE')
+  expect(after.feeInvestmentPiconeros).toBe(0n)
+  expect(after.deletedAt).toEqual(deletedAt)
+  expect(runItemLiveSideEffects).not.toHaveBeenCalled()
+  expect(consumeQuotaForFlippedItem).not.toHaveBeenCalled()
+  expect(denormalizeComment).not.toHaveBeenCalled()
+})
+
+test('a deleted pending reply consumes no quota, denormalizes nothing, and does not publish', async () => {
+  const { root, comment, payIn, major, minor } = await seedPendingFeeComment(310)
+  await prisma.item.update({
+    where: { id: comment.id },
+    data: { deletedAt: new Date(Date.now() - 60 * 60 * 1000), feeQuotaEligible: true }
+  })
+
+  await runRewardsWalletObserverOnce({
+    models: prisma,
+    account: rewardsWallet,
+    txs: [lwsFeeTx(txHash(), '1000000000', major, minor)]
+  })
+
+  const obs = await prisma.feeObservation.findFirst({ where: { payInId: payIn.id } })
+  expect(obs).toBeTruthy()
+
+  const after = await prisma.item.findUnique({ where: { id: comment.id } })
+  expect(after.feeStatus).toBe('PENDING_FEE')
+  expect(consumeQuotaForFlippedItem).not.toHaveBeenCalled()
+  expect(denormalizeComment).not.toHaveBeenCalled()
+  expect(runItemLiveSideEffects).not.toHaveBeenCalled()
+  const rootAfter = await prisma.item.findUnique({ where: { id: root.id } })
+  expect(rootAfter.ncomments).toBe(0)
+  expect(rootAfter.nDirectComments).toBe(0)
+})
+
+// --- deletion/payment race orderings (separate clients, awaited barriers,
+// no timing sleeps) ---
+
+test('race ordering: a fee flip committed first keeps its paid linkage through the sweep', async () => {
+  const flipper = new PrismaClient()
+  try {
+    const { item, payIn } = await seedPendingFeePost(311)
+    // Age past the abandonment cutoff so the sweep WOULD claim the row if it
+    // were still PENDING_FEE.
+    await prisma.item.update({ where: { id: item.id }, data: { createdAt: new Date(Date.now() - 2 * DAY_MS) } })
+
+    // Barrier: the flip's transaction commits on its own client first.
+    await flipPendingToLive(flipper, payIn, 1_000_000_000n)
+
+    // Only then does the sweep run (suite connection).
+    const out = await runAbandonFeeItemsOnce({ models: prisma })
+
+    expect(out.abandoned).toBe(0)
+    expect(await prisma.payIn.findUnique({ where: { id: payIn.id } })).not.toBeNull()
+    const after = await prisma.item.findUnique({ where: { id: item.id } })
+    expect(after.feeStatus).toBe('FEE_PAID')
+    expect(after.feePayInId).toBe(payIn.id)
+    expect(after.deletedAt).toBeNull()
+    expect(await prisma.itemPayIn.findFirst({ where: { itemId: item.id } })).not.toBeNull()
+  } finally {
+    await flipper.$disconnect()
+  }
+})
+
+test('race ordering: an abandonment that claims first makes the later fee flip a no-op', async () => {
+  const late = new PrismaClient()
+  try {
+    const { item, payIn, major, minor } = await seedPendingFeePost(312)
+    await prisma.item.update({
+      where: { id: item.id },
+      data: { createdAt: new Date(Date.now() - 2 * DAY_MS), feeQuotaEligible: true }
+    })
+
+    // Barrier: the sweep claims and commits first, deleting the linkage.
+    const out = await runAbandonFeeItemsOnce({ models: prisma })
+    expect(out.abandoned).toBe(1)
+
+    // The late fee event arrives afterwards on a separate client. The PayIn is
+    // gone, so attribution finds no pending leg and the stale in-memory PayIn
+    // cannot win a flip either.
+    await runRewardsWalletObserverOnce({
+      models: late,
+      account: rewardsWallet,
+      txs: [lwsFeeTx(txHash(), '1000000000', major, minor)]
+    })
+    await flipPendingToLive(late, payIn, 1_000_000_000n)
+
+    expect(await prisma.feeObservation.count({ where: { payInId: payIn.id } })).toBe(0)
+    const after = await prisma.item.findUnique({ where: { id: item.id } })
+    expect(after.feeStatus).toBe('PENDING_FEE')
+    expect(after.deletedAt).not.toBeNull()
+    expect(after.feeInvestmentPiconeros).toBe(0n)
+    expect(runItemLiveSideEffects).not.toHaveBeenCalled()
+    expect(consumeQuotaForFlippedItem).not.toHaveBeenCalled()
+    expect(denormalizeComment).not.toHaveBeenCalled()
+  } finally {
+    await late.$disconnect()
+  }
 })

@@ -285,11 +285,18 @@ export async function flipPendingToLive (models, payIn, feePiconeros) {
     // Item.piconeros (tip total) or boost (ranking), so tip display and
     // ranktop/ranklit are unaffected.
     const flipped = await models.$transaction(async tx => {
+      // A soft-deleted item can never enter the live path: the author's
+      // deletion may land between fee issuance and observation (it keeps the
+      // PENDING_FEE linkage), and publishing deleted content would fire
+      // notifications, consume quota, and denormalize for a removed item. The
+      // receipt is still recorded by the caller — only the flip refuses; the
+      // sweep later cleans the stale linkage.
       const rows = await tx.$queryRaw`
         UPDATE "Item"
         SET "feeStatus" = 'FEE_PAID',
             "feeInvestmentPiconeros" = GREATEST("feeInvestmentPiconeros", ${feePiconeros}::bigint)
         WHERE "feePayInId" = ${payIn.id} AND "feeStatus" = 'PENDING_FEE'
+          AND "deletedAt" IS NULL
         RETURNING id`
       if (!rows || rows.length === 0) return null
       // One fetch, with the includes runItemLiveSideEffects needs. Safe to reuse
