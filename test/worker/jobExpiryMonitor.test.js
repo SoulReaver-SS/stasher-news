@@ -10,6 +10,7 @@
 
 import { createJobExpiryMonitor } from '@/worker/jobExpiryMonitor'
 import { logWarn } from '../../lib/logger'
+import { alert, __clearDedupe } from '@/lib/alert'
 
 jest.mock('../../lib/logger', () => ({
   __esModule: true,
@@ -43,6 +44,31 @@ function monitorWith (rows, { alert = jest.fn().mockResolvedValue(true), now = (
 
 beforeEach(() => {
   jest.clearAllMocks()
+})
+
+test('real alert delivery exhausts retries, then the next monitor tick can notify', async () => {
+  jest.useFakeTimers()
+  __clearDedupe()
+  const savedUrl = process.env.ALERT_WEBHOOK_URL
+  process.env.ALERT_WEBHOOK_URL = 'https://hooks.example.test/alert'
+  const fetchSpy = jest.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('offline'))
+  try {
+    const { monitor, models } = monitorWith([REWARDS_JOB], { alert })
+    const failed = monitor.check(models)
+    await jest.runAllTimersAsync()
+    await failed
+    expect(fetchSpy).toHaveBeenCalledTimes(3)
+    fetchSpy.mockResolvedValue({ ok: true, status: 200 })
+    await monitor.check(models)
+    await monitor.check(models)
+    expect(fetchSpy).toHaveBeenCalledTimes(4)
+  } finally {
+    fetchSpy.mockRestore()
+    if (savedUrl === undefined) delete process.env.ALERT_WEBHOOK_URL
+    else process.env.ALERT_WEBHOOK_URL = savedUrl
+    __clearDedupe()
+    jest.useRealTimers()
+  }
 })
 
 test('a manager expiry pages once without replaying monetary work', async () => {

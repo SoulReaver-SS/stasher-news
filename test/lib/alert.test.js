@@ -1,5 +1,8 @@
 /* eslint-env jest */
 import { alert, __clearDedupe, DEDUPE_TTL_MS } from '@/lib/alert'
+import { logError } from '../../lib/logger'
+
+jest.mock('../../lib/logger', () => ({ logInfo: jest.fn(), logWarn: jest.fn(), logError: jest.fn() }))
 
 const URL = 'https://hooks.example.test/alert'
 
@@ -9,6 +12,8 @@ let savedChannel
 let savedChatId
 
 beforeEach(() => {
+  jest.useFakeTimers()
+  jest.clearAllMocks()
   __clearDedupe()
   savedUrl = process.env.ALERT_WEBHOOK_URL
   savedChannel = process.env.ALERT_CHANNEL
@@ -20,6 +25,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  jest.useRealTimers()
   fetchSpy.mockRestore()
   if (savedUrl === undefined) delete process.env.ALERT_WEBHOOK_URL
   else process.env.ALERT_WEBHOOK_URL = savedUrl
@@ -32,6 +38,11 @@ afterEach(() => {
 function postedBody (n = 1) {
   const opts = fetchSpy.mock.calls[n - 1][1]
   return JSON.parse(opts.body)
+}
+
+async function flushDelivery (delivery) {
+  await jest.runAllTimersAsync()
+  return delivery
 }
 
 describe('payload shape per channel', () => {
@@ -136,13 +147,13 @@ describe('delivery outcome is observable (Finding 2)', () => {
   })
 
   test('resolves false on a non-OK status (503)', async () => {
-    fetchSpy.mockResolvedValueOnce({ ok: false, status: 503 })
-    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
+    fetchSpy.mockResolvedValue({ ok: false, status: 503 })
+    await expect(flushDelivery(alert('critical', 'x', 'y'))).resolves.toBe(false)
   })
 
   test('resolves false on a caught transport error', async () => {
-    fetchSpy.mockRejectedValueOnce(new Error('ECONNREFUSED'))
-    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
+    fetchSpy.mockRejectedValue(new Error('ECONNREFUSED'))
+    await expect(flushDelivery(alert('critical', 'x', 'y'))).resolves.toBe(false)
   })
 
   test('returns false on every skip path (unset URL, invalid level, deduped)', async () => {
@@ -157,18 +168,18 @@ describe('delivery outcome is observable (Finding 2)', () => {
 
 describe('alert failure never throws', () => {
   test('network rejection is swallowed', async () => {
-    fetchSpy.mockRejectedValueOnce(new Error('ECONNREFUSED'))
-    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
+    fetchSpy.mockRejectedValue(new Error('ECONNREFUSED'))
+    await expect(flushDelivery(alert('critical', 'x', 'y'))).resolves.toBe(false)
   })
 
   test('non-ok HTTP response is swallowed', async () => {
-    fetchSpy.mockResolvedValueOnce({ ok: false, status: 500 })
-    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
+    fetchSpy.mockResolvedValue({ ok: false, status: 500 })
+    await expect(flushDelivery(alert('critical', 'x', 'y'))).resolves.toBe(false)
   })
 
   test('fetch throwing synchronously is swallowed', async () => {
-    fetchSpy.mockImplementationOnce(() => { throw new Error('sync boom') })
-    await expect(alert('critical', 'x', 'y')).resolves.toBe(false)
+    fetchSpy.mockImplementation(() => { throw new Error('sync boom') })
+    await expect(flushDelivery(alert('critical', 'x', 'y'))).resolves.toBe(false)
   })
 })
 
@@ -177,4 +188,65 @@ describe('invalid level', () => {
     await alert('boom', 'x', 'y')
     expect(fetchSpy).not.toHaveBeenCalled()
   })
+})
+
+test('a transient timeout retries with a fresh deadline and shares the in-flight outcome', async () => {
+  fetchSpy.mockRejectedValueOnce(new Error('timeout')).mockResolvedValueOnce({ ok: true, status: 200 })
+  const first = alert('critical', 'x', 'y', { dedupeKey: 'retry' })
+  const second = alert('critical', 'x', 'y', { dedupeKey: 'retry' })
+  expect(second).toBe(first)
+  await expect(flushDelivery(first)).resolves.toBe(true)
+  expect(fetchSpy).toHaveBeenCalledTimes(2)
+  expect(fetchSpy.mock.calls[0][1].signal).not.toBe(fetchSpy.mock.calls[1][1].signal)
+  expect(alert('critical', 'x', 'y', { dedupeKey: 'retry' })).toBe(false)
+})
+
+test.each([408, 429, 503])('retryable HTTP %s is delivered on the second attempt', async status => {
+  fetchSpy.mockResolvedValueOnce({ ok: false, status }).mockResolvedValueOnce({ ok: true, status: 200 })
+  await expect(flushDelivery(alert('critical', 'x', 'y'))).resolves.toBe(true)
+  expect(fetchSpy).toHaveBeenCalledTimes(2)
+})
+
+test.each([400, 401, 403])('permanent HTTP %s does not retry', async status => {
+  fetchSpy.mockResolvedValue({ ok: false, status })
+  await expect(flushDelivery(alert('critical', 'x', 'y'))).resolves.toBe(false)
+  expect(fetchSpy).toHaveBeenCalledTimes(1)
+})
+
+test('exhausted delivery releases dedupe, allowing the next caller to deliver', async () => {
+  fetchSpy.mockRejectedValue(new Error('https://secret-token.example/alert private-payload'))
+  await expect(flushDelivery(alert('critical', 'x', 'y', { dedupeKey: 'retry' }))).resolves.toBe(false)
+  expect(fetchSpy).toHaveBeenCalledTimes(3)
+  expect(JSON.stringify(logError.mock.calls)).not.toContain('secret-token')
+  fetchSpy.mockResolvedValue({ ok: true, status: 200 })
+  await expect(alert('critical', 'x', 'y', { dedupeKey: 'retry' })).resolves.toBe(true)
+})
+
+test('Retry-After is bounded and successful delivery starts the TTL after completion', async () => {
+  const startedAt = Date.now()
+  fetchSpy.mockResolvedValueOnce({ ok: false, status: 429, headers: { get: () => '999999' } })
+  const delivery = alert('critical', 'x', 'y', { dedupeKey: 'slow' })
+  await expect(flushDelivery(delivery)).resolves.toBe(true)
+  expect(Date.now() - startedAt).toBeLessThanOrEqual(5000)
+  jest.advanceTimersByTime(DEDUPE_TTL_MS - 1)
+  expect(alert('critical', 'x', 'y', { dedupeKey: 'slow' })).toBe(false)
+  jest.advanceTimersByTime(2)
+  await expect(alert('critical', 'x', 'y', { dedupeKey: 'slow' })).resolves.toBe(true)
+})
+
+test('fire-and-forget alerts retry without an awaiting caller', async () => {
+  fetchSpy.mockRejectedValueOnce(new Error('network blip'))
+  alert('critical', 'x', 'y')
+  await jest.runAllTimersAsync()
+  expect(fetchSpy).toHaveBeenCalledTimes(2)
+})
+
+test('a hanging fetch is aborted at ten seconds and retried', async () => {
+  fetchSpy.mockImplementationOnce((url, { signal }) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+  }))
+  await expect(flushDelivery(alert('critical', 'x', 'y'))).resolves.toBe(true)
+  expect(fetchSpy).toHaveBeenCalledTimes(2)
+  expect(fetchSpy.mock.calls[0][1].signal.aborted).toBe(true)
+  expect(logError).not.toHaveBeenCalled()
 })

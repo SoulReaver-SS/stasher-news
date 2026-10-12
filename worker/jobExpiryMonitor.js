@@ -122,8 +122,8 @@ export function createJobExpiryMonitor ({ alert: doAlert = alert, now = Date.now
         // retries this alert first (and only the alert — this monitor never
         // touches jobs, payouts, or any monetary state). Fixed-category
         // diagnostics only: alert/transport errors and responses can carry
-        // arbitrary text, and lib/alert's own 5-minute dedupe window is the
-        // intended re-attempt cadence — never cleared or bypassed here.
+        // arbitrary text. lib/alert retries transient POSTs itself and leaves
+        // failed deliveries undeduped so the next monitor tick can retry.
         logError('jobExpiryMonitor: expiry alert delivery failed; the event stays unalerted and is retried first next cycle')
         return
       }
