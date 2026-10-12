@@ -80,10 +80,10 @@ function advanceModels ({ userId = 7000, sleepMs = 0 } = {}) {
 // for the allowlisted `userId` with the shield armed, so the transaction
 // consumes the shield and leaves the run running.
 function missedModels ({ userId = 7000, sleepMs = 0, failWith = null } = {}) {
-  const streak = { id: 700, userId, type: 'FLAME', endedAt: null, lastEvaluatedDay: null, goldActive: true }
+  const streak = { id: 700, userId, type: 'FLAME', endedAt: null, startedAt: new Date('2026-10-11T00:00:00Z'), lastEvaluatedDay: null, goldActive: true }
   return {
     $queryRaw: async () => [],
-    streak: { findMany: async () => [streak] },
+    streak: { findMany: async () => [streak], findFirst: async () => streak },
     user: { findUnique: async () => ({ streak: 4 }) },
     $transaction: async fn => fn({
       $queryRaw: async () => {
@@ -93,8 +93,9 @@ function missedModels ({ userId = 7000, sleepMs = 0, failWith = null } = {}) {
       user: { findUnique: async () => ({ streak: 4 }), update: async () => ({}) },
       streak: {
         findFirst: async () => streak,
-        update: async () => {
+        update: async ({ data }) => {
           if (failWith) throw failWith
+          Object.assign(streak, data)
           return { ...streak, goldActive: false }
         }
       }

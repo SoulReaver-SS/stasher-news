@@ -3,12 +3,14 @@ import { cycleDay, ladderRewardForLevel, MAX_BANKED_BOOSTS, MAX_BANKED_POSTS, MA
 import { lockRewardUser, rewardNow } from '@/api/quests/boost-credit'
 import { questDay } from '@/lib/questClock'
 import { logInfo, logWarn } from '@/lib/logger'
+import { Prisma } from '@prisma/client'
 
 const REWARD_TYPE = { post: 'POST', reply: 'REPLY', boost: 'BOOST', turfdiscount: 'TURF_DISCOUNT' }
 const BANKED_CAP = { POST: MAX_BANKED_POSTS, REPLY: MAX_BANKED_REPLIES }
 const DAY_MS = 86_400_000
 const SLOW_TRANSACTION_MS = 1000
 const TRANSACTION_OPTIONS = { maxWait: 5000, timeout: 15000 }
+const MAX_CATCH_UP_DAYS = 7
 
 /**
  * Best-effort slow/failure diagnostics for one streak transaction path
@@ -81,6 +83,15 @@ export async function advanceQuestStreak ({ models, userId, day, requirePrevSett
           select: { lastEvaluatedDay: true }
         })
         if (last?.lastEvaluatedDay && last.lastEvaluatedDay >= dayDate) return
+        if (requirePrevSettled) {
+          const earlier = await tx.$queryRaw`
+            SELECT day FROM "QuestCompletion"
+            WHERE "userId" = ${userId} AND day < ${dayDate}
+              AND (${last?.lastEvaluatedDay ?? null}::timestamp IS NULL
+                   OR day > ${last?.lastEvaluatedDay ?? null}::timestamp)
+            GROUP BY day HAVING count(*) >= 2 LIMIT 1`
+          if (earlier.length) return
+        }
       }
       // Deferral guard: the previous day's outcome is still pending, so this day's
       // level is not knowable yet.
@@ -122,8 +133,7 @@ export async function advanceQuestStreak ({ models, userId, day, requirePrevSett
  * `Streak.lastEvaluatedDay` makes re-runs for the same day no-ops. Ladder
  * rewards are granted on advance, idempotently via `Streak.rewardLevel`.
  */
-export async function evaluateQuestStreaks ({ models, now = new Date(), userIds } = {}) {
-  const day = questDay(new Date(now.getTime() - DAY_MS))
+async function evaluateQuestStreakDay ({ models, day, userIds }) {
   const dayDate = new Date(`${day}T00:00:00.000Z`)
 
   // Every user with both completions recorded for the day (the sweep writes
@@ -132,11 +142,13 @@ export async function evaluateQuestStreaks ({ models, now = new Date(), userIds 
   // other runs are left exactly as they are.
   const clearedRows = await models.$queryRaw`
     SELECT "userId" FROM "QuestCompletion"
-    WHERE "day" = ${dayDate} GROUP BY "userId" HAVING count(*) >= 2`
+    WHERE "day" = ${dayDate}
+      ${userIds ? Prisma.sql`AND "userId" IN (${Prisma.join(userIds)})` : Prisma.empty}
+    GROUP BY "userId" HAVING count(*) >= 2`
   const scope = userIds ? new Set(userIds) : null
   const cleared = new Set(clearedRows.map(r => r.userId).filter(id => !scope || scope.has(id)))
 
-  const active = (await models.streak.findMany({ where: { type: 'FLAME', endedAt: null } }))
+  const active = (await models.streak.findMany({ where: { type: 'FLAME', endedAt: null, ...(userIds ? { userId: { in: userIds } } : {}) } }))
     .filter(s => !scope || scope.has(s.userId))
   const activeByUser = new Map(active.map(s => [s.userId, s]))
   const userIdsIter = new Set([...cleared, ...active.map(s => s.userId)])
@@ -204,6 +216,63 @@ export async function evaluateQuestStreaks ({ models, now = new Date(), userIds 
     else if (notification?.kind === 'shield') notifyShieldUsed(userId).catch(console.error)
     else if (notification?.kind === 'lost') notifyStreakLost(userId, notification.streak).catch(console.error)
   }
+}
+
+// Aggregate only the first unhandled clear for each user. Settled markers,
+// including ended runs, prevent replaying historical grants under a new run.
+async function unsettledClears (models, throughDay, userIds) {
+  return await models.$queryRaw`
+    WITH settled AS (
+      SELECT "userId", max("lastEvaluatedDay") AS day FROM "Streak"
+      WHERE type = 'FLAME' GROUP BY "userId"
+    ), cleared AS (
+      SELECT "userId", day FROM "QuestCompletion"
+      WHERE day <= ${throughDay}
+        ${userIds ? Prisma.sql`AND "userId" IN (${Prisma.join(userIds)})` : Prisma.empty}
+      GROUP BY "userId", day HAVING count(*) >= 2
+    )
+    SELECT c."userId", min(c.day) AS day FROM cleared c
+    LEFT JOIN settled s ON s."userId" = c."userId"
+    WHERE s.day IS NULL OR c.day > s.day
+    GROUP BY c."userId" ORDER BY c."userId"`
+}
+
+async function catchUpUser ({ models, userId, fromDay, throughDay }) {
+  let day = fromDay
+  for (let count = 0; count < MAX_CATCH_UP_DAYS && day <= throughDay; count++) {
+    await evaluateQuestStreakDay({ models, day: day.toISOString().slice(0, 10), userIds: [userId] })
+    const latest = await models.streak.findFirst({ where: { userId, type: 'FLAME' }, orderBy: { startedAt: 'desc' } })
+    if (latest && !latest.endedAt) {
+      day = new Date((latest.lastEvaluatedDay ?? day).getTime() + DAY_MS)
+    } else {
+      // Once a run ends, empty spans have no shield/level to settle. Jump to
+      // the next clear instead of walking years of empty calendar days.
+      const [next] = await unsettledClears(models, throughDay, [userId])
+      if (!next) break
+      day = next.day
+    }
+  }
+}
+
+export async function evaluateQuestStreaks ({ models, now = new Date(), userIds } = {}) {
+  if (userIds && !userIds.length) return
+  const throughDay = new Date(`${questDay(new Date(now.getTime() - DAY_MS))}T00:00:00.000Z`)
+  const cleared = await unsettledClears(models, throughDay, userIds)
+  const starts = new Map(cleared.map(row => [row.userId, row.day]))
+  const latestRuns = await models.streak.findMany({
+    where: { type: 'FLAME', ...(userIds ? { userId: { in: userIds } } : {}) },
+    distinct: ['userId'], orderBy: { startedAt: 'desc' }
+  })
+  for (const run of latestRuns) {
+    if (!run.endedAt) starts.set(run.userId, run.lastEvaluatedDay ? new Date(run.lastEvaluatedDay.getTime() + DAY_MS) : run.startedAt)
+  }
+  let firstFailure = null
+  for (const [userId, fromDay] of starts) {
+    if (!await models.user.findUnique({ where: { id: userId }, select: { id: true } })) continue
+    try { await catchUpUser({ models, userId, fromDay, throughDay }) } catch (err) { firstFailure ??= err }
+  }
+  // Let pg-boss retry the failed users without blocking other users' progress.
+  if (firstFailure) throw firstFailure
 }
 
 /**

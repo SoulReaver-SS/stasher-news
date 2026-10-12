@@ -255,6 +255,81 @@ test('the immediate advance runs once the previous day is settled', async () => 
   expect(user.streak).toBe(3)
 })
 
+test('a later daily backstop settles the original failed day before the newer clear', async () => {
+  const userId = await mkUser(2)
+  const run = await mkStreak(userId, { rewardLevel: 2, lastEvaluatedDay: new Date('2026-10-09T00:00:00Z') })
+  await prisma.streak.update({ where: { id: run.id }, data: { startedAt: new Date('2026-10-08T00:00:00Z') } })
+  await bothCleared(userId, '2026-10-10')
+  await bothCleared(userId, '2026-10-11')
+  const faulty = prisma.$extends({ query: { streak: {
+    async update () { throw new Error('evaluation interrupted') }
+  } } })
+  await expect(evaluateQuestStreaks({ models: faulty, now: new Date('2026-10-11T00:10:00Z'), userIds: [userId] }))
+    .rejects.toThrow('evaluation interrupted')
+  const options = { models: prisma, now: new Date('2026-10-12T00:10:00Z'), userIds: [userId] }
+  await evaluateQuestStreaks(options)
+  await evaluateQuestStreaks(options)
+  const user = await prisma.user.findUnique({ where: { id: userId } })
+  const after = await prisma.streak.findUnique({ where: { id: run.id } })
+  expect(user.streak).toBe(4)
+  expect(after.lastEvaluatedDay).toEqual(new Date('2026-10-11T00:00:00Z'))
+  expect(after.goldActive).toBe(true)
+  expect(await prisma.streakReward.count({ where: { userId, type: 'REPLY' } })).toBe(1)
+})
+
+test.each([true, false])('a missed old day applies shield=%s before the later clear', async goldActive => {
+  const userId = await mkUser(4)
+  const run = await mkStreak(userId, { rewardLevel: 4, goldActive, lastEvaluatedDay: new Date('2026-10-09T00:00:00Z') })
+  await prisma.streak.update({ where: { id: run.id }, data: { startedAt: new Date('2026-10-08T00:00:00Z') } })
+  await bothCleared(userId, '2026-10-11')
+  await evaluateQuestStreaks({ models: prisma, now: new Date('2026-10-12T00:10:00Z'), userIds: [userId] })
+  const user = await prisma.user.findUnique({ where: { id: userId } })
+  const old = await prisma.streak.findUnique({ where: { id: run.id } })
+  expect(user.streak).toBe(goldActive ? 5 : 1)
+  expect(old.goldActive).toBe(false)
+  expect(old.endedAt).toEqual(goldActive ? null : new Date('2026-10-10T00:00:00Z'))
+})
+
+test('the sweep cannot leapfrog an earlier clear when the first run never committed', async () => {
+  const userId = await mkUser()
+  await bothCleared(userId, '2026-10-10')
+  await bothCleared(userId, '2026-10-11')
+  expect(await advanceQuestStreak({ models: prisma, userId, day: '2026-10-11', requirePrevSettled: true })).toBeNull()
+  expect(await prisma.streak.count({ where: { userId } })).toBe(0)
+  await evaluateQuestStreaks({ models: prisma, now: new Date('2026-10-12T00:10:00Z'), userIds: [userId] })
+  const user = await prisma.user.findUnique({ where: { id: userId } })
+  expect(user.streak).toBe(2)
+})
+
+test('the seven-day catch-up cap retains durable progress rather than jumping to yesterday', async () => {
+  const userId = await mkUser()
+  for (let day = 1; day <= 9; day++) await bothCleared(userId, `2026-10-0${day}`)
+  const options = { models: prisma, now: new Date('2026-10-10T00:10:00Z'), userIds: [userId] }
+  await evaluateQuestStreaks(options)
+  const first = await prisma.streak.findFirst({ where: { userId, endedAt: null } })
+  expect(first.lastEvaluatedDay).toEqual(new Date('2026-10-07T00:00:00Z'))
+  await evaluateQuestStreaks(options)
+  const after = await prisma.user.findUnique({ where: { id: userId } })
+  expect(after.streak).toBe(9)
+})
+
+test('one broken user does not prevent another user from settling', async () => {
+  const first = await mkUser()
+  const second = await mkUser()
+  await bothCleared(first, '2026-10-11')
+  await bothCleared(second, '2026-10-11')
+  const faulty = prisma.$extends({ query: { user: {
+    async update ({ args, query }) {
+      if (args.where.id === first) throw new Error('first user interrupted')
+      return query(args)
+    }
+  } } })
+  await expect(evaluateQuestStreaks({ models: faulty, now: new Date('2026-10-12T00:10:00Z'), userIds: [first, second] }))
+    .rejects.toThrow('first user interrupted')
+  expect((await prisma.user.findUnique({ where: { id: first } })).streak).toBeNull()
+  expect((await prisma.user.findUnique({ where: { id: second } })).streak).toBe(1)
+})
+
 // Day-5 boost credit (spec 2026-10-05-quest-rebalance-boost-credit, task 3):
 // exactly one held credit, exactly 30 days of expiry, suppression never
 // refreshes the held row, and the marker advances even when suppressed.
