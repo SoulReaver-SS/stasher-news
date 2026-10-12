@@ -36,6 +36,17 @@ function logStreakTransactionTiming (fields) {
   } catch { /* diagnostics never change the transaction outcome */ }
 }
 
+// Both callers already hold the user reward lock and have rechecked the day
+// guard. Keep advancement and all grants within that same transaction.
+async function grantFlameAdvance ({ tx, userId, user, streak, dayDate }) {
+  const level = (user.streak ?? 0) + 1
+  const row = streak ?? await tx.streak.create({ data: { userId, type: 'FLAME', startedAt: dayDate } })
+  await tx.user.update({ where: { id: userId }, data: { streak: level } })
+  const rewards = await grantLadderRewards({ models: tx, userId, streak: row, from: row.rewardLevel, to: level })
+  const settled = await tx.streak.update({ where: { id: row.id }, data: { lastEvaluatedDay: dayDate } })
+  return { kind: 'advanced', level, cycleDay: cycleDay(level), goldFlame: settled.goldActive, rewards }
+}
+
 /**
  * Advance the flame for a UTC day whose quests are cleared (spec §4.5). The
  * quest sweep calls this as soon as both completions are on record, so the
@@ -97,16 +108,7 @@ export async function advanceQuestStreak ({ models, userId, day, requirePrevSett
       // level is not knowable yet.
       if (requirePrevSettled && streak && (!streak.lastEvaluatedDay || streak.lastEvaluatedDay < prevDate)) return
 
-      const level = (user.streak ?? 0) + 1
-      const row = streak ?? await tx.streak.create({
-        data: { userId, type: 'FLAME', startedAt: dayDate }
-      })
-      await tx.user.update({ where: { id: userId }, data: { streak: level } })
-      const rewards = await grantLadderRewards({ models: tx, userId, streak: row, from: row.rewardLevel, to: level })
-      // Read the row back AFTER the grants: grantLadderRewards may have armed the
-      // shield, and the arming advance must report the post-grant goldFlame.
-      const settled = await tx.streak.update({ where: { id: row.id }, data: { lastEvaluatedDay: dayDate } })
-      notification = { kind: 'advanced', level, cycleDay: cycleDay(level), goldFlame: settled.goldActive, rewards }
+      notification = await grantFlameAdvance({ tx, userId, user, streak, dayDate })
     }, TRANSACTION_OPTIONS)
     outcome = 'committed'
   } finally {
@@ -188,6 +190,17 @@ async function evaluateQuestStreakDay ({ models, day, userIds }) {
           const streak = await tx.streak.findFirst({ where: { userId, type: 'FLAME', endedAt: null } })
           if (!streak) return
           if (streak.lastEvaluatedDay && streak.lastEvaluatedDay >= dayDate) return
+
+          // The sweep may have committed its second completion while we
+          // waited for this lock. A stale outer snapshot must never consume
+          // the shield or settle a cleared day as missed.
+          const [completions] = await tx.$queryRaw`
+            SELECT count(*)::int AS count FROM "QuestCompletion"
+            WHERE "userId" = ${userId} AND day = ${dayDate}`
+          if (completions?.count >= 2) {
+            notification = await grantFlameAdvance({ tx, userId, user: current, streak, dayDate })
+            return
+          }
 
           await tx.streak.update({ where: { id: streak.id }, data: { lastEvaluatedDay: dayDate } })
           if (streak.goldActive) {

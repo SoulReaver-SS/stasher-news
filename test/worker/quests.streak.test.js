@@ -1,11 +1,13 @@
 /* eslint-env jest */
 import { PrismaClient } from '@prisma/client'
 import { advanceQuestStreak, evaluateQuestStreaks } from '@/worker/streak'
-import { utcDay, QUEST } from '@/lib/quests'
+import { utcDay, QUEST, drawFor } from '@/lib/quests'
+import { sweepQuestCompletions } from '@/worker/quests'
 import { notifyShieldUsed, notifyFlameAdvanced } from '@/lib/webPush'
 
 jest.mock('../../lib/webPush', () => ({
   notifyFlameAdvanced: jest.fn(() => Promise.resolve()),
+  notifyQuestCompleted: jest.fn(() => Promise.resolve()),
   notifyShieldUsed: jest.fn(() => Promise.resolve()),
   notifyStreakLost: jest.fn(() => Promise.resolve())
 }))
@@ -21,7 +23,7 @@ jest.mock('../../lib/logger', () => ({
 
 const prisma = new PrismaClient()
 const yesterday = utcDay(new Date(Date.now() - 86_400_000))
-const created = { users: [], streaks: [] }
+const created = { users: [], streaks: [], items: [] }
 
 async function mkUser (streak = null) {
   const [row] = await prisma.$queryRaw`INSERT INTO users DEFAULT VALUES RETURNING id::int AS id`
@@ -66,6 +68,7 @@ afterAll(async () => {
   await prisma.streakReward.deleteMany({ where: { userId: { in: created.users } } })
   await prisma.questCompletion.deleteMany({ where: { userId: { in: created.users } } })
   await prisma.streak.deleteMany({ where: { id: { in: created.streaks } } })
+  for (const id of [...created.items].reverse()) await prisma.item.deleteMany({ where: { id } })
   await prisma.user.deleteMany({ where: { id: { in: created.users } } })
   await prisma.$disconnect()
 })
@@ -336,6 +339,62 @@ test('one broken user does not prevent another user from settling', async () => 
     .rejects.toThrow('first user interrupted')
   expect((await prisma.user.findUnique({ where: { id: first } })).streak).toBeNull()
   expect((await prisma.user.findUnique({ where: { id: second } })).streak).toBe(1)
+})
+
+test.each([true, false])('a completion committed after the missed-day snapshot advances without consuming shield=%s', async goldActive => {
+  const userId = await mkUser(4)
+  let day = null
+  for (let i = 0; i < 30 && !day; i++) {
+    const candidate = utcDay(new Date(Date.now() + i * 86_400_000))
+    if (drawFor(userId, candidate).drawn === QUEST.FIRST_RESPONDER) day = candidate
+  }
+  expect(day).not.toBeNull()
+  const dayDate = new Date(`${day}T00:00:00Z`)
+  const sweepNow = new Date(`${day}T12:00:00Z`)
+  const run = await mkStreak(userId, { rewardLevel: 4, goldActive, lastEvaluatedDay: new Date(dayDate.getTime() - 86_400_000) })
+  await prisma.streak.update({ where: { id: run.id }, data: { startedAt: new Date(dayDate.getTime() - 2 * 86_400_000) } })
+  await prisma.questCompletion.create({ data: { userId, day: dayDate, quest: QUEST.UPVOTE } })
+  const [root] = await prisma.$queryRaw`INSERT INTO "Item" ("userId", title, created_at) VALUES (${userId}::int, 'settlement race root', ${sweepNow}) RETURNING id::int AS id`
+  const [comment] = await prisma.$queryRaw`INSERT INTO "Item" ("userId", "parentId", "rootId", text, created_at) VALUES (${userId}::int, ${root.id}::int, ${root.id}::int, 'settlement race reply', ${sweepNow}) RETURNING id::int AS id`
+  created.items.push(root.id, comment.id)
+  // Reproduce the real crash window: the sweep commits completion+banking,
+  // then its independent advancement fails before the evaluator takes the lock.
+  const interruptedSweep = prisma.$extends({
+    query: {
+      streak: { async findFirst () { throw new Error('sweep advancement interrupted') } }
+    }
+  })
+  let raced = false
+  const evaluator = prisma.$extends({
+    query: {
+      async $queryRaw ({ args, query }) {
+        const snapshot = await query(args)
+        const sql = args?.strings?.join('') ?? String(args?.sql ?? args?.[0])
+        if (!raced && /SELECT\s+"userId"\s+FROM\s+"QuestCompletion"/.test(sql)) {
+          raced = true
+          expect(snapshot).toHaveLength(0)
+          await expect(sweepQuestCompletions({ models: interruptedSweep, now: sweepNow, userIds: [userId] }))
+            .rejects.toThrow('sweep advancement interrupted')
+          expect(await prisma.questCompletion.count({ where: { userId, day: dayDate } })).toBe(2)
+        }
+        return snapshot
+      }
+    }
+  })
+  notifyShieldUsed.mockClear()
+  notifyFlameAdvanced.mockClear()
+  const options = { models: evaluator, now: new Date(dayDate.getTime() + 86_400_000 + 600_000), userIds: [userId] }
+  await evaluateQuestStreaks(options)
+  await evaluateQuestStreaks({ ...options, models: prisma })
+  expect(raced).toBe(true)
+  expect((await prisma.user.findUnique({ where: { id: userId } })).streak).toBe(5)
+  const after = await prisma.streak.findUnique({ where: { id: run.id } })
+  expect(after.endedAt).toBeNull()
+  expect(after.goldActive).toBe(goldActive)
+  expect(after.lastEvaluatedDay).toEqual(dayDate)
+  expect(await prisma.streakReward.count({ where: { userId, type: 'BOOST' } })).toBe(1)
+  expect(notifyShieldUsed).not.toHaveBeenCalled()
+  expect(notifyFlameAdvanced.mock.calls.filter(([id]) => id === userId)).toHaveLength(1)
 })
 
 // Day-5 boost credit (spec 2026-10-05-quest-rebalance-boost-credit, task 3):
