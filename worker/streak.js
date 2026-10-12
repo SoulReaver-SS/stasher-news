@@ -8,6 +8,7 @@ const REWARD_TYPE = { post: 'POST', reply: 'REPLY', boost: 'BOOST', turfdiscount
 const BANKED_CAP = { POST: MAX_BANKED_POSTS, REPLY: MAX_BANKED_REPLIES }
 const DAY_MS = 86_400_000
 const SLOW_TRANSACTION_MS = 1000
+const TRANSACTION_OPTIONS = { maxWait: 5000, timeout: 15000 }
 
 /**
  * Best-effort slow/failure diagnostics for one streak transaction path
@@ -95,7 +96,7 @@ export async function advanceQuestStreak ({ models, userId, day, requirePrevSett
       // shield, and the arming advance must report the post-grant goldFlame.
       const settled = await tx.streak.update({ where: { id: row.id }, data: { lastEvaluatedDay: dayDate } })
       notification = { kind: 'advanced', level, cycleDay: cycleDay(level), goldFlame: settled.goldActive, rewards }
-    })
+    }, TRANSACTION_OPTIONS)
     outcome = 'committed'
   } finally {
     logStreakTransactionTiming({
@@ -185,7 +186,7 @@ export async function evaluateQuestStreaks ({ models, now = new Date(), userIds 
             await tx.user.update({ where: { id: userId }, data: { streak: null } })
             notification = { kind: 'lost', streak }
           }
-        })
+        }, TRANSACTION_OPTIONS)
         outcome = 'committed'
       } finally {
         logStreakTransactionTiming({

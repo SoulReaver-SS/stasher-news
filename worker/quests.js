@@ -9,6 +9,31 @@ import { lockRewardUser } from '@/api/quests/boost-credit'
 // Look back further than the cron cadence (*/5) so a delayed tick can't miss
 // an action; the QuestCompletion unique key makes overlap harmless.
 const LOOKBACK_MS = 10 * 60 * 1000
+const TRANSACTION_OPTIONS = { maxWait: 5000, timeout: 15000 }
+
+// Completion and flame-independent reply credits commit together. The user
+// lock serializes both the duplicate check and the existing reward cap.
+async function recordQuestCompletion ({ models, userId, day, quest }) {
+  return await models.$transaction(async tx => {
+    if (!await lockRewardUser(tx, userId)) return false
+    const completionKey = { userId, day: new Date(`${day}T00:00:00.000Z`), quest }
+    if (await tx.questCompletion.findUnique({ where: { userId_day_quest: completionKey } })) return false
+    await tx.questCompletion.create({ data: completionKey })
+    for (let i = 0; i < (QUEST_REPLY_REWARDS[quest] ?? 1); i++) {
+      await tx.$queryRaw`
+        INSERT INTO "StreakReward" ("userId", "streakId", created_at, "grantedAt", "expiresAt", "type")
+        SELECT ${userId},
+               (SELECT s.id FROM "Streak" s
+                WHERE s."userId" = ${userId} AND s."type" = 'FLAME' AND s."endedAt" IS NULL
+                ORDER BY s.id DESC LIMIT 1),
+               now_utc(), now_utc(), now_utc() + interval '1 month', 'REPLY'::"StreakRewardType"
+        WHERE (SELECT count(*) FROM "StreakReward" r
+               WHERE r."userId" = ${userId} AND r."type" = 'REPLY'
+                 AND r."consumedAt" IS NULL AND r."expiresAt" > now_utc()) < ${MAX_BANKED_REPLIES}`
+    }
+    return true
+  }, TRANSACTION_OPTIONS)
+}
 
 /**
  * Detect quest completions for today's draw and record them (spec §4.2).
@@ -76,7 +101,6 @@ export async function sweepQuestCompletions ({ models, now = new Date(), userIds
     checks.push({ userId, day })
   }
   const seenChecks = new Set()
-  const recorded = []
   for (const { userId, day } of checks) {
     const key = `${userId}|${day}`
     if (seenChecks.has(key)) continue
@@ -85,57 +109,14 @@ export async function sweepQuestCompletions ({ models, now = new Date(), userIds
     const done = await completionsFor(models, { userId, day, draw })
     for (const quest of [draw.upvote, draw.drawn]) {
       if (!done[quest]) continue
-      try {
-        await models.questCompletion.create({
-          data: { userId, day: new Date(`${day}T00:00:00.000Z`), quest }
-        })
-      } catch (err) {
-        if (err?.code === 'P2002') continue // already recorded by an earlier tick
-        throw err
-      }
-      notifyQuestCompleted(userId, quest).catch(console.error)
-      recorded.push({ userId, quest })
+      const recorded = await recordQuestCompletion({ models, userId, day, quest })
+      if (recorded) notifyQuestCompleted(userId, quest).catch(console.error)
     }
   }
 
-  // Advance the flame before banking so a day cleared on this tick grants its
-  // ladder rung in the same pass. The order no longer affects the quest
-  // credits themselves: banking is flame-independent (below) and every
-  // completion banks on the tick it is recorded.
+  // A crash here cannot lose banked quest credits: they already committed
+  // atomically with their completions, independently of flame advancement.
   await advanceClearedDays({ models, days: [...new Set([...days, ...lateObserved.map(l => l.day)])], userIds })
-
-  // Quest reply credits are NOT flame-gated (product clarification
-  // 2026-10-06): completing a quest banks its reply immediately, with or
-  // without an active run — each completion banks on the tick it is recorded,
-  // so the two daily quests pay independently of the flame and of each
-  // other's tick. The row still records the active run id when one exists
-  // (streakId NULL otherwise), and only the ladder rungs stay flame-gated
-  // (granted by the advance above). Never past the banked-reply cap, one
-  // capped insert per credit: the cap gates new grants only; rows held above
-  // it are grandfathered and nothing here deletes or claws back — spending
-  // rows down is what lets a fresh completion bank again. Each insert runs in
-  // a short transaction that takes the user row lock first (task 3): the same
-  // lock the advance holds, so the count predicate reads committed state and
-  // a race between this banking and a same-day ladder rung can never cross
-  // MAX_BANKED_REPLIES.
-  for (const { userId, quest } of recorded) {
-    const amount = QUEST_REPLY_REWARDS[quest] ?? 1
-    for (let i = 0; i < amount; i++) {
-      await models.$transaction(async tx => {
-        if (!await lockRewardUser(tx, userId)) return
-        await tx.$queryRaw`
-          INSERT INTO "StreakReward" ("userId", "streakId", created_at, "grantedAt", "expiresAt", "type")
-          SELECT ${userId},
-                 (SELECT s.id FROM "Streak" s
-                  WHERE s."userId" = ${userId} AND s."type" = 'FLAME' AND s."endedAt" IS NULL
-                  ORDER BY s.id DESC LIMIT 1),
-                 now_utc(), now_utc(), now_utc() + interval '1 month', 'REPLY'::"StreakRewardType"
-          WHERE (SELECT count(*) FROM "StreakReward" r
-                 WHERE r."userId" = ${userId} AND r."type" = 'REPLY'
-                   AND r."consumedAt" IS NULL AND r."expiresAt" > now_utc()) < ${MAX_BANKED_REPLIES}`
-      })
-    }
-  }
 }
 
 /**

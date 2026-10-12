@@ -178,6 +178,17 @@ async function seedPendingFeeSub (minor) {
 
 const txHash = () => randomUUID().replaceAll('-', '')
 
+test('item activation and comment effects have explicit independent transaction budgets', async () => {
+  const { payIn } = await seedPendingFeeComment(399)
+  const transaction = jest.spyOn(prisma, '$transaction')
+  await flipPendingToLive(prisma, payIn, 1000000000n)
+  expect(transaction).toHaveBeenCalledTimes(2)
+  for (const [, options] of transaction.mock.calls) {
+    expect(options).toEqual({ maxWait: 5000, timeout: 15000 })
+  }
+  expect(denormalizeComment).toHaveBeenCalledTimes(1)
+})
+
 function lwsFeeTx (hash, piconeros, major, minor, height = 1234) {
   return { hash, piconeros: BigInt(piconeros), recipient: { maj_i: major, min_i: minor }, height, id: 1, payment_id: null }
 }

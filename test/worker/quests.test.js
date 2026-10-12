@@ -141,10 +141,12 @@ test('a run\'s first day banks the day 1 rung plus both quest credits', async ()
   const [user] = await prisma.$queryRaw`SELECT streak FROM users WHERE id = ${userId}::int`
   expect(user.streak).toBe(1)
   // Day 1's rung banks a reply too (rev 4), on top of one credit per quest:
-  // three total, tied to the run the advance just created.
+  // three total; only the ladder rung needs the run created after banking.
   const credits = await prisma.streakReward.findMany({ where: { userId, type: 'REPLY' } })
   expect(credits).toHaveLength(3)
-  expect(credits.every(c => c.streakId === streak.id && c.consumedAt === null)).toBe(true)
+  expect(credits.filter(c => c.streakId === streak.id)).toHaveLength(1)
+  expect(credits.filter(c => c.streakId === null)).toHaveLength(2)
+  expect(credits.every(c => c.consumedAt === null)).toBe(true)
 
   await sweepQuestCompletions({ models: prisma, now, userIds: created.users }) // re-run: nothing new banks
   expect(await prisma.streakReward.count({ where: { userId, type: 'REPLY' } })).toBe(3)
@@ -223,7 +225,7 @@ test('quest completions bank with no flame at all, across separate ticks', async
   const all = await prisma.streakReward.findMany({ where: { userId, type: 'REPLY' }, orderBy: { id: 'asc' } })
   expect(all).toHaveLength(3) // first responder + upvote + day-1 ladder rung
   expect(all[0].streakId).toBeNull() // banked before any run existed
-  expect(all[1].streakId).toBe(streak.id) // upvote, banked on the clearing tick
+  expect(all[1].streakId).toBeNull() // upvote commits before the first run exists
   expect(all[2].streakId).toBe(streak.id) // day-1 rung
 })
 
@@ -249,6 +251,37 @@ test('a first responder completion banks one reply credit', async () => {
   expect(await prisma.questCompletion.count({ where: { userId, day: new Date(`${day}T00:00:00.000Z`), quest: QUEST.FIRST_RESPONDER } })).toBe(1)
   const credits = await prisma.streakReward.findMany({ where: { userId, type: 'REPLY' } })
   expect(credits).toHaveLength(1)
+})
+
+test('reply banking failure rolls back its quest completion, so a retry cannot lose the grant', async () => {
+  const userId = await mkUser()
+  let day = null
+  for (let i = 0; i < 30 && !day; i++) {
+    const candidate = utcDay(new Date(Date.now() + i * 86_400_000))
+    if (drawFor(userId, candidate).drawn === QUEST.FIRST_RESPONDER) day = candidate
+  }
+  expect(day).not.toBeNull()
+  const now = new Date(`${day}T12:00:00Z`)
+  const dayDate = new Date(`${day}T00:00:00Z`)
+  const [root] = await prisma.$queryRaw`INSERT INTO "Item" ("userId", title, created_at) VALUES (${userId}::int, 'rollback root', ${now}) RETURNING id::int AS id`
+  const [comment] = await prisma.$queryRaw`INSERT INTO "Item" ("userId", "parentId", "rootId", text, created_at) VALUES (${userId}::int, ${root.id}::int, ${root.id}::int, 'rollback reply', ${now}) RETURNING id::int AS id`
+  created.items.push(root.id, comment.id)
+  const faulty = prisma.$extends({ query: {
+    async $queryRaw ({ args, query }) {
+      const sql = args?.strings?.join('') ?? String(args?.sql ?? args?.[0])
+      if (sql.includes('INSERT INTO "StreakReward"')) throw new Error('banking interrupted')
+      return query(args)
+    }
+  } })
+  notifyQuestCompleted.mockClear()
+  await expect(sweepQuestCompletions({ models: faulty, now, userIds: [userId] })).rejects.toThrow('banking interrupted')
+  expect(await prisma.questCompletion.count({ where: { userId, day: dayDate } })).toBe(0)
+  expect(await prisma.streakReward.count({ where: { userId } })).toBe(0)
+  expect(notifyQuestCompleted.mock.calls.filter(([id]) => id === userId)).toHaveLength(0)
+  await sweepQuestCompletions({ models: prisma, now, userIds: [userId] })
+  await sweepQuestCompletions({ models: prisma, now, userIds: [userId] })
+  expect(await prisma.questCompletion.count({ where: { userId, day: dayDate } })).toBe(1)
+  expect(await prisma.streakReward.count({ where: { userId, type: 'REPLY' } })).toBe(1)
 })
 
 test('nine held replies bank one more and stop exactly at the cap of ten', async () => {

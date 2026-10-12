@@ -13,6 +13,8 @@ import { alert } from '@/lib/alert'
 import { logError } from '@/lib/logger'
 import { consumeQuotaForFlippedItem, consumeStreakReward } from '@/api/payIn/lib/freebie'
 
+const TRANSACTION_OPTIONS = { maxWait: 5000, timeout: 15000 }
+
 // rewardsWalletObserver — observes posting/territory fees AND downvote payments paid to
 // the platform rewards wallet (Phase 3 Task 5 + Phase 4 Task 4 / spec §3.3, §5.6,
 // §6.2). The rewards wallet is the ONLY custodial component; every payment lands
@@ -310,7 +312,7 @@ export async function flipPendingToLive (models, payIn, feePiconeros) {
           user: true
         }
       })
-    })
+    }, TRANSACTION_OPTIONS)
     if (flipped) {
       // R01: an item that was in-quota at creation but born PENDING_FEE (its
       // only cost was the upload fee) consumes its free quota HERE — the
@@ -318,14 +320,14 @@ export async function flipPendingToLive (models, payIn, feePiconeros) {
       // the winning flip branch reaches this) and best-effort: its OWN
       // transaction, so a failure (a missing/expired credit, or any DB error —
       // it surfaces rather than being swallowed) logs + alerts instead of
-      // rolling the flip back or wedging the cursor. The timeout matches
-      // payIn begin's 10s: the quota transaction takes the user reward lock,
+      // rolling the flip back or wedging the cursor. The local timeout gives
+      // headroom to the quota transaction, which takes the user reward lock,
       // which can legitimately wait behind a concurrent payIn/quest-banking
       // transaction longer than Prisma's 5s default. An over- or under-shot
       // count is inert (free-left clamps at 0; the window reset re-baselines).
       if (flipped.feeQuotaEligible) {
         try {
-          await models.$transaction(tx => consumeQuotaForFlippedItem(tx, { item: flipped, userId: payIn.userId }), { timeout: 10000 })
+          await models.$transaction(tx => consumeQuotaForFlippedItem(tx, { item: flipped, userId: payIn.userId }), TRANSACTION_OPTIONS)
         } catch (err) {
           logError('flipPendingToLive: quota consumption failed', err)
           alert('critical', 'flipped item quota consumption failed',
@@ -341,7 +343,7 @@ export async function flipPendingToLive (models, payIn, feePiconeros) {
       // (a poisoned flip tx would fail COMMIT regardless of the catch).
       if (flipped.parentId) {
         try {
-          await models.$transaction(tx => denormalizeComment(tx, flipped))
+          await models.$transaction(tx => denormalizeComment(tx, flipped), TRANSACTION_OPTIONS)
         } catch (err) {
           logError('flipPendingToLive: comment denormalization failed', err)
           alert('critical', 'comment denormalization failed after fee flip',

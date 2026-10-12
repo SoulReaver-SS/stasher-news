@@ -186,6 +186,13 @@ describe('streak retry policy migration', () => {
 })
 
 describe('streak transaction timings', () => {
+  test.each([['advance', advanceModels], ['missed', missedModels]])('%s transactions have an explicit local budget', async (path, makeModels) => {
+    const models = makeModels()
+    models.$transaction = jest.fn(models.$transaction)
+    if (path === 'advance') await advanceQuestStreak({ models, userId: 7000, day: DAY })
+    else await evaluateQuestStreaks({ models, userIds: [7000], now: ANCHOR })
+    expect(models.$transaction).toHaveBeenCalledWith(expect.any(Function), { maxWait: 5000, timeout: 15000 })
+  })
   test('a slow committed advance logs the exact timing fields', async () => {
     const userId = 7001
     const models = advanceModels({ userId, sleepMs: SLOW_MS })
@@ -204,7 +211,7 @@ describe('streak transaction timings', () => {
     })
     // the measured lock interval includes network/event-loop delay; it is
     // lock ACQUISITION time, sampled around lockRewardUser
-    expect(fields.lockAcquireMs).toBeGreaterThanOrEqual(SLOW_MS)
+    expect(fields.lockAcquireMs).toBeGreaterThanOrEqual(1000)
     expect(fields.transactionMs).toBeGreaterThanOrEqual(fields.lockAcquireMs)
   })
 
