@@ -154,19 +154,25 @@ export function xorWithMask (pid8, mask) {
  * @returns {string[]} hex pids (lowercase), [] when the tx carries none
  */
 export function paymentIdCandidates (extra, viewKeyHex) {
+  return [...iteratePaymentIdCandidates(extra, viewKeyHex)].filter(pid => pid !== null)
+}
+
+// Each public-key attempt is a step, including a malformed key (null). The
+// worker can yield between expensive curve operations; synchronous callers
+// retain paymentIdCandidates' byte-identical string-array contract.
+export function * iteratePaymentIdCandidates (extra, viewKeyHex) {
   const parsed = parseTxExtra(extra)
-  const out = []
-  if (parsed.plainPid != null) out.push(Buffer.from(parsed.plainPid).toString('hex'))
+  if (parsed.plainPid != null) yield Buffer.from(parsed.plainPid).toString('hex')
   if (parsed.encryptedPid != null) {
     for (const pubKey of parsed.pubKeys) {
       try {
-        out.push(xorWithMask(parsed.encryptedPid, maskFromTxPubKey(pubKey, viewKeyHex)).toString('hex'))
+        yield xorWithMask(parsed.encryptedPid, maskFromTxPubKey(pubKey, viewKeyHex)).toString('hex')
       } catch {
         // a malformed pubkey entry: skip its candidate, keep scanning
+        yield null
       }
     }
   }
-  return out
 }
 
 // Monero's varint (base-128, little-endian groups) — the output index suffix

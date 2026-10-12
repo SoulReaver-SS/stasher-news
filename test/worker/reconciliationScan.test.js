@@ -46,3 +46,17 @@ test('an unknown tip initiation date leaves the exhaustive transaction order int
   const rows = [{ hash: 'old', timestamp: '2020-01-01T00:00:00Z' }]
   expect(prioritizeRecentTransactions(rows, [{ detectedAt: null }])).toEqual(rows)
 })
+
+test('one extra with many public keys checkpoints each derivation, not only each transaction', async () => {
+  const pubkey = Buffer.from('58' + '66'.repeat(31), 'hex')
+  const extra = Buffer.concat([
+    Buffer.from([1]), pubkey, Buffer.from([4, 64]), ...Array(64).fill(pubkey),
+    Buffer.from([2, 9, 1]), Buffer.alloc(8)
+  ])
+  let checkpoints = 0
+  const checkpoint = () => { checkpoints++; return null }
+  for await (const { pids } of scanRawPaymentIds([{ hash: 'many-keys', extra }], '01' + '00'.repeat(31), checkpoint)) {
+    expect(pids).toHaveLength(65)
+  }
+  expect(checkpoints).toBeGreaterThanOrEqual(65)
+})

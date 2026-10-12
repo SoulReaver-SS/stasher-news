@@ -261,9 +261,13 @@ test('a later daily backstop settles the original failed day before the newer cl
   await prisma.streak.update({ where: { id: run.id }, data: { startedAt: new Date('2026-10-08T00:00:00Z') } })
   await bothCleared(userId, '2026-10-10')
   await bothCleared(userId, '2026-10-11')
-  const faulty = prisma.$extends({ query: { streak: {
-    async update () { throw new Error('evaluation interrupted') }
-  } } })
+  const faulty = prisma.$extends({
+    query: {
+      streak: {
+        async update () { throw new Error('evaluation interrupted') }
+      }
+    }
+  })
   await expect(evaluateQuestStreaks({ models: faulty, now: new Date('2026-10-11T00:10:00Z'), userIds: [userId] }))
     .rejects.toThrow('evaluation interrupted')
   const options = { models: prisma, now: new Date('2026-10-12T00:10:00Z'), userIds: [userId] }
@@ -318,12 +322,16 @@ test('one broken user does not prevent another user from settling', async () => 
   const second = await mkUser()
   await bothCleared(first, '2026-10-11')
   await bothCleared(second, '2026-10-11')
-  const faulty = prisma.$extends({ query: { user: {
-    async update ({ args, query }) {
-      if (args.where.id === first) throw new Error('first user interrupted')
-      return query(args)
+  const faulty = prisma.$extends({
+    query: {
+      user: {
+        async update ({ args, query }) {
+          if (args.where.id === first) throw new Error('first user interrupted')
+          return query(args)
+        }
+      }
     }
-  } } })
+  })
   await expect(evaluateQuestStreaks({ models: faulty, now: new Date('2026-10-12T00:10:00Z'), userIds: [first, second] }))
     .rejects.toThrow('first user interrupted')
   expect((await prisma.user.findUnique({ where: { id: first } })).streak).toBeNull()

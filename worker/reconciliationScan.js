@@ -1,6 +1,6 @@
 import { performance } from 'node:perf_hooks'
 import { setImmediate } from 'node:timers/promises'
-import { paymentIdCandidates } from '@/api/monero/pidDecrypt'
+import { iteratePaymentIdCandidates } from '@/api/monero/pidDecrypt'
 
 const RECENT_MARGIN_MS = 2 * 60 * 60 * 1000
 
@@ -15,7 +15,12 @@ export function createReconciliationCheckpoint ({ sliceMs = 10, now = () => perf
 
 export async function * scanRawPaymentIds (raws, viewKeyHex, checkpoint = createReconciliationCheckpoint()) {
   for (const raw of raws) {
-    const pids = paymentIdCandidates(raw.extra, viewKeyHex)
+    const pids = []
+    for (const pid of iteratePaymentIdCandidates(raw.extra, viewKeyHex)) {
+      if (pid !== null) pids.push(pid)
+      const pause = checkpoint()
+      if (pause) await pause
+    }
     const pause = checkpoint()
     if (pause) await pause
     yield { raw, pids }

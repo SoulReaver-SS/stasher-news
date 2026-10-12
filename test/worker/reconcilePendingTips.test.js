@@ -624,7 +624,8 @@ test('raw recovery yields before processing the remaining history', async () => 
     $transaction: async fn => fn({ $executeRaw: async () => 1 })
   }
   const out = await runReconcilePendingTipsOnce({
-    models, checkpoint,
+    models,
+    checkpoint,
     lwsClient: { getAddressTxs: async () => ({ transactions: [{ hash: 'paid', payment_id: 'wrong', timestamp: '2020-01-01T00:00:00Z', piconeros: 1n }] }) },
     daemonClient: fx.daemon,
     apply: async () => { expect(heartbeat).toBe(true); return 1n }

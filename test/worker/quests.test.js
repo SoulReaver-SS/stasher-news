@@ -266,13 +266,15 @@ test('reply banking failure rolls back its quest completion, so a retry cannot l
   const [root] = await prisma.$queryRaw`INSERT INTO "Item" ("userId", title, created_at) VALUES (${userId}::int, 'rollback root', ${now}) RETURNING id::int AS id`
   const [comment] = await prisma.$queryRaw`INSERT INTO "Item" ("userId", "parentId", "rootId", text, created_at) VALUES (${userId}::int, ${root.id}::int, ${root.id}::int, 'rollback reply', ${now}) RETURNING id::int AS id`
   created.items.push(root.id, comment.id)
-  const faulty = prisma.$extends({ query: {
-    async $queryRaw ({ args, query }) {
-      const sql = args?.strings?.join('') ?? String(args?.sql ?? args?.[0])
-      if (sql.includes('INSERT INTO "StreakReward"')) throw new Error('banking interrupted')
-      return query(args)
+  const faulty = prisma.$extends({
+    query: {
+      async $queryRaw ({ args, query }) {
+        const sql = args?.strings?.join('') ?? String(args?.sql ?? args?.[0])
+        if (sql.includes('INSERT INTO "StreakReward"')) throw new Error('banking interrupted')
+        return query(args)
+      }
     }
-  } })
+  })
   notifyQuestCompleted.mockClear()
   await expect(sweepQuestCompletions({ models: faulty, now, userIds: [userId] })).rejects.toThrow('banking interrupted')
   expect(await prisma.questCompletion.count({ where: { userId, day: dayDate } })).toBe(0)

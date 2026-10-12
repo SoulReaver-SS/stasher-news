@@ -261,7 +261,8 @@ export async function evaluateQuestStreaks ({ models, now = new Date(), userIds 
   const starts = new Map(cleared.map(row => [row.userId, row.day]))
   const latestRuns = await models.streak.findMany({
     where: { type: 'FLAME', ...(userIds ? { userId: { in: userIds } } : {}) },
-    distinct: ['userId'], orderBy: { startedAt: 'desc' }
+    distinct: ['userId'],
+    orderBy: { startedAt: 'desc' }
   })
   for (const run of latestRuns) {
     if (!run.endedAt) starts.set(run.userId, run.lastEvaluatedDay ? new Date(run.lastEvaluatedDay.getTime() + DAY_MS) : run.startedAt)
