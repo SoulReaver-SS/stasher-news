@@ -110,7 +110,8 @@ export default function Item ({
   const embed = parseEmbedUrl(item.url)
   // hide the bare URL line only when the card shows that exact status;
   // an unrelated main URL stays visible next to a body-derived preview
-  const mainIsSelected = canonicalXStatus(item.url)?.statusUrl === item.xPreview?.statusUrl
+  const mainStatus = canonicalXStatus(item.url)
+  const mainIsSelected = mainStatus != null && mainStatus.statusUrl === item.xPreview?.statusUrl
 
   return (
     <>
