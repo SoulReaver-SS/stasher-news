@@ -60,6 +60,8 @@ test('monerod down (get_info probe throws) triggers debounced critical alert, lw
   const o = opts({ lwsClient: lwsUp(), daemonClient: monerodDown(), now: () => 0 })
   const res = await runHealthProbeOnce(o)
   expect(res).toEqual({ lwsOk: true, monerodOk: false, height: 0, stalled: false })
+  expect(alertCalls(o.alert, 'monerod down')).toHaveLength(0)
+  await runHealthProbeOnce(o)
   expect(alertCalls(o.alert, 'monerod down')).toHaveLength(1)
   expect(alertCalls(o.alert, 'monerod down')[0][0]).toBe('critical')
   expect(alertCalls(o.alert, 'monerod down')[0][3]).toEqual({ dedupeKey: 'monerod-down' })
@@ -83,8 +85,23 @@ test('both services down fires both critical alerts independently', async () => 
   const res = await runHealthProbeOnce(o)
   expect(res).toEqual({ lwsOk: false, monerodOk: false, height: 0, stalled: false })
   expect(alertCalls(o.alert, 'lws down')).toHaveLength(1)
+  expect(alertCalls(o.alert, 'monerod down')).toHaveLength(0)
+  await runHealthProbeOnce(o)
   expect(alertCalls(o.alert, 'monerod down')).toHaveLength(1)
   expect(o.setStatus.mock.calls[0][0]).toMatchObject({ lws: false, monerod: false })
+})
+
+test('successful probes and process reset both break the consecutive-miss chain', async () => {
+  const o = opts({ lwsClient: lwsUp(), daemonClient: monerodDown() })
+  await runHealthProbeOnce(o)
+  await runHealthProbeOnce({ ...o, daemonClient: monerodUp(100) })
+  await runHealthProbeOnce(o)
+  expect(alertCalls(o.alert, 'monerod down')).toHaveLength(0)
+  __resetStallState()
+  await runHealthProbeOnce(o)
+  expect(alertCalls(o.alert, 'monerod down')).toHaveLength(0)
+  await runHealthProbeOnce(o)
+  expect(alertCalls(o.alert, 'monerod down')).toHaveLength(1)
 })
 
 test('height stall: unchanged height past MONEROD_STALL_THRESHOLD_MS triggers stall alert', async () => {

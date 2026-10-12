@@ -35,10 +35,12 @@ const STALL_THRESHOLD_MS = Number(process.env.MONEROD_STALL_THRESHOLD_MS) || 10 
 
 let lastHeight = null
 let heightFirstSeenAt = null
+let monerodConsecutiveMisses = 0
 
 export function __resetStallState () {
   lastHeight = null
   heightFirstSeenAt = null
+  monerodConsecutiveMisses = 0
 }
 
 export async function runHealthProbeOnce ({
@@ -98,8 +100,9 @@ export async function runHealthProbeOnce ({
   if (!lwsOk) {
     doAlert('critical', 'lws down', 'monero-lws wallet endpoint unreachable', { dedupeKey: 'lws-down' })
   }
-  if (!monerodOk) {
-    doAlert('critical', 'monerod down', 'monerod daemon unreachable (get_info probe failed)', { dedupeKey: 'monerod-down' })
+  monerodConsecutiveMisses = monerodOk ? 0 : Math.min(monerodConsecutiveMisses + 1, 2)
+  if (!monerodOk && monerodConsecutiveMisses >= 2) {
+    doAlert('critical', 'monerod down', 'monerod daemon unreachable (two consecutive get_info probes failed)', { dedupeKey: 'monerod-down' })
   }
   if (stalled) {
     doAlert('critical', 'monerod stalled', `chain height unchanged at ${height} for >= ${Math.round(stallThresholdMs / 1000)}s`, { dedupeKey: 'monerod-stall' })
