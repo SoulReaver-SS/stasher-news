@@ -12,6 +12,8 @@
 // Run via the node:22.21.1 helper container:
 //   docker exec sn-prisma npx jest test/api/monero/daemonClient.test.js
 
+const http = require('node:http')
+
 const DAEMON_MODULE = require.resolve('../../../api/monero/daemonClient')
 
 const MONEROD_URL = 'http://monerod:38081'
@@ -140,6 +142,56 @@ describe('getTransactions', () => {
     const client = makeClient(t)
     const out = await client.getTransactions(['abc'])
     expect(out[0].extra).toEqual(Buffer.from('deadbeef', 'hex'))
+  })
+
+  test('omits malformed hex extras instead of silently truncating them', async () => {
+    // Finding 1: Buffer.from('01zz', 'hex') silently yields [0x01] and an odd
+    // string is truncated too; converting before validating let a malformed
+    // acquisition pass the reader's Buffer check as usable evidence.
+    const t = recordingTransport(() => jsonRes(200, {
+      status: 'OK',
+      txs: [
+        { tx_hash: 'trailing', as_json: JSON.stringify({ extra: '01zz' }) },
+        { tx_hash: 'odd-length', as_json: JSON.stringify({ extra: 'abc' }) },
+        { tx_hash: 'good', as_json: JSON.stringify({ extra: 'deadbeef' }) }
+      ]
+    }))
+    const client = makeClient(t)
+    const out = await client.getTransactions(['trailing', 'odd-length', 'good'])
+    expect(out).toEqual([{ hash: 'good', extra: Buffer.from('deadbeef', 'hex'), vout: [] }])
+  })
+
+  test('omits malformed byte-array extras instead of coercing or truncating entries', async () => {
+    const t = recordingTransport(() => jsonRes(200, {
+      status: 'OK',
+      txs: [
+        { tx_hash: 'fraction', as_json: JSON.stringify({ extra: [1.5, 2] }) },
+        { tx_hash: 'negative', as_json: JSON.stringify({ extra: [-1] }) },
+        { tx_hash: 'stringy', as_json: JSON.stringify({ extra: [1, '2'] }) },
+        { tx_hash: 'out-of-range', as_json: JSON.stringify({ extra: [256] }) },
+        { tx_hash: 'unsafe', as_json: JSON.stringify({ extra: [2 ** 53] }) },
+        { tx_hash: 'empty-array', as_json: JSON.stringify({ extra: [] }) }
+      ]
+    }))
+    const client = makeClient(t)
+    const out = await client.getTransactions(['fraction', 'negative', 'stringy', 'out-of-range', 'unsafe', 'empty-array'])
+    expect(out).toEqual([{ hash: 'empty-array', extra: Buffer.alloc(0), vout: [] }])
+  })
+
+  test('keeps a legitimately empty extra ("" or []) as a zero-byte Buffer', async () => {
+    const t = recordingTransport(() => jsonRes(200, {
+      status: 'OK',
+      txs: [
+        { tx_hash: 'empty-string', as_json: JSON.stringify({ extra: '' }) },
+        { tx_hash: 'empty-array', as_json: JSON.stringify({ extra: [] }) }
+      ]
+    }))
+    const client = makeClient(t)
+    const out = await client.getTransactions(['empty-string', 'empty-array'])
+    expect(out).toEqual([
+      { hash: 'empty-string', extra: Buffer.alloc(0), vout: [] },
+      { hash: 'empty-array', extra: Buffer.alloc(0), vout: [] }
+    ])
   })
 
   test('carries vout target keys (legacy and tagged shapes)', async () => {
@@ -617,5 +669,93 @@ describe('getPaymentTransactions', () => {
     const client = makeClient(t)
     const lenient = await client.getTransactions([HASH_A])
     expect(lenient).toEqual([{ hash: HASH_A, extra: Buffer.from([1, 2, 3, 4]), vout: ['22'.repeat(32), '33'.repeat(32)] }])
+  })
+})
+
+// ---- request deadlines (Finding 1) -----------------------------------------
+//
+// The raw-evidence reader retries ONLY deadline expiry, so a deadline must be
+// distinguishable from every other transport/HTTP/RPC failure. Each request
+// path aborts its AbortController with a DaemonTimeoutError and the node
+// transport destroys the socket with the signal's reason (never a fresh
+// generic Error), so the typed error is what surfaces to callers.
+
+describe('request deadlines', () => {
+  test('DaemonTimeoutError carries the fixed DAEMON_TIMEOUT code', () => {
+    const err = new daemon.DaemonTimeoutError()
+    expect(err).toBeInstanceOf(Error)
+    expect(err.name).toBe('DaemonTimeoutError')
+    expect(err.code).toBe('DAEMON_TIMEOUT')
+  })
+
+  // Transport double upholding the same contract as the real node transport:
+  // a deadline rejects the request with the supplied signal's reason.
+  function hangingTransport () {
+    const calls = []
+    const fn = (url, { signal } = {}) => new Promise((resolve, reject) => {
+      calls.push({ url, signal })
+      const fail = () => reject(signal.reason)
+      if (signal.aborted) fail()
+      else signal.addEventListener('abort', fail, { once: true })
+    })
+    fn.calls = calls
+    return fn
+  }
+
+  test.each([
+    ['rpc (block header lookup)', client => client.getBlockHashByHeight(1)],
+    ['getTransactions', client => client.getTransactions([HASH_A])],
+    ['getPaymentTransactions', client => client.getPaymentTransactions([HASH_A])]
+  ])('%s aborts with the typed deadline error', async (label, call) => {
+    const t = hangingTransport()
+    const client = makeClient(t, { timeoutMs: 10 })
+    const err = await call(client).catch(e => e)
+    expect(t.calls).toHaveLength(1)
+    expect(t.calls[0].signal.reason).toBeInstanceOf(daemon.DaemonTimeoutError)
+    expect(err).toBeInstanceOf(daemon.DaemonTimeoutError)
+    expect(err.name).toBe('DaemonTimeoutError')
+    expect(err.code).toBe('DAEMON_TIMEOUT')
+  })
+
+  function listen (server) {
+    return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
+  }
+
+  test('the real node transport destroys a hung request with the typed deadline reason', async () => {
+    const server = http.createServer(() => {}) // accept and never respond
+    const port = await listen(server)
+    try {
+      const client = daemon.createDaemonClient({ daemonUrl: `http://127.0.0.1:${port}`, timeoutMs: 25 })
+      const err = await client.getTransactions([HASH_A]).catch(e => e)
+      expect(err).toBeInstanceOf(daemon.DaemonTimeoutError)
+      expect(err.code).toBe('DAEMON_TIMEOUT')
+    } finally {
+      await new Promise(resolve => server.close(resolve))
+    }
+  })
+
+  test('the real node transport destroys an already-aborted request with the signal reason', async () => {
+    const server = http.createServer(() => {})
+    const port = await listen(server)
+    const RealAbortController = global.AbortController
+    try {
+      const deadline = new daemon.DaemonTimeoutError()
+      // Simulate the race where the deadline fires before the transport binds
+      // its abort listener: the signal arrives already aborted, carrying the
+      // typed reason.
+      global.AbortController = class {
+        constructor () {
+          this.signal = { aborted: true, reason: deadline, addEventListener () {} }
+        }
+
+        abort () {}
+      }
+      const client = daemon.createDaemonClient({ daemonUrl: `http://127.0.0.1:${port}`, timeoutMs: 1000 })
+      const err = await client.getTransactions([HASH_A]).catch(e => e)
+      expect(err).toBe(deadline)
+    } finally {
+      global.AbortController = RealAbortController
+      await new Promise(resolve => server.close(resolve))
+    }
   })
 })

@@ -8,6 +8,7 @@ import { moneroTipsRecoveredTotal, moneroTipsExpiredTotal } from '@/lib/metrics'
 import { encryptViewKey } from '@/api/monero/viewkey'
 import { maskFromTxPubKey, xorWithMask } from '@/api/monero/pidDecrypt'
 import { createDaemonClient } from '@/api/monero/daemonClient'
+import { createReconciliationRawReader } from '@/worker/reconciliationRawTransactions'
 
 // lib/alert is mocked so operator pages are assertable without a network side
 // effect (reverseStaleDetections.test.js pattern).
@@ -670,9 +671,47 @@ test('daemon failure during the fallback does NOT expire unmatched tips (anti-st
   const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, daemonClient: daemon, apply: async () => {} })
   expect(out).toEqual({ recovered: 0, expired: 0, excluded: 0, pidFallback: 0 })
   expect(expiredWhere).toBeNull()
+  // Fixed category only — the transport message (which can embed view-key or
+  // payload material for other failure classes) never reaches the alert.
   expect(alert).toHaveBeenCalledWith('warn', 'lws raw-decrypt fallback failed',
-    expect.stringContaining('monerod get_transactions unavailable'),
+    expect.stringContaining('RAW_LOOKUP_FAILED'),
     expect.objectContaining({ dedupeKey: 'lws-pid-fallback-error' }))
+  expect(alert.mock.calls.map(args => args.join(' ')).join('\n')).not.toContain('monerod get_transactions unavailable')
+})
+
+test.each([
+  ['DAEMON_TIMEOUT', 'DAEMON_TIMEOUT'],
+  ['RAW_SCAN_BUDGET_EXHAUSTED', 'RAW_SCAN_BUDGET_EXHAUSTED'],
+  ['RAW_EVIDENCE_RESPONSE_INVALID', 'RAW_EVIDENCE_RESPONSE_INVALID'],
+  ['SOME_UNKNOWN_CODE', 'RAW_LOOKUP_FAILED']
+])('fallback failure alert surfaces only the fixed category for %s', async (code, expected) => {
+  const t = tip({ id: 43n, detectedAt: new Date(Date.now() - (2 * 24 * 60 * 60 * 1000)) })
+  const account = { id: 7, address: 'ADDR', status: 'ACTIVE', viewKey: {}, subaddresses: [] }
+  const lws = {
+    getAddressTxs: async () => ({
+      transactions: [{ hash: 'cafebabe', height: 100, payment_id: 'd048685749d57220', piconeros: 1000000000n, spent_outputs: [] }],
+      blockchain_height: 110
+    })
+  }
+  let expiredWhere = null
+  const models = {
+    observedTip: { findMany: async () => [t], updateMany: async ({ where }) => { expiredWhere = where; return { count: 1 } } },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async () => {}
+  }
+  const rawReader = {
+    read: async () => {
+      throw Object.assign(new Error(`sensitive-detail-${code}`), { code })
+    }
+  }
+  const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, rawReader, apply: async () => {} })
+  expect(out).toEqual({ recovered: 0, expired: 0, excluded: 0, pidFallback: 0 })
+  expect(expiredWhere).toBeNull()
+  expect(alert).toHaveBeenCalledWith('warn', 'lws raw-decrypt fallback failed',
+    expect.stringContaining(expected), { dedupeKey: 'lws-pid-fallback-error' })
+  const alerted = alert.mock.calls.map(args => args.join(' ')).join('\n')
+  expect(alerted).not.toContain('sensitive-detail-')
+  if (code !== expected) expect(alerted).not.toContain(code)
 })
 
 test('fallback that runs clean still expires genuinely unpaid tips', async () => {
@@ -695,6 +734,225 @@ test('fallback that runs clean still expires genuinely unpaid tips', async () =>
   const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, daemonClient: fx.daemon, apply: async () => {} })
   expect(out).toEqual({ recovered: 0, expired: 1, excluded: 0, pidFallback: 0 })
   expect(expiredWhere).toEqual({ id: 33n, state: 'PENDING' })
+})
+
+test('a partial raw response recovers a proven tip but defers expiry of the unmatched remainder', async () => {
+  // One candidate hash is answered, the other is missing. The proven tip is
+  // recovered (missing evidence never blocks a cryptographic match), but the
+  // still-unmatched expired-age tip must NOT be expired from a partial read.
+  const realPid = '661bf254912cb9f7'
+  const servedPid = 'd048685749d57220'
+  const txHash = 'b9c84119f7275b39'
+  const missingHash = 'cccc000000000000000000000000000000000000000000000000000000000000'
+  const recoverable = tip({ id: 46n, paymentId: realPid, tipperId: 6 })
+  const unpaid = tip({ id: 47n, paymentId: 'ffffffffffffffff', detectedAt: new Date(Date.now() - (2 * 24 * 60 * 60 * 1000)) })
+  const fx = wrongPidFixture({ pidHex: realPid, txHash })
+  const account = fx.account({ viewKey: fx.viewKey })
+  const lws = {
+    getAddressTxs: async () => ({
+      transactions: [
+        { hash: txHash, height: 3216990, payment_id: servedPid, piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 4, min_i: 2 } }] },
+        { hash: missingHash, height: 100, payment_id: servedPid, piconeros: 1n, spent_outputs: [] }
+      ],
+      blockchain_height: 3217000
+    })
+  }
+  let expiredWhere = null
+  const models = {
+    observedTip: {
+      findMany: async () => [recoverable, unpaid],
+      updateMany: async ({ where }) => { expiredWhere = where; return { count: 1 } }
+    },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async (fn) => { await fn({ $executeRaw: async () => 1 }) }
+  }
+  const daemon = { getTransactions: async () => [{ hash: txHash, extra: fx.extra }] }
+  const rawReader = createReconciliationRawReader({ daemon, sleep: async () => {}, random: () => 0 })
+  const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, rawReader, apply: async () => 700000000n })
+  expect(out).toEqual({ recovered: 1, expired: 0, excluded: 0, pidFallback: 1 })
+  expect(expiredWhere).toBeNull()
+  expect(alert).toHaveBeenCalledWith(
+    'warn', 'lws raw-decrypt fallback incomplete', expect.any(String),
+    expect.objectContaining({ dedupeKey: 'lws-pid-fallback-incomplete-7' })
+  )
+})
+
+test('zero raw candidates is a complete pass with no RPC (unpaid tips still expire)', async () => {
+  const t = tip({ id: 52n, paymentId: 'ffffffffffffffff', detectedAt: new Date(Date.now() - (2 * 24 * 60 * 60 * 1000)) })
+  const account = { id: 7, address: 'ADDR', status: 'ACTIVE', viewKey: {}, subaddresses: [] }
+  const lws = { getAddressTxs: async () => ({ transactions: [], blockchain_height: 110 }) }
+  let expiredWhere = null
+  const models = {
+    observedTip: {
+      findMany: async () => [t],
+      updateMany: async ({ where }) => { expiredWhere = where; return { count: 1 } }
+    },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async () => {}
+  }
+  const rawReader = { read: jest.fn(async () => { throw new Error('must not be called') }) }
+  const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, rawReader, apply: async () => {} })
+  expect(out).toEqual({ recovered: 0, expired: 1, excluded: 0, pidFallback: 0 })
+  expect(expiredWhere).toEqual({ id: 52n, state: 'PENDING' })
+  expect(rawReader.read).not.toHaveBeenCalled()
+})
+
+test('account-local freshness: a warm reader re-joins cached raw bytes to the CURRENT lws row', async () => {
+  // The reader caches only the public `extra` bytes. Height/amount/spent
+  // metadata must keep coming from the fresh lws scan row, or a stale amount
+  // could be credited (or a fresh self-send missed).
+  const realPid = '661bf254912cb9f7'
+  const servedPid = 'd048685749d57220'
+  const txHash = 'b9c84119f7275b39'
+  const fx = wrongPidFixture({ pidHex: realPid, txHash })
+  const account = fx.account({ viewKey: fx.viewKey })
+  const daemon = { getTransactions: jest.fn(async () => [{ hash: txHash, extra: fx.extra }]) }
+  const rawReader = createReconciliationRawReader({ daemon, sleep: async () => {}, random: () => 0 })
+  const row = over => ({
+    hash: txHash,
+    height: 100,
+    payment_id: servedPid,
+    piconeros: 1000000000n,
+    spent_outputs: [{ sender: { maj_i: 4, min_i: 2 } }],
+    ...over
+  })
+
+  // Run 1 (cold): reads and caches the raw bytes. Nothing matches; complete
+  // evidence lets the decoy's stale unpaid tip expire.
+  const decoy = tip({ id: 48n, paymentId: 'ffffffffffffffff', detectedAt: new Date(Date.now() - (2 * 24 * 60 * 60 * 1000)) })
+  const models1 = {
+    observedTip: { findMany: async () => [decoy], updateMany: async () => ({ count: 1 }) },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async () => {}
+  }
+  const first = await runReconcilePendingTipsOnce({
+    models: models1,
+    lwsClient: { getAddressTxs: async () => ({ transactions: [row()], blockchain_height: 110 }) },
+    rawReader,
+    apply: async () => {}
+  })
+  expect(first).toEqual({ recovered: 0, expired: 1, excluded: 0, pidFallback: 0 })
+  expect(daemon.getTransactions).toHaveBeenCalledTimes(1)
+
+  // Run 2 (warm): lws serves CHANGED height/amount for the same tx; the claim
+  // must bind the fresh row, not any remembered metadata.
+  const fresh = tip({ id: 49n, paymentId: realPid, tipperId: 6 })
+  const execs = []
+  const models2 = {
+    observedTip: { findMany: async () => [fresh], updateMany: async () => ({ count: 0 }) },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async (fn) => {
+      await fn({
+        $executeRaw: async (...args) => {
+          const q = args[0]
+          execs.push({ sql: Array.isArray(q) ? q.join('') : q.text, vals: [...args].slice(1).flat() })
+          return 1
+        }
+      })
+    }
+  }
+  const lws2 = { getAddressTxs: async () => ({ transactions: [row({ height: 222, piconeros: 2500000000n })], blockchain_height: 300 }) }
+  const second = await runReconcilePendingTipsOnce({ models: models2, lwsClient: lws2, rawReader, apply: async () => 700000000n })
+  expect(second).toEqual({ recovered: 1, expired: 0, excluded: 0, pidFallback: 1 })
+  expect(daemon.getTransactions).toHaveBeenCalledTimes(1) // warm cache: no second RPC
+  const detected = execs.find(e => e.sql.includes("state = 'DETECTED'") && e.sql.includes("state = 'PENDING'"))
+  expect(detected).toBeDefined()
+  expect(detected.vals).toContain(222)
+  expect(detected.vals).toContain(2500000000n)
+
+  // Restart: a new reader starts cold and refetches; the safety verdict is
+  // unchanged, only the RPC count moves.
+  const restarted = createReconciliationRawReader({ daemon, sleep: async () => {}, random: () => 0 })
+  const third = await runReconcilePendingTipsOnce({ models: models2, lwsClient: lws2, rawReader: restarted, apply: async () => 700000000n })
+  expect(third).toEqual({ recovered: 1, expired: 0, excluded: 0, pidFallback: 1 })
+  expect(daemon.getTransactions).toHaveBeenCalledTimes(2)
+})
+
+test('a hash removed from the current lws scan cannot mint a receipt from cached raw bytes', async () => {
+  const realPid = '661bf254912cb9f7'
+  const servedPid = 'd048685749d57220'
+  const txHash = 'b9c84119f7275b39'
+  const fx = wrongPidFixture({ pidHex: realPid, txHash })
+  const account = fx.account({ viewKey: fx.viewKey })
+  const daemon = { getTransactions: jest.fn(async () => [{ hash: txHash, extra: fx.extra }]) }
+  const rawReader = createReconciliationRawReader({ daemon, sleep: async () => {}, random: () => 0 })
+  const read = jest.spyOn(rawReader, 'read')
+
+  // Run 1: the current scan anchors the tx, so its extra enters the cache.
+  const decoy = tip({ id: 60n, paymentId: 'ffffffffffffffff', detectedAt: new Date(Date.now() - (2 * 24 * 60 * 60 * 1000)) })
+  const models1 = {
+    observedTip: { findMany: async () => [decoy], updateMany: async () => ({ count: 1 }) },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async () => {}
+  }
+  const lws1 = {
+    getAddressTxs: async () => ({
+      transactions: [{ hash: txHash, height: 3216990, payment_id: servedPid, piconeros: 1000000000n, spent_outputs: [] }],
+      blockchain_height: 3217000
+    })
+  }
+  const first = await runReconcilePendingTipsOnce({ models: models1, lwsClient: lws1, rawReader, apply: async () => {} })
+  expect(first).toEqual({ recovered: 0, expired: 1, excluded: 0, pidFallback: 0 })
+  expect(read).toHaveBeenCalledTimes(1)
+
+  // Run 2: lws no longer serves the row. The cached extra still decrypts to
+  // realPid, but with no current row to anchor it, no receipt may be built.
+  const trap = tip({ id: 61n, paymentId: realPid })
+  const claimed = []
+  const models2 = {
+    observedTip: { findMany: async () => [trap], updateMany: async () => ({ count: 0 }) },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async () => {}
+  }
+  const lws2 = { getAddressTxs: async () => ({ transactions: [], blockchain_height: 3217000 }) }
+  const second = await runReconcilePendingTipsOnce({
+    models: models2, lwsClient: lws2, rawReader, apply: async () => { claimed.push(trap.id) }
+  })
+  expect(second).toEqual({ recovered: 0, expired: 0, excluded: 0, pidFallback: 0 })
+  expect(claimed).toEqual([])
+  expect(read).toHaveBeenCalledTimes(1) // zero candidates: the cache is never re-read
+  expect(daemon.getTransactions).toHaveBeenCalledTimes(1) // only the warming read
+})
+
+test('raw acquisition summary logs counts only — no hashes, keys, or payloads', async () => {
+  const realPid = '661bf254912cb9f7'
+  const servedPid = 'd048685749d57220'
+  const txHash = 'b9c84119f7275b39'
+  const missingHash = 'cccc000000000000000000000000000000000000000000000000000000000000'
+  const t = tip({ id: 45n, paymentId: realPid, tipperId: 6 })
+  const fx = wrongPidFixture({ pidHex: realPid, txHash })
+  const account = fx.account({ viewKey: fx.viewKey })
+  const lws = {
+    getAddressTxs: async () => ({
+      transactions: [
+        { hash: txHash, height: 3216990, payment_id: servedPid, piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 4, min_i: 2 } }] },
+        { hash: missingHash, height: 100, payment_id: servedPid, piconeros: 1n, spent_outputs: [] }
+      ],
+      blockchain_height: 3217000
+    })
+  }
+  const daemon = { getTransactions: async () => [{ hash: txHash, extra: fx.extra }] }
+  const rawReader = createReconciliationRawReader({ daemon, sleep: async () => {}, random: () => 0 })
+  const models = {
+    observedTip: { findMany: async () => [t], updateMany: async () => ({ count: 0 }) },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async (fn) => { await fn({ $executeRaw: async () => 1 }) }
+  }
+  const log = jest.spyOn(console, 'log').mockImplementation(() => {})
+  try {
+    const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, rawReader, apply: async () => 700000000n })
+    expect(out).toEqual({ recovered: 1, expired: 0, excluded: 0, pidFallback: 1 })
+    const logged = log.mock.calls.map(args => args.join(' ')).join('\n')
+    expect(logged).toContain('requested=2')
+    expect(logged).toContain('fetched=1')
+    expect(logged).toContain('missing=1')
+    expect(logged).not.toContain(txHash)
+    expect(logged).not.toContain(missingHash)
+    expect(logged).not.toContain(servedPid)
+    expect(logged).not.toContain(realPid)
+  } finally {
+    log.mockRestore()
+  }
 })
 
 test('fallback is skipped entirely when no daemon is injected (legacy callers keep today\'s behavior)', async () => {
@@ -757,13 +1015,20 @@ test('chunked fallback recovers a wrong-pid tip on an account with >100 transact
       ok: true,
       text: async () => JSON.stringify({
         status: 'OK',
-        txs: batch.includes(txHash)
-          ? [{ tx_hash: txHash, as_json: JSON.stringify({ extra: Array.from(fx.extra) }) }]
-          : []
+        // Genuine full evidence: every requested hash is answered (empty extra
+        // for the unrelated history), so this run is COMPLETE. An omission
+        // here would make the fixture silently incomplete and unable to assert
+        // exhaustive expiry safety.
+        txs: batch.map(h => ({
+          tx_hash: h,
+          as_json: JSON.stringify({ extra: h === txHash ? Array.from(fx.extra) : [] })
+        }))
       })
     }
   }
   const daemon = createDaemonClient({ daemonUrl: 'http://monerod:38081', transport })
+  // Fresh reader: module-level singleton cache state must not hide requests.
+  const rawReader = createReconciliationRawReader({ daemon, sleep: async () => {}, random: () => 0 })
   let expiredWhere = null
   let applied = false
   const models = {
@@ -777,7 +1042,7 @@ test('chunked fallback recovers a wrong-pid tip on an account with >100 transact
   const out = await runReconcilePendingTipsOnce({
     models,
     lwsClient: lws,
-    daemonClient: daemon,
+    rawReader,
     apply: async () => { applied = true; return 700000000n }
   })
   expect(out).toEqual({ recovered: 1, expired: 0, excluded: 0, pidFallback: 1 })
@@ -788,7 +1053,11 @@ test('chunked fallback recovers a wrong-pid tip on an account with >100 transact
   expect(requests).toEqual([50, 50, 50, 4])
 })
 
-test('logs a warning (and still expires) when the daemon returns no raw txs for a non-empty candidate list', async () => {
+test('a non-empty candidate list with zero raw evidence is incomplete: expiry deferred, no updateMany', async () => {
+  // A non-empty candidate list answered with NO usable raw records is the
+  // exact shape a lookup failure takes (restricted-cap [] or a shrunken
+  // response). Missing evidence is not proof of nonpayment: the tip must stay
+  // PENDING and the next 2-min run retries — never expire on incomplete data.
   const t = tip({
     id: 41n,
     paymentId: 'ffffffffffffffff',
@@ -811,10 +1080,94 @@ test('logs a warning (and still expires) when the daemon returns no raw txs for 
     $transaction: async () => {}
   }
   const daemon = { getTransactions: async () => [] }
-  const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
-  const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, daemonClient: daemon, apply: async () => {} })
-  expect(out).toEqual({ recovered: 0, expired: 1, excluded: 0, pidFallback: 0 })
-  expect(expiredWhere).toEqual({ id: 41n, state: 'PENDING' })
-  expect(warn).toHaveBeenCalledWith(expect.stringContaining('no raw txs for 1 candidate hash(es) on account 7'))
-  warn.mockRestore()
+  const rawReader = createReconciliationRawReader({ daemon, sleep: async () => {}, random: () => 0 })
+  const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, rawReader, apply: async () => {} })
+  expect(out).toEqual({ recovered: 0, expired: 0, excluded: 0, pidFallback: 0 })
+  expect(expiredWhere).toBeNull()
+  expect(alert).toHaveBeenCalledWith(
+    'warn', 'lws raw-decrypt fallback incomplete', expect.any(String),
+    expect.objectContaining({ dedupeKey: 'lws-pid-fallback-incomplete-7' })
+  )
+})
+
+test('a malformed raw extra is missing evidence: expiry deferred, then refetched once corrected', async () => {
+  // Finding 1 end-to-end: '01zz' used to be silently truncated by
+  // Buffer.from(hex) into [0x01], so the daemonClient returned a "valid"
+  // Buffer, the reader counted the hash as available, the pass reported
+  // COMPLETE, and an unmatched, expired-age tip was EXPIRED off a malformed
+  // acquisition — and the malformed bytes then served from cache. After the
+  // fix the record is omitted (hash missing -> incomplete -> deferral), and a
+  // later read with corrected bytes must hit the RPC again.
+  const realPid = '661bf254912cb9f7'
+  const servedPid = 'd048685749d57220'
+  const txHash = 'b9c84119f7275b39'
+  const t = tip({
+    id: 50n,
+    paymentId: realPid,
+    tipperId: 6,
+    detectedAt: new Date(Date.now() - (2 * 24 * 60 * 60 * 1000))
+  })
+  const fx = wrongPidFixture({ pidHex: realPid, txHash })
+  const account = fx.account({ viewKey: fx.viewKey })
+  const lws = {
+    getAddressTxs: async () => ({
+      transactions: [{ hash: txHash, height: 3216990, payment_id: servedPid, piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 4, min_i: 2 } }] }],
+      blockchain_height: 3217000
+    })
+  }
+  const requestedHashes = []
+  let malformed = true
+  const transport = async (url, { body }) => {
+    const { txs_hashes: batch } = JSON.parse(body)
+    requestedHashes.push(...batch)
+    return {
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({
+        status: 'OK',
+        txs: batch.map(h => ({
+          tx_hash: h,
+          as_json: JSON.stringify({ extra: malformed ? '01zz' : Array.from(fx.extra) })
+        }))
+      })
+    }
+  }
+  const daemon = createDaemonClient({ daemonUrl: 'http://monerod:38081', transport })
+  const rawReader = createReconciliationRawReader({ daemon, sleep: async () => {}, random: () => 0 })
+  const expiredWheres = []
+  const models = {
+    observedTip: {
+      findMany: async () => [t],
+      updateMany: async ({ where }) => { expiredWheres.push(where); return { count: 1 } }
+    },
+    moneroAccount: { findMany: async () => [account] },
+    $transaction: async (fn) => {
+      await fn({
+        $executeRaw: async () => 1,
+        $queryRaw: async () => [{ subName: null }],
+        abuseSignal: { create: async () => {} }
+      })
+    }
+  }
+
+  const first = await runReconcilePendingTipsOnce({
+    models, lwsClient: lws, rawReader, apply: async () => { throw new Error('must not apply') }
+  })
+  expect(first).toEqual({ recovered: 0, expired: 0, excluded: 0, pidFallback: 0 })
+  expect(expiredWheres).toEqual([]) // no EXPIRED updateMany off malformed evidence
+  expect(alert).toHaveBeenCalledWith(
+    'warn', 'lws raw-decrypt fallback incomplete', expect.any(String),
+    expect.objectContaining({ dedupeKey: 'lws-pid-fallback-incomplete-7' })
+  )
+  expect(requestedHashes).toEqual([txHash])
+
+  // Corrected acquisition: the malformed response warmed nothing, so the same
+  // hash is fetched again and now recovers the tip.
+  malformed = false
+  const second = await runReconcilePendingTipsOnce({
+    models, lwsClient: lws, rawReader, apply: async () => 700000000n
+  })
+  expect(second).toEqual({ recovered: 1, expired: 0, excluded: 0, pidFallback: 1 })
+  expect(requestedHashes).toEqual([txHash, txHash])
+  expect(expiredWheres).toEqual([])
 })

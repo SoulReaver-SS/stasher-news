@@ -3,6 +3,7 @@ import { lwsClient } from '@/api/monero/lwsClient'
 import { daemonClient } from '@/api/monero/daemonClient'
 import { decryptViewKey } from '@/api/monero/viewkey'
 import { paymentIdCandidates } from '@/api/monero/pidDecrypt'
+import { getReconciliationRawReader } from '@/worker/reconciliationRawTransactions'
 import { applyTipDetected } from '@/api/monero/ranking'
 import { shouldExcludeTip, resolveItemSubName } from '@/api/monero/selfTip'
 import { RECONCILE_PENDING_AGE_MS, PENDING_EXPIRY_MS } from '@/lib/constants'
@@ -44,7 +45,10 @@ import { moneroPendingTips, moneroTipsRecoveredTotal, moneroTipsExpiredTotal } f
 // fallback match is cryptographic proof of payment: only the view-key holder can
 // compute the mask. Daemon/view-key failures never abort the run and DEFER the
 // expiry decision for that account's unmatched tips (a paid tip must not be
-// expired because a lookup was down); the next 2-min run retries.
+// expired because a lookup was down); the next 2-min run retries. INCOMPLETE
+// raw evidence defers just the same: a response missing candidate hashes is
+// "not established now", never proof of nonpayment — proven matches still
+// claim, the unmatched remainder stays PENDING.
 
 // Alert tiers: recoveries ARE missed webhooks (unpaid checkouts can never be
 // recovered — nothing on chain to find), so the operator page fires on the
@@ -54,6 +58,20 @@ import { moneroPendingTips, moneroTipsRecoveredTotal, moneroTipsExpiredTotal } f
 // they mean lws's stored rows are corrupt, not that webhooks were missed.
 const RECONCILE_RECOVERED_WARN = Number(process.env.RECONCILE_RECOVERED_WARN) || 1
 const RECONCILE_RECOVERED_CRITICAL = Number(process.env.RECONCILE_RECOVERED_CRITICAL) || 10
+
+// Fixed classification for raw-lookup failures. Only the reader's typed codes
+// are surfaced; every other failure (transport/HTTP/RPC/view-key) collapses to
+// RAW_LOOKUP_FAILED, so arbitrary exception text — which can embed view-key
+// material or raw payloads — never reaches operator alerts.
+const RAW_LOOKUP_ERROR_CATEGORIES = new Set([
+  'DAEMON_TIMEOUT',
+  'RAW_SCAN_BUDGET_EXHAUSTED',
+  'RAW_EVIDENCE_RESPONSE_INVALID'
+])
+
+function rawLookupCategory (err) {
+  return err && RAW_LOOKUP_ERROR_CATEGORIES.has(err.code) ? err.code : 'RAW_LOOKUP_FAILED'
+}
 
 // The atomic PENDING claim shared by the pid-keyed pass and the raw-decrypt
 // fallback: DETECTED or EXCLUDED, exactly-once vs the webhook and each other.
@@ -152,9 +170,10 @@ async function claimTip ({ models, apply, tip, tx, amount, direct, isExcluded })
 // One account's wrong-pid pass: match unmatched PENDING tips against the
 // recipient-side decryption of every scanned tx's encrypted pid. Returns claim
 // counts + the set of tip ids THIS pass claimed (so the caller does not expire
-// them). THROWS on daemon/view-key failure so the caller can defer the expiry
-// decision (a paid tip must never be expired because a lookup failed).
-async function recoverByRawDecrypt ({ models, apply, daemon, account, transactions, tips }) {
+// them) + `complete`: every candidate hash had usable raw evidence right now.
+// THROWS on daemon/view-key failure so the caller can defer the expiry decision
+// (a paid tip must never be expired because a lookup failed).
+async function recoverByRawDecrypt ({ models, apply, rawReader, account, transactions, tips }) {
   const pendingPids = new Set(tips.map(t => String(t.paymentId).toLowerCase()))
   const rowByHash = new Map()
   for (const row of transactions || []) {
@@ -168,20 +187,18 @@ async function recoverByRawDecrypt ({ models, apply, daemon, account, transactio
   for (const [h, row] of rowByHash) {
     if (!pendingPids.has(String(row.payment_id ?? '').toLowerCase())) candidateHashes.push(h)
   }
-  if (!candidateHashes.length) return { recovered: 0, excluded: 0, claimedTipIds: new Set() }
+  // Zero candidates is a COMPLETE pass: there is nothing this account could
+  // still prove. No RPC, no deferral — the caller's expiry pass runs.
+  if (!candidateHashes.length) return { recovered: 0, excluded: 0, claimedTipIds: new Set(), complete: true }
 
-  const raws = await daemon.getTransactions(candidateHashes)
-  if (!raws.length) {
-    // A non-empty candidate list answered with zero raw txs is the exact shape
-    // an oversized /get_transactions request used to take (restricted mode:
-    // HTTP 200 + status, no txs) before the client batched + status-checked.
-    // Post-fix this is a genuine "not found" answer, but if it reappears in the
-    // logs a lookup silently stopped seeing txs lws knows about — never let
-    // that be invisible again (mainnet incident 2026-09-15).
-    console.warn(`reconcilePendingTips: monerod returned no raw txs for ${candidateHashes.length} candidate hash(es) on account ${account.id}`)
-    return { recovered: 0, excluded: 0, claimedTipIds: new Set() }
-  }
-  const viewKeyHex = decryptViewKey(account.viewKey)
+  const startedAt = Date.now()
+  const { raws, missingHashes, stats } = await rawReader.read(candidateHashes)
+  // Safe acquisition summary: counts + elapsed only, never hashes/keys/payloads.
+  console.log(`reconcilePendingTips: raw acquisition summary account=${account.id} requested=${stats.requested} cached=${stats.cached} fetched=${stats.fetched} missing=${missingHashes.length} batches=${stats.batches} retries=${stats.retries} elapsedMs=${Date.now() - startedAt}`)
+  // Only decrypt when there is evidence to decrypt: an all-missing response
+  // is classified as INCOMPLETE (defer), regardless of the view-key envelope
+  // — with zero raws there is nothing a view key could prove.
+  const viewKeyHex = raws.length > 0 ? decryptViewKey(account.viewKey) : null
 
   // recipient-side pid -> tx row (first hit wins; 8-byte pid collisions
   // between different txs of one account are 2^-64-negligible)
@@ -213,12 +230,18 @@ async function recoverByRawDecrypt ({ models, apply, daemon, account, transactio
     if (out.excluded) excluded += 1
     if (out.recovered || out.excluded) claimedTipIds.add(tip.id)
   }
-  return { recovered, excluded, claimedTipIds }
+  // A partial response still yields every positively proven claim above, but
+  // the missing subset means the remaining unmatched tips are NOT proven
+  // nonpayers: the caller defers their expiry to the next 2-min run.
+  return { recovered, excluded, claimedTipIds, complete: missingHashes.length === 0 }
 }
 
 export async function runReconcilePendingTipsOnce ({
-  models, lwsClient: client = lwsClient, apply = applyTipDetected, daemonClient: daemon = null
+  models, lwsClient: client = lwsClient, apply = applyTipDetected, daemonClient: daemon = null, rawReader = null
 }) {
+  // Injected reader wins; otherwise the shared per-daemon reader; with neither
+  // the raw pass keeps its legacy no-op (existing core callers/tests).
+  const reader = rawReader ?? (daemon ? getReconciliationRawReader(daemon) : null)
   const now = Date.now()
   const reconcileBefore = new Date(now - RECONCILE_PENDING_AGE_MS)
   const expireBefore = new Date(now - PENDING_EXPIRY_MS)
@@ -284,21 +307,33 @@ export async function runReconcilePendingTipsOnce ({
     }
 
     // Pass 2 — wrong-pid raw-decrypt fallback for the unmatched remainder
-    // (daemon omitted -> legacy no-op). A failure defers this account's
-    // expiry decisions to the next run (anti-strand), never aborts the job.
+    // (no reader/daemon -> legacy no-op). A failure or a PARTIAL evidence
+    // response defers this account's expiry decisions to the next run
+    // (anti-strand), never aborts the job.
     let fallbackClaimed = new Set()
-    if (unmatched.length && daemon && !unscannable) {
+    if (unmatched.length && reader && !unscannable) {
       try {
         const out = await recoverByRawDecrypt({
-          models, apply, daemon, account, transactions: scanTxs, tips: unmatched
+          models, apply, rawReader: reader, account, transactions: scanTxs, tips: unmatched
         })
         recovered += out.recovered
         excluded += out.excluded
         pidFallback += out.recovered + out.excluded
         fallbackClaimed = out.claimedTipIds
+        if (!out.complete) {
+          // Some candidate hashes had no usable raw evidence right now.
+          // Caught claims stand (each is cryptographically proven), but the
+          // still-unmatched tips must not be judged from an incomplete
+          // response: defer their expiry; the next 2-min run retries.
+          alert('warn', 'lws raw-decrypt fallback incomplete',
+            `account ${account.id}: raw evidence unavailable; unmatched tip expiry deferred`,
+            { dedupeKey: `lws-pid-fallback-incomplete-${account.id}` })
+          continue
+        }
       } catch (err) {
+        // Fixed-category classification only — never the arbitrary error text.
         alert('warn', 'lws raw-decrypt fallback failed',
-          `${err && err.message} — expiry deferred for ${unmatched.length} tip(s) on account ${account.id}; next run retries`,
+          `${rawLookupCategory(err)} — expiry deferred for ${unmatched.length} tip(s) on account ${account.id}; next run retries`,
           { dedupeKey: 'lws-pid-fallback-error' })
         // nothing on this account expires this run
         continue

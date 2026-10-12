@@ -31,6 +31,7 @@ import { runReconcileOwnerFeeLegsOnce, reconcileOwnerFeeLegs } from '@/worker/re
 import { encryptViewKey } from '@/api/monero/viewkey'
 import { maskFromTxPubKey, paymentIdCandidates, xorWithMask } from '@/api/monero/pidDecrypt'
 import { createDaemonClient, daemonClient } from '@/api/monero/daemonClient'
+import { createReconciliationRawReader } from '@/worker/reconciliationRawTransactions'
 import { lwsClient } from '@/api/monero/lwsClient'
 import { applySubFeeReceipt } from '../../api/monero/subFeeObservation'
 import { alert } from '../../lib/alert'
@@ -142,7 +143,21 @@ function feeCase (evidence) {
     acc,
     models: makeModels({ maps: [leg({ paymentId: ISSUED_PID })], payIns: [pi], accounts: [acc] }),
     monero: { getAddressTxs: jest.fn(async () => ({ transactions: evidence.map(e => e.row) })) },
-    daemon: { getTransactions: jest.fn(async hashes => evidence.filter(e => hashes.includes(e.raw.hash)).map(e => e.raw)) }
+    // monerod answers each requested hash at most once — never duplicate the
+    // same record when an lws scan repeats a row (the reader refuses
+    // duplicate/foreign records by design).
+    daemon: {
+      getTransactions: jest.fn(async hashes => {
+        const out = []
+        const seen = new Set()
+        for (const e of evidence) {
+          if (!hashes.includes(e.raw.hash) || seen.has(e.raw.hash)) continue
+          seen.add(e.raw.hash)
+          out.push(e.raw)
+        }
+        return out
+      })
+    }
   }
 }
 
@@ -554,7 +569,9 @@ test('owner history over 100 hashes uses the existing batched daemon transport',
     return { ok: true, status: 200, text: async () => JSON.stringify({ status: 'OK', txs }) }
   }
   const daemon = createDaemonClient({ daemonUrl: 'http://test.invalid', transport })
-  await runReconcileOwnerFeeLegsOnce({ models: fx.models, monero: fx.monero, daemonClient: daemon })
+  // Fresh reader: module-level singleton cache state must not hide requests.
+  const rawReader = createReconciliationRawReader({ daemon })
+  await runReconcileOwnerFeeLegsOnce({ models: fx.models, monero: fx.monero, rawReader })
   expect(batches).toEqual([50, 50, 50, 1])
   expect(applySubFeeReceipt).toHaveBeenCalledTimes(1)
   expect(applySubFeeReceipt).toHaveBeenCalledWith(fx.models, expect.objectContaining({ txHash: target.row.hash }))
@@ -616,6 +633,108 @@ test('multiple candidate active PIDs for one raw hash are refused', async () => 
   await runReconcileOwnerFeeLegsOnce({ models, monero, daemonClient: daemon })
   expect(applySubFeeReceipt).not.toHaveBeenCalled()
   expect(alert).toHaveBeenCalledWith('warn', 'owner-fee ambiguous raw payment id refused', expect.any(String), { dedupeKey: `subfee-pid-ambiguous-7-${evidence.row.hash}` })
+})
+
+test('one raw hash decrypts independently under each owner view key', async () => {
+  // A tx's encrypted pid is masked by a per-view-key derivation: the SAME raw
+  // extra must be re-decrypted account-locally, never frozen to whichever
+  // owner's key happened to touch the shared cache first.
+  const keyA = TEST_VIEW_KEY
+  const keyB = '02' + '00'.repeat(31)
+  const pub = Buffer.from(ed25519.ExtendedPoint.BASE.multiply(2n).toRawBytes())
+  const stored = xorWithMask(Buffer.from(ISSUED_PID, 'hex'), maskFromTxPubKey(pub, keyA))
+  const extra = Buffer.concat([Buffer.from([1]), pub, Buffer.from([2, 9, 1]), stored])
+  const pidB = paymentIdCandidates(extra, keyB)[0]
+  expect(pidB).toBeDefined()
+  expect(pidB).not.toBe(ISSUED_PID)
+
+  const hash = 'ab'.repeat(32)
+  const accA = account({ viewKey: encryptViewKey(keyA) })
+  const accB = account({ id: 9, ownerUserId: 9, address: 'ADDR2', viewKey: encryptViewKey(keyB) })
+  const models = makeModels({
+    maps: [leg({ paymentId: ISSUED_PID }), leg({ id: 2, paymentId: pidB, ownerUserId: 9 })],
+    payIns: [payIn({ moneroPaymentId: ISSUED_PID }), payIn({ id: 102, moneroPaymentId: pidB })],
+    accounts: [accA, accB]
+  })
+  const daemon = { getTransactions: jest.fn(async () => [{ hash, extra }]) }
+  const rawReader = createReconciliationRawReader({ daemon })
+  const monero = {
+    getAddressTxs: jest.fn(async () => ({
+      transactions: [{ hash, payment_id: SERVED_PID, height: 500, piconeros: 1_000_000_000n, spent_outputs: [] }]
+    }))
+  }
+  const out = await runReconcileOwnerFeeLegsOnce({ models, monero, rawReader })
+  expect(out).toEqual({ legs: 2, replayed: 2, flipped: 2, pidFallback: 0 })
+  const receipts = applySubFeeReceipt.mock.calls.map(([, receipt]) => receipt)
+  expect(receipts.map(r => r.paymentId).sort()).toEqual([ISSUED_PID, pidB].sort())
+  expect(receipts.reduce((sum, r) => sum + r.piconeros, 0n)).toBe(2_000_000_000n)
+  // ONE shared cache entry, fetched once; each owner decrypted it locally.
+  expect(daemon.getTransactions).toHaveBeenCalledTimes(1)
+})
+
+test('served-pid discovery finds receipt A and raw discovery finds receipt B for the same issued PID', async () => {
+  // Multi-top-up parity: a served-pid hit must not stop raw discovery — and
+  // vice versa. Both receipts reach the shared applier, and the hourly re-run
+  // routes them again (the applier's insert is idempotent in production).
+  const served = feeEvidence({ hash: 'ab'.repeat(32), row: { piconeros: 400_000_000n, payment_id: ISSUED_PID } })
+  const scrambled = feeEvidence({ hash: 'cd'.repeat(32), row: { piconeros: 600_000_000n } })
+  const fx = feeCase([served, scrambled])
+  const first = await runReconcileOwnerFeeLegsOnce({ models: fx.models, monero: fx.monero, daemonClient: fx.daemon })
+  expect(first).toEqual({ legs: 1, replayed: 2, flipped: 2, pidFallback: 0 })
+  expect(applySubFeeReceipt.mock.calls.map(([, r]) => r.txHash)).toEqual([served.row.hash, scrambled.row.hash])
+  for (const [, receipt] of applySubFeeReceipt.mock.calls) {
+    expect(receipt.paymentId).toBe(ISSUED_PID)
+    expect(receipt.feePayIn).toBe(fx.pi)
+  }
+
+  applySubFeeReceipt.mockClear()
+  const replay = await runReconcileOwnerFeeLegsOnce({ models: fx.models, monero: fx.monero, daemonClient: fx.daemon })
+  expect(replay).toEqual({ legs: 1, replayed: 2, flipped: 2, pidFallback: 0 })
+  expect(applySubFeeReceipt.mock.calls.map(([, r]) => r.txHash)).toEqual([served.row.hash, scrambled.row.hash])
+  expect(alert).not.toHaveBeenCalledWith('warn', 'owner-fee payment-id misattribution recovered', expect.anything(), expect.anything())
+})
+
+test('a warm reader re-joins cached raw bytes to the CURRENT lws row; a restart only refetches', async () => {
+  // The reader caches only public `extra` bytes. Amount/height must keep
+  // coming from the fresh lws scan row or a stale receipt could be replayed.
+  const evidence = feeEvidence()
+  const fx = feeCase([evidence])
+  const rawReader = createReconciliationRawReader({ daemon: fx.daemon })
+  const row = over => ({ ...evidence.row, ...over })
+
+  const first = await runReconcileOwnerFeeLegsOnce({
+    models: fx.models,
+    monero: { getAddressTxs: async () => ({ transactions: [row()] }) },
+    rawReader
+  })
+  expect(first).toEqual({ legs: 1, replayed: 1, flipped: 1, pidFallback: 0 })
+  expect(applySubFeeReceipt).toHaveBeenLastCalledWith(fx.models, expect.objectContaining({ height: 500, piconeros: 1_000_000_000n }))
+  expect(fx.daemon.getTransactions).toHaveBeenCalledTimes(1)
+
+  // Warm run: CHANGED height/amount for the same hash — the applier must see
+  // the fresh row, and the cache means no second RPC.
+  applySubFeeReceipt.mockClear()
+  const second = await runReconcileOwnerFeeLegsOnce({
+    models: fx.models,
+    monero: { getAddressTxs: async () => ({ transactions: [row({ height: 900, piconeros: 2_000_000_000n })] }) },
+    rawReader
+  })
+  expect(second).toEqual({ legs: 1, replayed: 1, flipped: 1, pidFallback: 0 })
+  expect(applySubFeeReceipt).toHaveBeenCalledWith(fx.models, expect.objectContaining({ height: 900, piconeros: 2_000_000_000n }))
+  expect(fx.daemon.getTransactions).toHaveBeenCalledTimes(1)
+
+  // Simulated restart: a factory-new reader starts cold, so the same evidence
+  // is fetched again — the receipt outcome is unchanged.
+  applySubFeeReceipt.mockClear()
+  const restarted = createReconciliationRawReader({ daemon: fx.daemon })
+  const third = await runReconcileOwnerFeeLegsOnce({
+    models: fx.models,
+    monero: { getAddressTxs: async () => ({ transactions: [row({ height: 900, piconeros: 2_000_000_000n })] }) },
+    rawReader: restarted
+  })
+  expect(third).toEqual({ legs: 1, replayed: 1, flipped: 1, pidFallback: 0 })
+  expect(applySubFeeReceipt).toHaveBeenCalledTimes(1)
+  expect(fx.daemon.getTransactions).toHaveBeenCalledTimes(2)
 })
 
 test('malformed raw extra cannot manufacture a PID match', async () => {

@@ -32,6 +32,29 @@ const DEFAULT_TIMEOUT_MS = 15000
 // comfortably under the cap, and decode_as_json responses stay smaller.
 export const MAX_TX_HASHES_PER_REQUEST = 50
 
+// An `extra` blob counts as evidence only when its encoding is VALID before any
+// conversion. Buffer.from('01zz', 'hex') silently truncates to [0x01] and
+// Buffer.from([2 ** 53]) coerces/truncates out-of-range array entries, so a
+// malformed acquisition would otherwise reach the raw-evidence reader as a
+// "valid" Buffer and could authorise an expiry verdict. Valid forms: an even
+// length hex string (the EMPTY string is legitimate) or an array whose every
+// element is a safe 0..255 integer.
+const HEX_BYTES_RE = /^(?:[0-9a-fA-F]{2})*$/
+const isByteValue = b => Number.isSafeInteger(b) && b >= 0 && b <= 255
+
+// A request that exceeded its deadline aborts with this typed error (Finding
+// 1) so callers can tell "monerod did not answer in time" apart from every
+// other transport/HTTP/RPC failure. The fixed code is safe to classify
+// without echoing arbitrary error text, and the retry decision belongs to the
+// caller (the raw-evidence reader retries exactly one deadline per batch).
+export class DaemonTimeoutError extends Error {
+  constructor () {
+    super('monerod request deadline exceeded')
+    this.name = 'DaemonTimeoutError'
+    this.code = 'DAEMON_TIMEOUT'
+  }
+}
+
 class DaemonHttpError extends Error {
   constructor (status) {
     super(`monerod JSON-RPC returned HTTP ${status}`)
@@ -57,7 +80,9 @@ function readEnv (name, fallback) {
 
 // Real transport on node:http/https — same shape as lwsClient's real transport
 // ({status, ok, text}). Honours an AbortSignal so the client response timeout
-// can destroy a hung request.
+// can destroy a hung request. Both abort branches destroy with the signal's
+// error reason (the client's typed DaemonTimeoutError), never a fresh generic
+// error, so the deadline stays classifiable by the time it reaches the caller.
 function makeTransport () {
   return function transport (url, { method = 'POST', headers = {}, body, signal } = {}) {
     return new Promise((resolve, reject) => {
@@ -81,8 +106,8 @@ function makeTransport () {
       })
       req.on('error', reject)
       if (signal) {
-        if (signal.aborted) req.destroy(new Error('aborted'))
-        else signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true })
+        if (signal.aborted) req.destroy(signal.reason)
+        else signal.addEventListener('abort', () => req.destroy(signal.reason), { once: true })
       }
       if (body !== undefined && body !== null) req.write(body)
       req.end()
@@ -125,7 +150,7 @@ export function createDaemonClient (options = {}) {
     const base = requireUrl()
     const body = JSON.stringify({ jsonrpc: '2.0', id: '0', method, params })
     const ac = new AbortController()
-    const timer = setTimeout(() => ac.abort(), timeoutMs)
+    const timer = setTimeout(() => ac.abort(new DaemonTimeoutError()), timeoutMs)
     let res
     try {
       res = await transport(`${base}/json_rpc`, { method: 'POST', body, signal: ac.signal })
@@ -165,7 +190,7 @@ export function createDaemonClient (options = {}) {
   async function fetchTxBatch (base, hashes) {
     const body = JSON.stringify({ txs_hashes: hashes, decode_as_json: true })
     const ac = new AbortController()
-    const timer = setTimeout(() => ac.abort(), timeoutMs)
+    const timer = setTimeout(() => ac.abort(new DaemonTimeoutError()), timeoutMs)
     let res
     try {
       res = await transport(`${base}/get_transactions`, { method: 'POST', body, signal: ac.signal })
@@ -190,7 +215,10 @@ export function createDaemonClient (options = {}) {
    * feed the recipient ownership proof (a 0-conf tx is only credited when one
    * of its outputs derives to the claimed recipient). decode_as_json hands
    * back the parsed tx as a JSON string; monerod serializes `extra` as a byte
-   * array (older builds: hex string) — both are normalized to a Buffer. vout
+   * array (older builds: hex string) — both are validated for encoding BEFORE
+   * conversion and then normalized to a Buffer; a malformed extra (bad hex,
+   * out-of-range array entries) omits the tx like unparseable as_json, so a
+   * malformed acquisition is never mistaken for usable evidence. vout
    * entries are reduced to their one-time key (legacy `target.key` or v2
    * `target.tagged_key.key`), with null preserved for entries that carry no
    * key. Restricted RPC permits this endpoint but caps a single request at 100
@@ -213,8 +241,16 @@ export function createDaemonClient (options = {}) {
         if (typeof tx.as_json === 'string' && tx.as_json) {
           try {
             const parsed = JSON.parse(tx.as_json)
-            if (Array.isArray(parsed.extra)) extra = Buffer.from(parsed.extra)
-            else if (typeof parsed.extra === 'string') extra = Buffer.from(parsed.extra, 'hex')
+            // Validate the ENCODING before conversion (see HEX_BYTES_RE /
+            // isByteValue above): an invalid extra omits the tx, exactly like
+            // unparseable as_json, so callers see the hash as missing
+            // (incomplete evidence -> expiry deferred, never an expiry off a
+            // malformed acquisition).
+            if (Array.isArray(parsed.extra)) {
+              if (parsed.extra.every(isByteValue)) extra = Buffer.from(parsed.extra)
+            } else if (typeof parsed.extra === 'string') {
+              if (HEX_BYTES_RE.test(parsed.extra)) extra = Buffer.from(parsed.extra, 'hex')
+            }
             if (Array.isArray(parsed.vout)) {
               vout = parsed.vout.map((o) => o?.target?.key ?? o?.target?.tagged_key?.key ?? null)
             }
@@ -468,7 +504,7 @@ export function createDaemonClient (options = {}) {
       const batch = hashes.slice(i, i + MAX_TX_HASHES_PER_REQUEST)
       const body = JSON.stringify({ txs_hashes: batch, decode_as_json: true, prune: false })
       const ac = new AbortController()
-      const timer = setTimeout(() => ac.abort(), timeoutMs)
+      const timer = setTimeout(() => ac.abort(new DaemonTimeoutError()), timeoutMs)
       let res
       try {
         res = await transport(`${base}/get_transactions`, { method: 'POST', body, signal: ac.signal })

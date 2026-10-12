@@ -4,6 +4,7 @@ import { applySubFeeReceipt } from '@/api/monero/subFeeObservation'
 import { isSelfSend } from '@/api/monero/selfTip'
 import { decryptViewKey } from '@/api/monero/viewkey'
 import { paymentIdCandidates } from '@/api/monero/pidDecrypt'
+import { getReconciliationRawReader } from '@/worker/reconciliationRawTransactions'
 import { alert } from '@/lib/alert'
 
 // Cron-owned backstop for owner-routed fee legs (the eighth money-observation
@@ -30,7 +31,10 @@ import { alert } from '@/lib/alert'
 // Raw discovery is attribution-only: the amount/height still come from the
 // owner account's lws row (a raw extra proves the pid, never the RingCT
 // amount), and every receipt keeps the applier's provisional-height discipline.
-// Never self-requeues — a failed run heals at the next hourly cron tick.
+// It runs through the shared bounded reader (worker/reconciliationRawTransactions.js):
+// completed batches survive later failures/ticks, while incomplete evidence
+// only warns + defers — it never fabricates a receipt. Never self-requeues —
+// a failed run heals at the next hourly cron tick.
 
 // The single receipt path shared by served-pid matches and raw-decrypt
 // matches. Extracted so both paths keep byte-identical money effects:
@@ -83,14 +87,17 @@ async function replayOwnerReceipt ({ models, account, leg, tx }) {
 // response that omits or invents hashes can never stand in for the requested
 // transaction. A candidate hash yielding more than one distinct active pid is
 // refused outright (ambiguous attribution is not evidence for either leg).
-async function findRawFeeMatches ({ daemon, account, rowsByHash, legByPid }) {
+async function findRawFeeMatches ({ rawReader, account, rowsByHash, legByPid }) {
   const hashes = [...rowsByHash.keys()]
   if (!hashes.length) return []
-  const raws = await daemon.getTransactions(hashes)
+  const startedAt = Date.now()
+  const { raws, missingHashes, stats } = await rawReader.read(hashes)
+  // Safe acquisition summary: counts + elapsed only, never hashes/keys/payloads.
+  console.log(`reconcileOwnerFeeLegs: raw acquisition summary account=${account.id} requested=${stats.requested} cached=${stats.cached} fetched=${stats.fetched} missing=${missingHashes.length} batches=${stats.batches} retries=${stats.retries} elapsedMs=${Date.now() - startedAt}`)
   const viewKeyHex = decryptViewKey(account.viewKey)
   const matches = []
   const seen = new Set()
-  for (const raw of raws || []) {
+  for (const raw of raws) {
     const hash = String(raw.hash ?? '').toLowerCase()
     const tx = rowsByHash.get(hash)
     if (!tx || seen.has(hash)) continue
@@ -107,15 +114,18 @@ async function findRawFeeMatches ({ daemon, account, rowsByHash, legByPid }) {
   // consulted for those rows. Warn so a silently-shrunken response cannot
   // strand a paid leg unnoticed; the next hourly run retries (lws history
   // persists, and a pruned/never-scanned row simply stays unmatched).
-  if (seen.size < hashes.length) {
+  if (missingHashes.length > 0) {
     alert('warn', 'owner-fee raw transaction evidence incomplete',
-      `account ${account.id}: ${hashes.length - seen.size} of ${hashes.length} raw transactions unavailable; next hourly run retries`,
+      `account ${account.id}: ${missingHashes.length} of ${hashes.length} raw transactions unavailable; next hourly run retries`,
       { dedupeKey: `subfee-pid-fallback-incomplete-${account.id}` })
   }
   return matches
 }
 
-export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient, daemonClient: daemon = null }) {
+export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient, daemonClient: daemon = null, rawReader = null }) {
+  // Injected reader wins; otherwise the shared per-daemon reader; with neither
+  // the raw pass keeps its legacy no-op (existing core callers/tests).
+  const reader = rawReader ?? (daemon ? getReconciliationRawReader(daemon) : null)
   // Active legs = map rows still holding an lws webhook (unexpired) whose
   // PayIn still exists. NO payInState filter: fee payIns are created PAID by
   // design (piconeros=0 — the fee-gated Item/Sub lives on Item.feeStatus, not
@@ -198,9 +208,9 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
     // an applier/DB write failure outside this catch must fail the cron run
     // and retry rather than masquerade as a lookup miss.
     let rawMatches = []
-    if (daemon && rawRows.size) {
+    if (reader && rawRows.size) {
       try {
-        rawMatches = await findRawFeeMatches({ daemon, account, rowsByHash: rawRows, legByPid })
+        rawMatches = await findRawFeeMatches({ rawReader: reader, account, rowsByHash: rawRows, legByPid })
       } catch {
         // Fixed-category diagnostics only: transport/crypto error text can
         // embed sensitive input (key material, raw payloads), so neither this
