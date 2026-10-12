@@ -326,8 +326,13 @@ test('a mature DETECTED wash tip (self-send from the recipient own wallet) is EX
   expect(signal.kind).toBe('SELF_SEND_EXCLUDED')
   expect(signal.subjectUserId).toBe(authorId)
   expect(signal.actorUserId).toBe(tipperId)
-  // one scan per tip (incremental, pid found, no fallback)
-  expect(washLws.getAddressTxs).toHaveBeenCalledTimes(1)
+  // One scan for THIS tip's account (incremental from a null cursor, pid
+  // found, no full-history fallback). The shared mock may also serve the
+  // NULL-height backstop's ambient scans for other dev-DB accounts, so count
+  // only this account's scans — a fallback would make it 2.
+  const washScans = washLws.getAddressTxs.mock.calls.filter(([scanned]) => scanned.id === account.id)
+  expect(washScans).toHaveLength(1)
+  expect(washScans[0][1]).toBe(0)
 })
 
 test('a mature DETECTED tip whose stored amount disagrees with the chain is EXCLUDED (CHAIN_MISMATCH), reversed, and never credited', async () => {
