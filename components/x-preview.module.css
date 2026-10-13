@@ -31,8 +31,12 @@
   padding: 8px 14px 0;
   font-size: 0.85rem;
   line-height: 1.5;
+  /* tweet line breaks (stored as \n) must render as breaks, not spaces.
+     Blank lines count toward the clamp, so leave room for the common
+     "setup / blank / punchline" tweet format. */
+  white-space: pre-line;
   display: -webkit-box;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 5;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
