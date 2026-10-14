@@ -1,5 +1,6 @@
 /* eslint-env jest */
-import resolvers from '@/api/resolvers/item'
+import resolvers, { assertMoneroWallCommentAccess, assertMoneroWallWrite } from '@/api/resolvers/item'
+import addendumResolvers from '@/api/resolvers/item-addendum'
 import { Prisma } from '@prisma/client'
 import { applyItemUpdate } from '@/api/payIn/types/itemUpdate'
 
@@ -349,4 +350,305 @@ test('applyItemUpdate: an unrelated edit leaves the cached preview alone', async
   await applyItemUpdate(tx, { piconeros: 0n }, { id: 1, userId: 7, title: 'new title' })
   const { data } = tx.item.update.mock.calls[0][0]
   expect('xPreview' in data).toBe(false)
+})
+
+// --- Monerowall-covered discussions (2026-10-14) ---
+// A post created with the discussion walled hides its comments behind the same
+// entitlement: locked viewers get no comment list, no comment text anywhere
+// (the Item.text choke point covers profiles, /recent, in-app notifications
+// and direct API queries), and cannot join the discussion. The author's
+// openMoneroWallComments lift is one-way; removing the whole wall opens the
+// discussion with it.
+const walledRoot = (over = {}) => ({
+  id: 1,
+  userId: 7,
+  parentId: null,
+  rootId: null,
+  moneroWallPricePiconeros: 1_000_000_000n,
+  moneroWallThresholdPiconeros: null,
+  moneroWallEnabledAt: enabledAt,
+  moneroWallRemovedAt: null,
+  moneroWallCoversComments: true,
+  moneroWallCommentsRemovedAt: null,
+  ...over
+})
+
+const comment = (over = {}) => ({
+  id: 5,
+  userId: 42,
+  parentId: 1,
+  rootId: 1,
+  text: 'the answer is 42',
+  ...over
+})
+
+const rootLoader = root => ({
+  load: async (id) => (Number(id) === Number(root.id) ? root : null)
+})
+
+const walledCtx = (over = {}) => ({
+  me: { id: 99 },
+  moneroWallLoader: fakeLoader(lockedState),
+  rootItemLoader: rootLoader(walledRoot()),
+  ...over
+})
+
+test('comment text: locked viewer gets null', async () => {
+  expect(await resolvers.Item.text(comment(), {}, walledCtx())).toBe(null)
+})
+
+test('comment text: entitled viewer gets full text', async () => {
+  const ctx = walledCtx({ moneroWallLoader: fakeLoader(entitledState) })
+  expect(await resolvers.Item.text(comment(), {}, ctx)).toBe('the answer is 42')
+})
+
+test('comment text: the post author sees every comment', async () => {
+  const ctx = walledCtx({ me: { id: 7 } })
+  expect(await resolvers.Item.text(comment(), {}, ctx)).toBe('the answer is 42')
+})
+
+test('comment text: comments under a post-only wall stay public', async () => {
+  const ctx = walledCtx({ rootItemLoader: rootLoader(walledRoot({ moneroWallCoversComments: false })) })
+  expect(await resolvers.Item.text(comment(), {}, ctx)).toBe('the answer is 42')
+})
+
+test('comment text: comments under an opened discussion are public again', async () => {
+  const ctx = walledCtx({ rootItemLoader: rootLoader(walledRoot({ moneroWallCommentsRemovedAt: new Date('2026-09-21T00:00:00Z') })) })
+  expect(await resolvers.Item.text(comment(), {}, ctx)).toBe('the answer is 42')
+})
+
+test('comment text: a comment whose root cannot be resolved fails closed', async () => {
+  const ctx = walledCtx({ rootItemLoader: { load: async () => null } })
+  expect(await resolvers.Item.text(comment(), {}, ctx)).toBe(null)
+})
+
+test('html + lexicalState: locked viewer gets null and the lexical loader is untouched', async () => {
+  const loader = capturingLexicalLoader()
+  const ctx = { ...walledCtx(), lexicalStateLoader: loader }
+  expect(await resolvers.Item.html(comment(), {}, ctx)).toBe(null)
+  expect(await resolvers.Item.lexicalState(comment(), {}, ctx)).toBe(null)
+  expect(loader.calls).toHaveLength(0)
+})
+
+test('excerpt: locked viewer gets null for a walled comment', async () => {
+  expect(await resolvers.Item.excerpt(comment(), {}, walledCtx())).toBe(null)
+})
+
+test('commentWalled: true for a locked viewer, false for entitled and un-walled threads', async () => {
+  expect(await resolvers.Item.commentWalled(comment(), {}, walledCtx())).toBe(true)
+  expect(await resolvers.Item.commentWalled(comment(), {}, walledCtx({ moneroWallLoader: fakeLoader(entitledState) }))).toBe(false)
+  const openCtx = walledCtx({ rootItemLoader: rootLoader(walledRoot({ moneroWallCoversComments: false })) })
+  expect(await resolvers.Item.commentWalled(comment(), {}, openCtx)).toBe(false)
+  expect(await resolvers.Item.commentWalled(walledRoot(), {}, walledCtx())).toBe(false)
+})
+
+test('comments: locked viewer gets an empty list without touching SQL', async () => {
+  const item = walledRoot({ ncomments: 3, nDirectComments: 3 })
+  const result = await resolvers.Item.comments(item, {}, walledCtx({ models: undefined }))
+  expect(result).toEqual({ comments: [], cursor: null })
+})
+
+test('comments: entitled viewer resolves the comment tree normally', async () => {
+  const item = walledRoot({ ncomments: 3, nDirectComments: 3 })
+  // resolveItemComments runs its SQL path; with no models the query throws —
+  // proving the gate let it through (the fail we assert on is SQL, not gating)
+  await expect(resolvers.Item.comments(item, {}, walledCtx({ models: undefined, moneroWallLoader: fakeLoader(entitledState) })))
+    .rejects.toThrow()
+})
+
+test('newComments: locked viewer gets an empty list', async () => {
+  const models = {
+    item: { findUnique: jest.fn(async ({ where }) => walledRoot({ id: Number(where.id) })) }
+  }
+  const result = await resolvers.Query.newComments(null, { itemId: '1', after: null }, { models, me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) })
+  expect(result).toEqual({ comments: [] })
+})
+
+test('newComments: entitled viewer reaches the SQL path', async () => {
+  const models = {
+    item: { findUnique: jest.fn(async () => walledRoot()) },
+    $queryRawUnsafe: jest.fn(async () => { throw new Error('reached SQL') })
+  }
+  await expect(resolvers.Query.newComments(null, { itemId: '1', after: null }, { models, me: { id: 99 }, moneroWallLoader: fakeLoader(entitledState) }))
+    .rejects.toThrow('reached SQL')
+})
+
+test('newComments: comments under a post-only wall reach the SQL path', async () => {
+  const models = {
+    item: { findUnique: jest.fn(async () => walledRoot({ moneroWallCoversComments: false })) },
+    $queryRawUnsafe: jest.fn(async () => { throw new Error('reached SQL') })
+  }
+  await expect(resolvers.Query.newComments(null, { itemId: '1', after: null }, { models, me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) }))
+    .rejects.toThrow('reached SQL')
+})
+
+describe('assertMoneroWallCommentAccess', () => {
+  test('rejects a locked viewer with a discussion message', async () => {
+    await expect(assertMoneroWallCommentAccess({ root: walledRoot(), me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) }))
+      .rejects.toThrow(/unlock the post/i)
+  })
+  test('lets an entitled viewer through', async () => {
+    await expect(assertMoneroWallCommentAccess({ root: walledRoot(), me: { id: 99 }, moneroWallLoader: fakeLoader(entitledState) }))
+      .resolves.toBeUndefined()
+  })
+  test('lets anyone through when the discussion is not walled', async () => {
+    await expect(assertMoneroWallCommentAccess({ root: walledRoot({ moneroWallCoversComments: false }), me: null, moneroWallLoader: fakeLoader(lockedState) }))
+      .resolves.toBeUndefined()
+  })
+})
+
+describe('openMoneroWallComments', () => {
+  const txModels = (item) => ({
+    item: {
+      findUnique: jest.fn(async ({ where }) => item && { ...item, id: Number(where.id) }),
+      update: jest.fn(async ({ data }) => ({ ...item, ...data }))
+    },
+    $transaction: jest.fn(async ops => Promise.all(ops)),
+    $executeRaw: jest.fn(async () => 1)
+  })
+
+  test('stamps moneroWallCommentsRemovedAt and reindexes the subtree', async () => {
+    const models = txModels(walledRoot())
+    const updated = await resolvers.Mutation.openMoneroWallComments(null, { id: '1' }, { me: { id: 7 }, models })
+    expect(updated.moneroWallCommentsRemovedAt).toBeInstanceOf(Date)
+    expect(models.item.update.mock.calls[0][0].data.moneroWallCommentsRemovedAt).toBeInstanceOf(Date)
+    expect(models.$executeRaw).toHaveBeenCalledTimes(1)
+    const [strings] = models.$executeRaw.mock.calls[0]
+    expect(strings.join('')).toContain('indexItem')
+  })
+
+  test('refuses a stranger, a wall-less post, and an already-open discussion', async () => {
+    await expect(resolvers.Mutation.openMoneroWallComments(null, { id: '1' }, { me: { id: 99 }, models: txModels(walledRoot()) }))
+      .rejects.toThrow(/does not belong to you/)
+    await expect(resolvers.Mutation.openMoneroWallComments(null, { id: '1' }, { me: { id: 7 }, models: txModels(walledRoot({ moneroWallEnabledAt: null })) }))
+      .rejects.toThrow(/no monerowall/)
+    await expect(resolvers.Mutation.openMoneroWallComments(null, { id: '1' }, { me: { id: 7 }, models: txModels(walledRoot({ moneroWallCoversComments: false })) }))
+      .rejects.toThrow(/not walled/)
+    await expect(resolvers.Mutation.openMoneroWallComments(null, { id: '1' }, { me: { id: 7 }, models: txModels(walledRoot({ moneroWallCommentsRemovedAt: new Date() })) }))
+      .rejects.toThrow(/not walled/)
+  })
+
+  test('unauthenticated callers are rejected', async () => {
+    await expect(resolvers.Mutation.openMoneroWallComments(null, { id: '1' }, { me: null, models: txModels(walledRoot()) }))
+      .rejects.toThrow()
+  })
+})
+
+describe('removeMoneroWall subtree reindex', () => {
+  test('removing a comment-walled post reindexes the subtree too', async () => {
+    const models = {
+      item: { findUnique: jest.fn(async () => walledRoot()), update: jest.fn(async ({ data }) => ({ ...walledRoot(), ...data })) },
+      $transaction: jest.fn(async ops => Promise.all(ops)),
+      $executeRaw: jest.fn(async () => 1)
+    }
+    await resolvers.Mutation.removeMoneroWall(null, { id: '1' }, { me: { id: 7 }, models })
+    expect(models.$executeRaw).toHaveBeenCalledTimes(1)
+  })
+
+  test('removing a post-only wall skips the subtree reindex', async () => {
+    const models = {
+      item: { findUnique: jest.fn(async () => walledRoot({ moneroWallCoversComments: false })), update: jest.fn(async ({ data }) => ({ ...walledRoot(), ...data })) },
+      $transaction: jest.fn(async ops => Promise.all(ops)),
+      $executeRaw: jest.fn(async () => 1)
+    }
+    await resolvers.Mutation.removeMoneroWall(null, { id: '1' }, { me: { id: 7 }, models })
+    expect(models.$executeRaw).not.toHaveBeenCalled()
+  })
+})
+
+describe('assertMoneroWallWrite: coversComments (create-time only, needs a wall)', () => {
+  const wallModels = {
+    platformFeeConfig: { findUnique: jest.fn(async () => ({ minTipPiconeros: 100_000_000n })) },
+    observedTip: { findFirst: jest.fn(async () => null) },
+    moneroAccount: { findFirst: jest.fn(async () => ({ id: 1 })) }
+  }
+  const me = { id: 7 }
+
+  test('create: the flag without a wall leg is rejected', async () => {
+    await expect(assertMoneroWallWrite({ models: wallModels, me, item: { moneroWallCoversComments: true, text: 'a\n\nb' }, old: null }))
+      .rejects.toThrow(/requires a monerowall/)
+  })
+
+  test('create: the flag alongside a price passes', async () => {
+    await expect(assertMoneroWallWrite({ models: wallModels, me, item: { moneroWallPricePiconeros: 1_000_000_000n, moneroWallCoversComments: true, text: 'a\n\nb' }, old: null }))
+      .resolves.toBeUndefined()
+  })
+
+  test('create: the flag without any wall args still hits the wall-leg check', async () => {
+    await expect(assertMoneroWallWrite({ models: wallModels, me, item: { moneroWallCoversComments: true, text: 'a\n\nb' }, old: null }))
+      .rejects.toThrow(/requires a monerowall/)
+  })
+})
+
+// --- Review findings (2026-10-14): the long tail of content-bearing fields ---
+
+test('imgproxyUrls: locked viewer gets no derivatives for a walled-discussion comment', async () => {
+  const item = comment({ imgproxyUrls: { 'https://media.test/1.png': { '640w': '/sig/1' } } })
+  expect(await resolvers.Item.imgproxyUrls(item, {}, walledCtx())).toEqual({})
+})
+
+test('imgproxyUrls: entitled viewer keeps a walled-discussion comment derivatives', async () => {
+  const item = comment({ imgproxyUrls: { 'https://media.test/1.png': { '640w': '/sig/1' } } })
+  const ctx = walledCtx({ moneroWallLoader: fakeLoader(entitledState) })
+  expect(await resolvers.Item.imgproxyUrls(item, {}, ctx)).toBe(item.imgproxyUrls)
+})
+
+test('imgproxyUrls: non-walled-thread comments pass through untouched', async () => {
+  const item = comment({ imgproxyUrls: { 'https://media.test/1.png': { '640w': '/sig/1' } } })
+  const ctx = walledCtx({ rootItemLoader: rootLoader(walledRoot({ moneroWallCoversComments: false })) })
+  expect(await resolvers.Item.imgproxyUrls(item, {}, ctx)).toBe(item.imgproxyUrls)
+})
+
+test('a comment resolved without rootItemLoader throws (wiring bug, never silent)', async () => {
+  await expect(resolvers.Item.text(comment(), {}, { me: { id: 99 }, moneroWallLoader: fakeLoader(lockedState) }))
+    .rejects.toThrow(/rootItemLoader/)
+})
+
+test('addendum: locked viewer gets nothing for a walled-discussion comment', async () => {
+  const item = comment({ addendumText: 'post-window bonus content', addendumHtml: '<p>post-window bonus content</p>' })
+  expect(await addendumResolvers.Item.addendumText(item, {}, walledCtx())).toBe(null)
+  expect(await addendumResolvers.Item.addendumHtml(item, {}, walledCtx())).toBe(null)
+})
+
+test('addendum: entitled viewer reads a walled-discussion comment addendum', async () => {
+  const item = comment({ addendumText: 'post-window bonus content' })
+  const ctx = walledCtx({ moneroWallLoader: fakeLoader(entitledState) })
+  expect(await addendumResolvers.Item.addendumText(item, {}, ctx)).toBe('post-window bonus content')
+})
+
+test('addendum: comments under post-only walls keep their addendum public', async () => {
+  const item = comment({ addendumText: 'post-window bonus content' })
+  const ctx = walledCtx({ rootItemLoader: rootLoader(walledRoot({ moneroWallCoversComments: false })) })
+  expect(await addendumResolvers.Item.addendumText(item, {}, ctx)).toBe('post-window bonus content')
+})
+
+// --- Second-pass review findings: xPreview + fail-open alignment ---
+
+test('xPreview: locked viewer gets no preview for a walled-discussion comment', async () => {
+  const item = comment({ xPreview: { statusUrl: 'https://x.com/a/status/1', text: 'secret tweet', publicSource: true, sourceUrl: 'https://x.com/a/status/1' } })
+  expect(await resolvers.Item.xPreview(item, {}, walledCtx())).toBe(null)
+})
+
+test('xPreview: entitled viewer keeps a walled-discussion comment preview', async () => {
+  const item = comment({ xPreview: { statusUrl: 'https://x.com/a/status/1', text: 'secret tweet', publicSource: true, sourceUrl: 'https://x.com/a/status/1' } })
+  const ctx = walledCtx({ moneroWallLoader: fakeLoader(entitledState) })
+  expect(await resolvers.Item.xPreview(item, {}, ctx)).toBe(item.xPreview)
+})
+
+// --- Live bug (2026-10-14): upsertComment dropped moneroWallLoader from the
+// context it forwarded to createItem, so the comment gate crashed with
+// "Cannot read properties of undefined (reading 'load')" on every comment
+// attempt against a comment-walled post. The gate must see the full request
+// context: locked viewers get the domain error, never a TypeError.
+test('upsertComment: the comment gate receives moneroWallLoader through the resolver boundary', async () => {
+  const models = {
+    item: {
+      count: jest.fn(async () => 0),
+      findUnique: jest.fn(async () => walledRoot())
+    },
+    itemPayIn: { findFirst: jest.fn(async () => ({ id: 1 })) }
+  }
+  const ctx = { me: { id: 99 }, models, headers: {}, moneroWallLoader: fakeLoader(lockedState) }
+  await expect(resolvers.Mutation.upsertComment(null, { text: 'my guess is 42', parentId: '1' }, ctx))
+    .rejects.toThrow(/unlock the post to join the discussion/)
 })

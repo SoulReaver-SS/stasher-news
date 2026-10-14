@@ -98,7 +98,8 @@ export default function DraftsMenu ({ type }) {
         // DraftInput declares String, so coerce when present; explicit
         // empty/absent check (not ||) so a numeric 0 behaves predictably
         moneroWallPriceXmr: v.moneroWallEnabled && v.moneroWallPriceXmr != null && v.moneroWallPriceXmr !== '' ? String(v.moneroWallPriceXmr) : null,
-        moneroWallThresholdXmr: v.moneroWallEnabled && v.moneroWallThresholdXmr != null && v.moneroWallThresholdXmr !== '' ? String(v.moneroWallThresholdXmr) : null
+        moneroWallThresholdXmr: v.moneroWallEnabled && v.moneroWallThresholdXmr != null && v.moneroWallThresholdXmr !== '' ? String(v.moneroWallThresholdXmr) : null,
+        moneroWallCoversComments: v.moneroWallEnabled ? v.moneroWallCoversComments === true : null
       }
       const { data: saveData } = await upsertDraft({ variables: { input } })
       toaster.success('draft saved')

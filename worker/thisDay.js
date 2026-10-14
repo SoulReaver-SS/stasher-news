@@ -77,15 +77,18 @@ function topStackers (days) {
   return text
 }
 
-function topComments (days) {
+export function topComments (days) {
   let text = '#### Top Comments'
   for (const { day, data } of days) {
     const comment = data.comments.items?.[0]
     if (comment) {
+      // a Monerowall-covered discussion's top comment resolves with null text
+      // for this anon worker (fail-closed gate) — keep the link, drop the quote
+      const quote = comment.text ? comment.text.trim().split('\n')[0] : '(walled discussion)'
       text += `
 - ${process.env.NEXT_PUBLIC_URL}/items/${comment.root.id}?commentId=${comment.id} on [${comment.root.title}](${process.env.NEXT_PUBLIC_URL}/items/${comment.root.id})
     - ${piconerosToMXmr(BigInt(comment.piconeros ?? 0))} \\ ${numWithUnits(comment.ncomments, { unitSingular: 'reply', unitPlural: 'replies' })} \\ @${comment.user.name} \\ \`${day}\`
-        > ${comment.text.trim().split('\n')[0]} [...]`
+        > ${quote} [...]`
     } else {
       text += `
 - no top comment for \`${day}\``

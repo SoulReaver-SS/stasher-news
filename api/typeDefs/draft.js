@@ -12,6 +12,7 @@ export default gql`
     extra: String
     moneroWallPricePiconeros: BigInt
     moneroWallThresholdPiconeros: BigInt
+    moneroWallCoversComments: Boolean
     # total bytes of the uploads pinned by this draft (drives the menu's media meter; derived, not stored)
     pinnedMediaBytes: BigInt
     # number of uploads pinned by this draft (drives the menu's "N files" row meta; derived, not stored)
@@ -33,6 +34,7 @@ export default gql`
     randPollOptions: Boolean
     moneroWallPriceXmr: String
     moneroWallThresholdXmr: String
+    moneroWallCoversComments: Boolean
   }
 
   extend type Query {

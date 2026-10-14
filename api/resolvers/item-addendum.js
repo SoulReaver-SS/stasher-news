@@ -12,7 +12,7 @@ import { ADMIN_ITEMS, SN_ADMIN_IDS } from '@/lib/constants'
 import { getItemEditMode, itemEditDeadline, normalizeAddendumText } from '@/lib/item-addendum'
 import { isJob } from '@/lib/item'
 import { lexicalHTMLGenerator } from '@/lib/lexical/server/html'
-import { getItem, moneroWallStateFor } from './item'
+import { getItem, moneroWallStateFor, rootWallStateFor } from './item'
 import { uploadIdsFromText } from './upload'
 
 // Same lookup the Item.payIn resolver does, duplicated locally (kept narrow on
@@ -47,9 +47,15 @@ async function editInputs (item, ctx) {
 
 // The monerowall gates the addendum like the rest of the body: a locked (or
 // contract-missing) view yields nothing, on every representation (raw text,
-// time, HTML, lexical state) — 2026-09-26 H1 contract.
+// time, HTML, lexical state) — 2026-09-26 H1 contract. A comment under a
+// Monerowall-covered discussion is gated by its thread root's wall the same
+// way (2026-10-14): the addendum is body content, not metadata.
 async function addendumVisible (item, ctx) {
   if (!item.addendumText || item.deletedAt) return false
+  if (item.parentId != null) {
+    const rootView = await rootWallStateFor(item, ctx)
+    if (rootView?.locked) return false
+  }
   const view = await moneroWallStateFor(item, ctx)
   return !(view?.locked)
 }

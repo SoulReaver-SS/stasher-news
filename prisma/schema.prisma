@@ -401,6 +401,7 @@ model Draft {
   extra                        Json?
   moneroWallPricePiconeros     BigInt?
   moneroWallThresholdPiconeros BigInt?
+  moneroWallCoversComments     Boolean?
   createdAt                    DateTime @default(now()) @map("created_at")
   updatedAt                    DateTime @updatedAt @map("updated_at")
   user                         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -635,6 +636,12 @@ model Item {
   moneroWallThresholdPiconeros BigInt?
   moneroWallEnabledAt          DateTime?
   moneroWallRemovedAt          DateTime?
+  // discussion wall (2026-10-14): create-time-only flag — wall the comments
+  // too (same X/T entitlement, one payment unlocks body + discussion); stamped
+  // one-way open by openMoneroWallComments. Removing the whole wall opens the
+  // discussion with it (moneroWallEnabled is the superset gate).
+  moneroWallCoversComments     Boolean   @default(false)
+  moneroWallCommentsRemovedAt  DateTime?
 
   // back-relations for observed Monero tips/downvotes (ObservedTip/ObservedDownvote)
   observedTips      ObservedTip[]

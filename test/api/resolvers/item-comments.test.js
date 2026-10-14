@@ -23,6 +23,9 @@ jest.mock('../../../lib/lexical/server/html', () => ({
 function captureModels () {
   const captured = { query: null, args: null }
   const models = {
+    // thread-root wall lookup for the Monerowall-covered-discussion gate:
+    // null root = no wall = straight to the SQL path under test
+    item: { findUnique: async () => null },
     $queryRawUnsafe: async (query, ...args) => {
       captured.query = query
       captured.args = args

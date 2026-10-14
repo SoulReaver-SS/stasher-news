@@ -1,0 +1,91 @@
+.composer {
+  padding-top: 1.5rem;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: .5rem .75rem;
+  color: var(--stealth-muted);
+  font-size: .8rem;
+}
+
+.activeTab {
+  color: var(--bs-body-color);
+  font-weight: bold;
+}
+
+.input:disabled {
+  background: var(--stealth-surface, var(--bs-body-bg));
+  border-color: var(--stealth-border);
+  resize: none;
+  cursor: not-allowed;
+  opacity: .7;
+}
+
+.comments {
+  margin: 1rem 0;
+}
+
+.count {
+  margin: 0 0 .75rem;
+  padding-left: 1rem;
+  font-size: .85rem;
+  color: var(--stealth-muted);
+}
+
+.card {
+  display: flex;
+  gap: .75rem;
+  padding: 1rem;
+  margin-bottom: .75rem;
+  border: 1px solid var(--stealth-border);
+  border-radius: .5rem;
+  background: var(--stealth-surface, var(--bs-body-bg));
+}
+
+.voteRail {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-around;
+  color: var(--stealth-muted);
+  opacity: .45;
+}
+
+.content {
+  flex: 1;
+  min-width: 0;
+}
+
+.meta {
+  width: 35%;
+  height: .5rem;
+  margin-bottom: .9rem;
+  border-radius: .25rem;
+  background: var(--stealth-muted);
+  opacity: .18;
+}
+
+.pixels {
+  width: 82%;
+  max-width: 32rem;
+  height: .9rem;
+  margin-bottom: .6rem;
+  background-image: repeating-conic-gradient(
+    var(--stealth-muted) 0% 25%, transparent 0% 50%
+  );
+  background-size: 7px 9px;
+  opacity: .35;
+}
+
+.shortLine {
+  width: 40%;
+  background-position: 3px 2px;
+  opacity: .22;
+}
+
+.replyLabel {
+  color: var(--stealth-muted);
+  font-size: .75rem;
+}

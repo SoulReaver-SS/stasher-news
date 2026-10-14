@@ -11,6 +11,7 @@ export const DRAFT_FIELDS = gql`
     extra
     moneroWallPricePiconeros
     moneroWallThresholdPiconeros
+    moneroWallCoversComments
     pinnedMediaBytes
     pinnedMediaCount
     updatedAt

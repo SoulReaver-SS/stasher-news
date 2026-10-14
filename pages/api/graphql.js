@@ -14,7 +14,7 @@ import { logWarn, logError } from '@/lib/logger'
 import { formatGraphqlError } from '@/lib/formatGraphqlError'
 import { apiKeyGuardPlugin } from '@/lib/apiKeyGuard'
 import { lexicalStateLoader } from '@/lib/lexical/server/loader'
-import { createMoneroWallLoader } from '@/lib/monero-wall/loader'
+import { createMoneroWallLoader, createRootItemLoader } from '@/lib/monero-wall/loader'
 import { createMoneroWallRatingLoader } from '@/lib/monero-wall/rating-loader'
 import { createUserLoader, createSubLoader } from '@/api/loaders'
 import { lwsClient } from '@/api/monero/lwsClient'
@@ -103,6 +103,7 @@ const apolloHandler = startServerAndCreateNextHandler(apolloServer, {
       monero: lwsClient,
       lexicalStateLoader: lexicalStateLoader({ me, userLoader }),
       moneroWallLoader,
+      rootItemLoader: createRootItemLoader({ models }),
       moneroWallRatingLoader: createMoneroWallRatingLoader({ models, me, moneroWallLoader })
     }
   }

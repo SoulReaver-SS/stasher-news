@@ -25,17 +25,19 @@ export default gql`
     deleteItem(id: ID): Item
     upsertLink(
       id: ID, subNames: [String!], title: String!, url: String!, text: String,
-      moneroWallPricePiconeros: BigInt, moneroWallThresholdPiconeros: BigInt,
+      moneroWallPricePiconeros: BigInt, moneroWallThresholdPiconeros: BigInt, moneroWallCoversComments: Boolean,
       hash: String, hmac: String, sendProtocolId: Int): PayIn!
     upsertDiscussion(
       id: ID, subNames: [String!], title: String!, text: String,
-      moneroWallPricePiconeros: BigInt, moneroWallThresholdPiconeros: BigInt,
+      moneroWallPricePiconeros: BigInt, moneroWallThresholdPiconeros: BigInt, moneroWallCoversComments: Boolean,
       hash: String, hmac: String, sendProtocolId: Int): PayIn!
     upsertBounty(
       id: ID, subNames: [String!], title: String!, text: String, bountyPiconeros: BigInt,
-      moneroWallPricePiconeros: BigInt, moneroWallThresholdPiconeros: BigInt,
+      moneroWallPricePiconeros: BigInt, moneroWallThresholdPiconeros: BigInt, moneroWallCoversComments: Boolean,
       hash: String, hmac: String, sendProtocolId: Int): PayIn!
     removeMoneroWall(id: ID!): Item!
+    # one-way lift of the discussion wall only (the post body stays walled)
+    openMoneroWallComments(id: ID!): Item!
     rateMoneroWallPost(itemId: ID!, stars: Int!): Item!
     upsertJob(
       id: ID, subNames: [String!], title: String!, company: String!, location: String, remote: Boolean,
@@ -105,6 +107,10 @@ export default gql`
     frozen: Boolean!
     publiclyUnlocked: Boolean!
     locked: Boolean!
+    # discussion wall (2026-10-14): coversComments is static config,
+    # commentsLocked is viewer-relative (coversComments && locked)
+    coversComments: Boolean!
+    commentsLocked: Boolean!
     myContributionPiconeros: BigInt!
     myRateablePiconeros: BigInt!
     progressPiconeros: BigInt!
@@ -205,6 +211,9 @@ export default gql`
     payIn: PayIn
     moneroWall: MoneroWall
     moneroWallRating: MoneroWallRatingAgg!
+    # true when this item is a comment the viewer cannot read (thread root
+    # walls the discussion and the viewer is locked) — drives the placeholder
+    commentWalled: Boolean!
     meCommentsViewedAt: Date
   }
 `

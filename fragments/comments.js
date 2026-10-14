@@ -12,6 +12,9 @@ export const COMMENT_FIELDS = gql`
     createdAt
     deletedAt
     text
+    # true when this reply sits under a monerowalled discussion the viewer
+    # hasn't unlocked — the server serves null text; render the placeholder
+    commentWalled
     lexicalState
     html
     editMode
@@ -78,6 +81,9 @@ export const COMMENT_FIELDS_NO_CHILD_COMMENTS = gql`
     createdAt
     deletedAt
     text
+    # true when this reply sits under a monerowalled discussion the viewer
+    # hasn't unlocked — the server serves null text; render the placeholder
+    commentWalled
     lexicalState
     html
     editMode

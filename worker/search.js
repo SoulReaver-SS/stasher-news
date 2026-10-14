@@ -1,7 +1,7 @@
 import { gql } from 'graphql-tag'
 import search from '@/api/search/index'
 import removeMd from 'remove-markdown'
-import { indexableMoneroWallText } from '@/lib/monero-wall'
+import { indexableMoneroWallText, moneroWallCommentsEnabled } from '@/lib/monero-wall'
 
 const ITEM_SEARCH_FIELDS = gql`
   fragment ItemSearchFields on Item {
@@ -68,7 +68,16 @@ function indexableDoc (doc) {
   return bigintSafe(doc)
 }
 
-async function _indexItem (item, { models, updatedAt }) {
+// Wall-config columns for a thread root, used to keep walled-discussion
+// comments out of the index (both indexing paths).
+const ROOT_WALL_SELECT = {
+  moneroWallEnabledAt: true,
+  moneroWallRemovedAt: true,
+  moneroWallCoversComments: true,
+  moneroWallCommentsRemovedAt: true
+}
+
+export async function _indexItem (item, { models, updatedAt }) {
   console.log('indexing item', item.id)
   // HACK: modify the title for jobs so that company/location are searchable
   // and highlighted without further modification
@@ -86,8 +95,21 @@ async function _indexItem (item, { models, updatedAt }) {
 
   const itemdb = await models.item.findUnique({
     where: { id: Number(item.id) },
-    select: { weightedVotes: true, weightedDownVotes: true, ranktop: true, text: true, moneroWallEnabledAt: true, moneroWallRemovedAt: true }
+    select: { weightedVotes: true, weightedDownVotes: true, ranktop: true, text: true, moneroWallEnabledAt: true, moneroWallRemovedAt: true, parentId: true, rootId: true }
   })
+
+  // Monerowall-covered discussion (2026-10-14): a comment under a walled
+  // discussion never enters the index (scrapers read search, not just
+  // GraphQL). The lift mutations enqueue subtree indexItem jobs so opened
+  // comments become searchable again.
+  if (itemdb.parentId != null) {
+    const root = await models.item.findUnique({ where: { id: Number(itemdb.rootId) }, select: ROOT_WALL_SELECT })
+    // a missing root row is a data anomaly — skip, like the resolvers fail closed
+    if (!root || moneroWallCommentsEnabled(root)) {
+      console.log(`indexItem: skipping comment ${item.id} — discussion is monerowalled`)
+      return
+    }
+  }
 
   itemcp.wvotes = itemdb.weightedVotes - itemdb.weightedDownVotes
   itemcp.ranktop = itemdb.ranktop
@@ -280,7 +302,12 @@ export async function indexAllItems ({ models, boss }) {
           moneroWallEnabledAt: true,
           moneroWallRemovedAt: true,
           user: { select: { name: true } },
-          root: { select: { subNames: true } },
+          root: {
+            select: {
+              subNames: true,
+              ...ROOT_WALL_SELECT
+            }
+          },
           Bookmark: { select: { userId: true } }
         }
       })
@@ -288,32 +315,36 @@ export async function indexAllItems ({ models, boss }) {
       if (items.length === 0) break
       lastId = items[items.length - 1].id
 
-      const docs = items.map(item => {
-        const doc = {
-          ...item,
-          wvotes: item.weightedVotes - item.weightedDownVotes,
-          subNames: item.subNames?.length > 0
-            ? item.subNames
-            : (item.root?.subNames || []),
-          bookmarkedBy: item.Bookmark.map(b => b.userId),
-          docType: item.parentId ? 'comment' : 'post',
-          textLength: 0 // set below after text processing
-        }
+      const docs = items
+        // Monerowall-covered discussion: walled comments never enter the
+        // index (matches the incremental _indexItem skip).
+        .filter(item => !(item.parentId && moneroWallCommentsEnabled(item.root)))
+        .map(item => {
+          const doc = {
+            ...item,
+            wvotes: item.weightedVotes - item.weightedDownVotes,
+            subNames: item.subNames?.length > 0
+              ? item.subNames
+              : (item.root?.subNames || []),
+            bookmarkedBy: item.Bookmark.map(b => b.userId),
+            docType: item.parentId ? 'comment' : 'post',
+            textLength: 0 // set below after text processing
+          }
 
-        // job title hack: append company/location so they're searchable
-        if (item.company) doc.title = `${doc.title} \\ ${item.company}`
-        if (item.location || item.remote) {
-          doc.title = `${doc.title} \\ ${item.location || ''}${item.location && item.remote ? ' or ' : ''}${item.remote ? 'Remote' : ''}`
-        }
-        if (item.text) doc.text = removeMd(indexableMoneroWallText(item))
-        doc.textLength = doc.text ? doc.text.length : 0
+          // job title hack: append company/location so they're searchable
+          if (item.company) doc.title = `${doc.title} \\ ${item.company}`
+          if (item.location || item.remote) {
+            doc.title = `${doc.title} \\ ${item.location || ''}${item.location && item.remote ? ' or ' : ''}${item.remote ? 'Remote' : ''}`
+          }
+          if (item.text) doc.text = removeMd(indexableMoneroWallText(item))
+          doc.textLength = doc.text ? doc.text.length : 0
 
-        // clean up relation/raw fields not needed in the index
-        delete doc.Bookmark
-        delete doc.root
+          // clean up relation/raw fields not needed in the index
+          delete doc.Bookmark
+          delete doc.root
 
-        return { id: item.id, doc: indexableDoc(doc) }
-      })
+          return { id: item.id, doc: indexableDoc(doc) }
+        })
 
       // Use update (NOT doc_as_upsert) to preserve seeded embedding fields.
       // doc_as_upsert triggers the default ingest pipeline even with pipeline=_none.

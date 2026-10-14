@@ -46,6 +46,8 @@ export const ITEM_FIELDS = gql`
       frozen
       publiclyUnlocked
       locked
+      coversComments
+      commentsLocked
       myContributionPiconeros
       myRateablePiconeros
       progressPiconeros
@@ -118,6 +120,9 @@ export const ITEM_FULL_FIELDS = gql`
     bountyWinnerCommentId
     bountyWinnerName
     text
+    # walled-discussion replies resolve null text for locked viewers; this
+    # flag drives the placeholder in notification/profile surfaces
+    commentWalled
     lexicalState
     html
     root {
@@ -251,6 +256,17 @@ export const REMOVE_MONERO_WALL = gql`
   ${ITEM_FIELDS}
   mutation removeMoneroWall($id: ID!) {
     removeMoneroWall(id: $id) {
+      ...ItemFields
+    }
+  }
+`
+
+// One-way author lift of the discussion wall only (the post body stays
+// walled). Bypasses the edit window like removeMoneroWall.
+export const OPEN_MONERO_WALL_COMMENTS = gql`
+  ${ITEM_FIELDS}
+  mutation openMoneroWallComments($id: ID!) {
+    openMoneroWallComments(id: $id) {
       ...ItemFields
     }
   }

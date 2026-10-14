@@ -33,6 +33,7 @@ import useCommentsView from './use-comments-view'
 import useCallbackRef from './use-callback-ref'
 import MoneroWallPanel from './monero-wall'
 import MoneroWallRating from './monero-wall-rating'
+import { LockedReply, LockedComments } from './locked-comments'
 
 function BioItem ({ item, handleClick }) {
   const { me } = useMe()
@@ -141,15 +142,21 @@ function TopLevelItem ({ item, noReply, ...props }) {
           </div>}
       </article>
       {item.mine && item.bountyStatus === 'EXPIRED' && <BountyActions item={item} />}
+      {/* The locked composer is decorative; the real submission form only
+          mounts after unlocking. The server also enforces participation. */}
       {!noReply &&
         <>
-          <Reply
-            item={item}
-            replyOpen
-            onCancelQuote={cancelQuote}
-            onQuoteReply={quoteReply}
-            quote={quote}
-          />
+          {item.moneroWall?.commentsLocked
+            ? <LockedReply />
+            : (
+              <Reply
+                item={item}
+                replyOpen
+                onCancelQuote={cancelQuote}
+                onQuoteReply={quoteReply}
+                quote={quote}
+              />
+              )}
           {
           // Don't show related items for Saloon items (position is set but no subName)
           (!item.position && item.subNames?.length > 0) &&
@@ -200,20 +207,22 @@ export default function ItemFull ({ item, fetchMoreComments, bio, rank, ...props
                 ? <BioItem item={item} {...props} />
                 : <TopLevelItem item={item} {...props} />}
               </div>)}
-          {item.comments &&
-            <div className={styles.comments}>
-              <Comments
-                parentId={item.id} parentCreatedAt={item.createdAt}
-                pinned={item.position} bio={bio}
-                commentSats={item.commentPiconeros} commentCost={item.commentCost} commentBoost={item.commentBoost}
-                ncomments={item.ncomments}
-                comments={item.comments.comments}
-                commentsCursor={item.comments.cursor}
-                fetchMoreComments={fetchMoreComments}
-                lastCommentAt={item.lastCommentAt}
-                item={item}
-              />
-            </div>}
+          {item.moneroWall?.commentsLocked
+            ? <LockedComments count={item.ncomments} />
+            : item.comments &&
+              <div className={styles.comments}>
+                <Comments
+                  parentId={item.id} parentCreatedAt={item.createdAt}
+                  pinned={item.position} bio={bio}
+                  commentSats={item.commentPiconeros} commentCost={item.commentCost} commentBoost={item.commentBoost}
+                  ncomments={item.ncomments}
+                  comments={item.comments.comments}
+                  commentsCursor={item.comments.cursor}
+                  fetchMoreComments={fetchMoreComments}
+                  lastCommentAt={item.lastCommentAt}
+                  item={item}
+                />
+              </div>}
         </CarouselProvider>
       </RootProvider>
     </>

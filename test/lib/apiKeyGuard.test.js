@@ -41,6 +41,7 @@ function schemaMutationNames () {
 const REVIEWED_NON_SENSITIVE = new Set([
   // content creation / moderation
   'bookmarkItem', 'deleteItem', 'deleteMessage', 'pinItem', 'removeMoneroWall',
+  'openMoneroWallComments',
   'rateMoneroWallPost',
   'upsertBio', 'upsertBounty', 'upsertComment', 'upsertDiscussion', 'upsertJob',
   'upsertLink', 'upsertPoll', 'upsertSubBranding',

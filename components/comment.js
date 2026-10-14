@@ -320,16 +320,22 @@ export default function Comment ({
             : (
               <>
                 <div className={styles.text} ref={textRef}>
-                  {item.searchText
-                    ? <SearchText text={item.searchText} />
-                    : (
-                      <Text itemId={item.id} state={item.lexicalState} html={item.html} topLevel={topLevel} rel={item.rel ?? UNKNOWN_LINK_REL} imgproxyUrls={item.imgproxyUrls} readerRef={onReaderRef}>
-                        {truncate ? truncateString(item.text) : undefined}
-                      </Text>)}
+                  {item.commentWalled
+                    ? (
+                      <div className='text-muted fst-italic'>
+                        this reply is behind the post&apos;s monerowall — unlock the post to read it.
+                      </div>
+                      )
+                    : item.searchText
+                      ? <SearchText text={item.searchText} />
+                      : (
+                        <Text itemId={item.id} state={item.lexicalState} html={item.html} topLevel={topLevel} rel={item.rel ?? UNKNOWN_LINK_REL} imgproxyUrls={item.imgproxyUrls} readerRef={onReaderRef}>
+                          {truncate ? truncateString(item.text) : undefined}
+                        </Text>)}
                 </div>
                 {/* search snippets must not present a partial original as the whole comment */}
-                {!item.searchText && <ItemAddendum item={item} readerRef={onAddendumReaderRef} />}
-                {!item.searchText && !truncate && collapse !== 'yep' && item.xPreview &&
+                {!item.searchText && !item.commentWalled && <ItemAddendum item={item} readerRef={onAddendumReaderRef} />}
+                {!item.searchText && !item.commentWalled && !truncate && collapse !== 'yep' && item.xPreview &&
                   <XPreviewCard xPreview={item.xPreview} url={item.url} showImage={me?.privates?.showImagesAndVideos !== false} />}
               </>
               )}

@@ -15,7 +15,7 @@ import { getAuthOptions } from '@/pages/api/auth/[...nextauth]'
 import { NOFOLLOW_LIMIT } from '@/lib/constants'
 import { MULTI_AUTH_ANON, MULTI_AUTH_LIST, MULTI_AUTH_POINTER, multiAuthMiddleware } from '@/lib/auth'
 import { lexicalStateLoader } from '@/lib/lexical/server/loader'
-import { createMoneroWallLoader } from '@/lib/monero-wall/loader'
+import { createMoneroWallLoader, createRootItemLoader } from '@/lib/monero-wall/loader'
 import { createMoneroWallRatingLoader } from '@/lib/monero-wall/rating-loader'
 import { createUserLoader, createSubLoader } from '@/api/loaders'
 import { getDomainBranding, SN_MAIN_DOMAIN } from '@/lib/domains'
@@ -52,6 +52,7 @@ export default async function getSSRApolloClient ({ req, res, me = null }) {
           monero: lwsClient,
           lexicalStateLoader: lexicalStateLoader({ me: viewer, userLoader }),
           moneroWallLoader,
+          rootItemLoader: createRootItemLoader({ models }),
           moneroWallRatingLoader: createMoneroWallRatingLoader({ models, me: viewer, moneroWallLoader })
         }
       })()

@@ -37,7 +37,8 @@ import { lexicalHTMLGenerator } from '@/lib/lexical/server/html'
 import { resolveItemComments } from './comment-tree'
 import { itemFeeReentryFunding, feeReceivedPiconerosForPayIn } from '@/api/monero/postingFee'
 import {
-  moneroWallEnabled, splitMoneroWallText, stripMoneroWallMarker, buildMoneroWallView, moneroWallUpdateError
+  moneroWallEnabled, splitMoneroWallText, stripMoneroWallMarker, buildMoneroWallView, moneroWallUpdateError,
+  moneroWallCommentsEnabled, moneroWallCommentsConfigError
 } from '@/lib/monero-wall'
 import { canonicalXStatus } from '@/lib/x-preview/status-url'
 
@@ -205,14 +206,86 @@ export async function moneroWallStateFor (item, { me, moneroWallLoader }) {
 // Text to render for the current viewer: full (marker stripped) when
 // entitled/author, teaser otherwise.
 async function moneroWallRenderText (item, ctx) {
+  if (item.parentId != null) {
+    // Monerowall-covered discussion (2026-10-14): a locked viewer gets no
+    // comment text on any surface — this helper feeds html/lexicalState.
+    const rootView = await rootWallStateFor(item, ctx)
+    if (rootView?.locked) return null
+  }
   if (!moneroWallEnabled(item)) return moneroWallFullText(item)
   const view = await moneroWallStateFor(item, ctx)
   if (!view || !view.locked) return stripMoneroWallMarker(item.text)
   return splitMoneroWallText(item.text).teaserText
 }
 
+// Wall-config columns needed to evaluate a thread root's comment wall.
+const WALL_SELECT = {
+  id: true,
+  userId: true,
+  parentId: true,
+  rootId: true,
+  moneroWallPricePiconeros: true,
+  moneroWallThresholdPiconeros: true,
+  moneroWallEnabledAt: true,
+  moneroWallRemovedAt: true,
+  moneroWallCoversComments: true,
+  moneroWallCommentsRemovedAt: true
+}
+
+// The thread root of an item id (the item itself for posts). Null when missing.
+async function threadRootFor (models, itemId) {
+  const item = await models.item.findUnique({ where: { id: Number(itemId) }, select: WALL_SELECT })
+  if (!item || item.parentId == null) return item
+  return await models.item.findUnique({ where: { id: Number(item.rootId) }, select: WALL_SELECT })
+}
+
+// MoneroWall view of an item's thread root, but only when the discussion is
+// walled there — null means "comments are not gated for anyone". Uses the
+// request-scoped rootItemLoader (one batched query per root per request) plus
+// the existing moneroWallLoader entitlement cache. Exported for
+// item-addendum's visibility gate (same discussion-wall contract).
+export async function rootWallStateFor (item, ctx) {
+  if (item.parentId == null) return null
+  // a missing loader is a context-wiring bug, not a viewer state — fail loud
+  // (a silently-absent loader would otherwise fail closed for EVERY comment
+  // sitewide, including fully public ones)
+  if (!ctx.rootItemLoader) throw new Error('rootItemLoader is missing from the GraphQL context')
+  const root = await ctx.rootItemLoader.load(Number(item.rootId))
+  // fail closed: an unresolvable root is a data anomaly — never leak
+  if (!root) return { locked: true }
+  if (!moneroWallCommentsEnabled(root)) return null
+  const state = await ctx.moneroWallLoader.load({ id: root.id, enabledAt: root.moneroWallEnabledAt })
+  return buildMoneroWallView({ item: root, meId: ctx.me?.id ?? null, ...state })
+}
+
+// Same gate for the thread's comment list: on a post it consults the post's
+// own comment wall, on a comment the thread root's.
+async function threadCommentsGate (item, ctx) {
+  if (item.parentId == null) {
+    if (!moneroWallCommentsEnabled(item)) return null
+    return await moneroWallStateFor(item, ctx)
+  }
+  return await rootWallStateFor(item, ctx)
+}
+
+/**
+ * Comment-creation gate for Monerowall-covered discussions: a locked viewer
+ * cannot join the discussion (bots and freeloaders pay to participate).
+ * Called from createItem's comment path with the thread root.
+ */
+export async function assertMoneroWallCommentAccess ({ root, me, moneroWallLoader }) {
+  if (!moneroWallCommentsEnabled(root)) return
+  const state = await moneroWallLoader.load({ id: root.id, enabledAt: root.moneroWallEnabledAt })
+  const view = buildMoneroWallView({ item: root, meId: me?.id ?? null, ...state })
+  if (view.locked) throw new GqlInputError('unlock the post to join the discussion')
+}
+
 export const excerptResolver = async (item, args, ctx) => {
   if (item.excerpt != null) return item.excerpt
+  if (item.parentId != null) {
+    const rootView = await rootWallStateFor(item, ctx)
+    if (rootView?.locked) return null
+  }
   if (!moneroWallEnabled(item)) return makeExcerpt(moneroWallFullText(item))
   const view = await moneroWallStateFor(item, ctx)
   if (view?.publiclyUnlocked) return makeExcerpt(stripMoneroWallMarker(item.text))
@@ -687,7 +760,13 @@ export default {
           LIMIT 3`
       }, similar)
     },
-    newComments: async (parent, { itemId, after }, { models, me }) => {
+    newComments: async (parent, { itemId, after }, { models, me, moneroWallLoader }) => {
+      const root = await threadRootFor(models, itemId)
+      if (root && moneroWallCommentsEnabled(root)) {
+        const state = await moneroWallLoader.load({ id: root.id, enabledAt: root.moneroWallEnabledAt })
+        const view = buildMoneroWallView({ item: root, meId: me?.id ?? null, ...state })
+        if (view.locked) return { comments: [] }
+      }
       const comments = await itemQueryWithMeta({
         me,
         models,
@@ -831,31 +910,34 @@ export default {
 
       return await deleteItemByAuthor({ models, id, item: old })
     },
-    upsertLink: async (parent, { id, ...item }, { me, models, headers }) => {
+    upsertLink: async (parent, { id, ...item }, ctx) => {
+      const { me, models } = ctx
       await validateSchema(linkSchema, item, { models, me })
 
       if (id) {
-        return await updateItem(parent, { id, ...item }, { me, models })
+        return await updateItem(parent, { id, ...item }, ctx)
       } else {
-        return await createItem(parent, item, { me, models, headers })
+        return await createItem(parent, item, ctx)
       }
     },
-    upsertDiscussion: async (parent, { id, ...item }, { me, models, headers }) => {
+    upsertDiscussion: async (parent, { id, ...item }, ctx) => {
+      const { me, models } = ctx
       await validateSchema(discussionSchema, item, { models, me })
 
       if (id) {
-        return await updateItem(parent, { id, ...item }, { me, models })
+        return await updateItem(parent, { id, ...item }, ctx)
       } else {
-        return await createItem(parent, item, { me, models, headers })
+        return await createItem(parent, item, ctx)
       }
     },
-    upsertBounty: async (parent, { id, ...item }, { me, models, headers }) => {
+    upsertBounty: async (parent, { id, ...item }, ctx) => {
+      const { me, models } = ctx
       await validateSchema(bountySchema, item, { models, me })
 
       if (id) {
-        return await updateItem(parent, { id, ...item }, { me, models })
+        return await updateItem(parent, { id, ...item }, ctx)
       } else {
-        return await createItem(parent, item, { me, models, headers })
+        return await createItem(parent, item, ctx)
       }
     },
     removeMoneroWall: async (parent, { id }, { me, models }) => {
@@ -865,10 +947,47 @@ export default {
       if (Number(item.userId) !== Number(me.id)) throw new GqlInputError('item does not belong to you')
       if (item.moneroWallEnabledAt == null) throw new GqlInputError('this post has no monerowall')
       if (item.moneroWallRemovedAt != null) throw new GqlInputError('the monerowall was already removed')
-      return await models.item.update({
-        where: { id: item.id },
-        data: { moneroWallRemovedAt: new Date() }
-      })
+      // Removing the whole wall opens the discussion with it (moneroWallEnabled
+      // is the superset gate). Comment docs were skipped from the search index
+      // while the discussion was walled — enqueue their re-index (same job the
+      // index_item trigger enqueues) so they become searchable again.
+      const reindexSubtree = moneroWallCommentsEnabled(item)
+        ? [models.$executeRaw`
+            INSERT INTO pgboss.job (name, data)
+            SELECT 'indexItem', jsonb_build_object('id', i.id)
+            FROM "Item" i WHERE i."rootId" = ${item.id}`]
+        : []
+      const [updated] = await models.$transaction([
+        models.item.update({
+          where: { id: item.id },
+          data: { moneroWallRemovedAt: new Date() }
+        }),
+        ...reindexSubtree
+      ])
+      return updated
+    },
+    // One-way lift of the discussion wall only: the post body stays walled.
+    // Mirrors removeMoneroWall (author-only, no edit-window gate, permanent).
+    openMoneroWallComments: async (parent, { id }, { me, models }) => {
+      if (!me) throw new GqlAuthenticationError()
+      const item = await models.item.findUnique({ where: { id: Number(id) } })
+      if (!item) throw new GqlInputError('item not found')
+      if (Number(item.userId) !== Number(me.id)) throw new GqlInputError('item does not belong to you')
+      if (item.moneroWallEnabledAt == null) throw new GqlInputError('this post has no monerowall')
+      if (!moneroWallCommentsEnabled(item)) throw new GqlInputError('the discussion is not walled')
+      // Lifted comments re-enter the search index (their docs were skipped
+      // while walled) — same enqueue the index_item trigger pattern uses.
+      const [updated] = await models.$transaction([
+        models.item.update({
+          where: { id: item.id },
+          data: { moneroWallCommentsRemovedAt: new Date() }
+        }),
+        models.$executeRaw`
+          INSERT INTO pgboss.job (name, data)
+          SELECT 'indexItem', jsonb_build_object('id', i.id)
+          FROM "Item" i WHERE i."rootId" = ${item.id}`
+      ])
+      return updated
     },
     rateMoneroWallPost: async (parent, { itemId, stars }, { me, models, moneroWallLoader }) => {
       if (!me) throw new GqlAuthenticationError()
@@ -893,7 +1012,8 @@ export default {
       }
       return await models.item.findUnique({ where: { id: item.id } })
     },
-    upsertPoll: async (parent, { id, ...item }, { me, models, headers }) => {
+    upsertPoll: async (parent, { id, ...item }, ctx) => {
+      const { me, models } = ctx
       const numExistingChoices = id
         ? await models.pollOption.count({
           where: {
@@ -905,13 +1025,14 @@ export default {
       await validateSchema(pollSchema, item, { models, me, numExistingChoices })
 
       if (id) {
-        return await updateItem(parent, { id, ...item }, { me, models })
+        return await updateItem(parent, { id, ...item }, ctx)
       } else {
         item.pollCost = item.pollCost || POLL_COST
-        return await createItem(parent, item, { me, models, headers })
+        return await createItem(parent, item, ctx)
       }
     },
-    upsertJob: async (parent, { id, ...item }, { me, models, headers }) => {
+    upsertJob: async (parent, { id, ...item }, ctx) => {
+      const { me, models } = ctx
       if (!me) {
         throw new GqlAuthenticationError()
       }
@@ -928,18 +1049,18 @@ export default {
       }
 
       if (id) {
-        return await updateItem(parent, { id, ...item }, { me, models })
+        return await updateItem(parent, { id, ...item }, ctx)
       } else {
-        return await createItem(parent, item, { me, models, headers })
+        return await createItem(parent, item, ctx)
       }
     },
-    upsertComment: async (parent, { id, ...item }, { me, models, headers }) => {
+    upsertComment: async (parent, { id, ...item }, ctx) => {
       await validateSchema(commentSchema, item)
 
       if (id) {
-        return await updateItem(parent, { id, ...item }, { me, models })
+        return await updateItem(parent, { id, ...item }, ctx)
       } else {
-        return await createItem(parent, item, { me, models, headers })
+        return await createItem(parent, item, ctx)
       }
     },
     updateNoteId: async (parent, { id, noteId }, { me, models }) => {
@@ -1020,6 +1141,12 @@ export default {
   Item: {
     excerpt: excerptResolver,
     text: async (item, args, ctx) => {
+      if (item.parentId != null) {
+        // Monerowall-covered discussion: a locked viewer gets no comment text
+        // on any surface (profiles, /recent, notifications, direct queries).
+        const rootView = await rootWallStateFor(item, ctx)
+        if (rootView?.locked) return null
+      }
       if (!moneroWallEnabled(item)) return moneroWallFullText(item)
       const { me } = ctx
       const view = await moneroWallStateFor(item, ctx)
@@ -1029,6 +1156,14 @@ export default {
       return splitMoneroWallText(item.text).teaserText
     },
     moneroWall: async (item, args, ctx) => await moneroWallStateFor(item, ctx),
+    // True when this item is a comment whose thread root walls the discussion
+    // and the viewer is locked — drives the "[walled]" placeholder wherever a
+    // comment shell still renders (profiles, /recent, notifications).
+    commentWalled: async (item, args, ctx) => {
+      if (item.parentId == null) return false
+      const rootView = await rootWallStateFor(item, ctx)
+      return rootView?.locked === true
+    },
     // H1 (2026-09-26 review): imgproxyUrls is content-bearing — the worker
     // derives signed derivative URLs from the FULL stored text, below the wall
     // included, and signed imgproxy URLs are bearer URLs (possession = fetch).
@@ -1047,7 +1182,16 @@ export default {
     // read item.imgproxyUrls off the row directly, so server-side rendering
     // of the teaser is unaffected by this filter.
     imgproxyUrls: async (item, args, ctx) => {
-      if (item.imgproxyUrls == null || !moneroWallEnabled(item)) return item.imgproxyUrls
+      if (item.imgproxyUrls == null) return item.imgproxyUrls
+      if (item.parentId != null) {
+        // H1 precedent (2026-09-26): signed imgproxy URLs are bearer URLs —
+        // possession = fetch. A locked viewer gets no derivatives for a
+        // walled-discussion comment (the worker derives them from the FULL
+        // comment text).
+        const rootView = await rootWallStateFor(item, ctx)
+        if (rootView?.locked) return {}
+      }
+      if (!moneroWallEnabled(item)) return item.imgproxyUrls
       const view = await moneroWallStateFor(item, ctx)
       // a null view here would mean a contract change upstream — filter (fail
       // closed) rather than serve the raw map
@@ -1068,7 +1212,15 @@ export default {
     // match the validated main URL. One DataLoader load per walled item.
     xPreview: async (item, args, ctx) => {
       const preview = item.xPreview
-      if (!preview || !moneroWallEnabled(item)) return preview
+      if (!preview) return preview
+      if (item.parentId != null) {
+        // same standard as imgproxyUrls: a locked viewer gets no preview
+        // derived from a walled-discussion comment's body (tweet text and
+        // signed image derivatives are content)
+        const rootView = await rootWallStateFor(item, ctx)
+        if (rootView?.locked) return null
+      }
+      if (!moneroWallEnabled(item)) return preview
       const view = await moneroWallStateFor(item, ctx)
       if (view && !view.locked) return preview
       const fromPublicMain = canonicalXStatus(item.url)?.statusUrl === preview.statusUrl
@@ -1258,6 +1410,15 @@ export default {
     },
     comments: async (item, { sort, cursor }, ctx) => {
       const { me } = ctx
+      // Monerowall-covered discussion: a locked viewer gets no comment list —
+      // before the pre-populated shortcut so even SSR-fetched trees are gated.
+      const gate = await threadCommentsGate(item, ctx)
+      if (gate?.locked) {
+        return {
+          comments: [],
+          cursor: null
+        }
+      }
       if (typeof item.comments !== 'undefined') {
         if (Array.isArray(item.comments)) {
           return {
@@ -1427,10 +1588,12 @@ export default {
         AND state = 'created'`
       return reminderJobs[0]?.startafter ?? null
     },
-    lexicalState: async (item, args, { me, moneroWallLoader, lexicalStateLoader }) => {
+    lexicalState: async (item, args, ctx) => {
       if (!item.text) return null
-      return lexicalStateLoader.load({
-        text: await moneroWallRenderText(item, { me, moneroWallLoader }),
+      const text = await moneroWallRenderText(item, ctx)
+      if (text == null) return null
+      return ctx.lexicalStateLoader.load({
+        text,
         context: {
           imgproxyUrls: item.imgproxyUrls,
           rel: item.rel,
@@ -1440,11 +1603,13 @@ export default {
         }
       })
     },
-    html: async (item, args, { me, moneroWallLoader, lexicalStateLoader }) => {
+    html: async (item, args, ctx) => {
       if (!item.text) return null
       try {
-        const lexicalState = await lexicalStateLoader.load({
-          text: await moneroWallRenderText(item, { me, moneroWallLoader }),
+        const text = await moneroWallRenderText(item, ctx)
+        if (text == null) return null
+        const lexicalState = await ctx.lexicalStateLoader.load({
+          text,
           context: {
             imgproxyUrls: item.imgproxyUrls,
             rel: item.rel,
@@ -1519,6 +1684,9 @@ export const updateItem = async (parent, { hash, hmac, sendProtocolId, ...item }
     delete item.moneroWallPricePiconeros
     delete item.moneroWallThresholdPiconeros
   }
+  // The discussion-wall flag is create-time only — never movable via edit
+  // (opening it goes through openMoneroWallComments, one-way).
+  delete item.moneroWallCoversComments
   delete item.moneroWallEnabledAt // clients can never move the window; create stamps it once
   await assertMoneroWallWrite({ models, me, item, old })
 
@@ -1619,8 +1787,9 @@ export const repostItem = async (parent, { id, subName }, { me, models }) => {
 // update calls may only tweak X/T on an existing active unfrozen wall;
 // enabling at edit, re-adding after removal, and nulling both settings are
 // rejected here or in moneroWallUpdateError.
-async function assertMoneroWallWrite ({ models, me, item, old }) {
-  const hasNew = item.moneroWallPricePiconeros !== undefined || item.moneroWallThresholdPiconeros !== undefined
+export async function assertMoneroWallWrite ({ models, me, item, old }) {
+  const hasNew = item.moneroWallPricePiconeros !== undefined || item.moneroWallThresholdPiconeros !== undefined ||
+    item.moneroWallCoversComments !== undefined
   const text = item.text ?? old?.text
 
   if (!hasNew) {
@@ -1634,6 +1803,16 @@ async function assertMoneroWallWrite ({ models, me, item, old }) {
 
   const config = await models.platformFeeConfig.findUnique({ where: { id: 1 } })
   if (!config) throw new GqlInputError('fee config not initialized')
+
+  // Discussion-wall flag: create-only, and only alongside a wall (it walls a
+  // subset of what the wall already walls). updateItem strips the flag before
+  // this check, so an old here means the update path can never move it.
+  const commentsError = moneroWallCommentsConfigError({
+    coversComments: item.moneroWallCoversComments,
+    hasWallLeg: item.moneroWallPricePiconeros != null || item.moneroWallThresholdPiconeros != null,
+    old
+  })
+  if (commentsError) throw new GqlInputError(commentsError)
 
   let frozen = false
   if (moneroWallEnabled(old) && old?.id) {
@@ -1664,7 +1843,7 @@ async function assertMoneroWallWrite ({ models, me, item, old }) {
   if (!account) throw new GqlInputError('add a Monero wallet before enabling a monerowall')
 }
 
-export const createItem = async (parent, { sendProtocolId, ...item }, { me, models, headers }) => {
+export const createItem = async (parent, { sendProtocolId, ...item }, { me, models, headers, moneroWallLoader }) => {
   // Turf repost (2026-09-24): creation is single-turf. Additional turfs are
   // added after the post is live via repostItem — one paid repost per turf,
   // so every posting fee stays a single payment to a single destination.
@@ -1681,6 +1860,8 @@ export const createItem = async (parent, { sendProtocolId, ...item }, { me, mode
     delete item.moneroWallPricePiconeros
     delete item.moneroWallThresholdPiconeros
   }
+  // Normalize the discussion-wall flag: only an explicit true ever persists.
+  if (item.moneroWallCoversComments !== true) delete item.moneroWallCoversComments
 
   await assertMoneroWallWrite({ models, me, item, old: null })
   if ((item.moneroWallPricePiconeros != null || item.moneroWallThresholdPiconeros != null) && item.moneroWallEnabledAt == null) {
@@ -1703,6 +1884,10 @@ export const createItem = async (parent, { sendProtocolId, ...item }, { me, mode
     if (!parent) {
       throw new GqlInputError('cannot comment on unpaid item')
     }
+    // Monerowall-covered discussion (2026-10-14): participation is paid —
+    // a locked viewer cannot join, keeping bots and freeloaders out.
+    const threadRoot = await threadRootFor(models, item.parentId)
+    await assertMoneroWallCommentAccess({ root: threadRoot, me, moneroWallLoader })
   }
 
   // mark item as created with API key

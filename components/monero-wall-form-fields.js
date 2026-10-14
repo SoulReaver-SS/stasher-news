@@ -17,8 +17,10 @@ export function moneroWallInitialValues (item, draft) {
       }
     : undefined)
   const enabled = !!wall
+  const coversComments = !!(item?.moneroWall?.coversComments ?? draft?.moneroWallCoversComments)
   return {
     moneroWallEnabled: enabled,
+    moneroWallCoversComments: coversComments,
     moneroWallPriceXmr: wall?.pricePiconeros != null ? piconerosToXmrDecimal(BigInt(wall.pricePiconeros)) : '',
     moneroWallThresholdXmr: wall?.thresholdPiconeros != null ? piconerosToXmrDecimal(BigInt(wall.thresholdPiconeros)) : '',
     moneroWallPricePiconeros: wall?.pricePiconeros != null ? String(wall.pricePiconeros) : null,
@@ -95,7 +97,7 @@ export default function MoneroWallFields ({ item }) {
   return (
     <div className='my-2'>
       {editing
-        ? <div className='text-muted fw-bold my-1'>monerowall (added at creation — X/T editable until the first payment; removal is permanent)</div>
+        ? <div className='text-muted fw-bold my-1'>monerowall (added at creation{item?.moneroWall?.coversComments ? ' — the discussion is walled too' : ''} — X/T editable until the first payment; removal is permanent)</div>
         : (
           <>
             <Checkbox
@@ -107,6 +109,7 @@ export default function MoneroWallFields ({ item }) {
                 setFieldValue('moneroWallThresholdXmr', '')
                 setFieldValue('moneroWallPricePiconeros', null)
                 setFieldValue('moneroWallThresholdPiconeros', null)
+                setFieldValue('moneroWallCoversComments', false)
               }}
             />
             <BootstrapForm.Text className='text-muted d-block mt-1 ms-4'>
@@ -142,6 +145,21 @@ export default function MoneroWallFields ({ item }) {
               />
             </Col>
           </Row>
+          {/* create-time only (like the wall itself): the discussion wall can
+              never be added to an existing post, and opening it later goes
+              through the author panel's one-way "open the discussion" action */}
+          {!editing && values.moneroWallEnabled && (
+            <>
+              <Checkbox
+                label='Wall the comment section too'
+                name='moneroWallCoversComments'
+                groupClassName='ms-4'
+              />
+              <BootstrapForm.Text className='text-muted d-block mt-1 ms-4'>
+                keep replies and discussion visible only to stashers who unlocked this post.
+              </BootstrapForm.Text>
+            </>
+          )}
           {(wallError || noWallLeg) && !legError && (
             <BootstrapForm.Text className='text-danger small d-block mt-1'>
               {wallError || NO_WALL_LEG_ERROR}

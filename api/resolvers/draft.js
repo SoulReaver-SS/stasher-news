@@ -62,7 +62,8 @@ export default {
         subName: input.subName ?? null,
         extra: buildExtra(input),
         moneroWallPricePiconeros: xmrToPiconerosOrNull(input.moneroWallPriceXmr),
-        moneroWallThresholdPiconeros: xmrToPiconerosOrNull(input.moneroWallThresholdXmr)
+        moneroWallThresholdPiconeros: xmrToPiconerosOrNull(input.moneroWallThresholdXmr),
+        moneroWallCoversComments: input.moneroWallCoversComments === true ? true : null
       }
 
       return models.$transaction(async tx => {
