@@ -10,12 +10,18 @@
 // (docs/superpowers/specs/2026-09-22-drafts-ui-mockups.html). The custom
 // toggles render their own ▾ glyph + count because the app hides Bootstrap's
 // .dropdown-toggle::after globally (styles/globals.scss).
-import { forwardRef } from 'react'
+import { forwardRef, useEffect, useRef } from 'react'
 import { useRouter } from 'next/router'
 import { useFormikContext } from 'formik'
 import Dropdown from 'react-bootstrap/Dropdown'
-import { useMutation, useQuery } from '@apollo/client/react'
+import { gql } from '@apollo/client'
+import { useApolloClient, useMutation, useQuery } from '@apollo/client/react'
 import { MY_DRAFTS, UPSERT_DRAFT, DELETE_DRAFT } from '@/fragments/draft'
+import {
+  readDraftPublications,
+  resolveDraftPublications,
+  writeDraftPublications
+} from '@/lib/draft-publication-ledger'
 import { xmrToPiconeros } from '@/lib/format'
 import { DRAFT_MAX_COUNT, DRAFT_MEDIA_CAP_BYTES } from '@/lib/constants'
 import { timeSince } from '@/lib/time'
@@ -31,6 +37,14 @@ const TYPE_QUERY = { DISCUSSION: 'discussion', LINK: 'link', BOUNTY: 'bounty', P
 const TYPE_ICON = { DISCUSSION: '✎', LINK: '🔗', BOUNTY: '◎', POLL: '▤' }
 
 const MB = 1024 * 1024
+
+// ledger sweep lookup: is a recorded fee-gated publication's item live yet?
+// (lib/draft-publication-ledger.js)
+const DRAFT_PUBLICATION_ITEM_STATUS = gql`
+  query DraftPublicationItemStatus($id: ID!) {
+    item(id: $id) { id feeStatus }
+  }
+`
 
 // custom dropdown toggles (module scope: stable identity, ref forwarded)
 const CaretToggle = forwardRef(function CaretToggle ({ children, onClick, ...props }, ref) {
@@ -69,12 +83,67 @@ export default function DraftsMenu ({ type }) {
   const toaster = useToast()
   const { me } = useMe()
   const formik = useFormikContext() // undefined on the picker page
+  const client = useApolloClient()
   const { data, refetch } = useQuery(MY_DRAFTS, { skip: !me })
   const [upsertDraft] = useMutation(UPSERT_DRAFT)
   const [deleteDraft] = useMutation(DELETE_DRAFT)
 
   const drafts = data?.myDrafts ?? [] // cross-type: NO per-type filter
   const loadedDraftId = router.query.draft
+
+  // publication-ledger sweep (lib/draft-publication-ledger.js): a fee-gated
+  // publish deletes its draft only when the posting-fee modal is still open
+  // when the fee flips — if it closed early, finish the job here on a later
+  // load. Runs once per mount, after MY_DRAFTS resolves; entries whose item
+  // is still pending stay recorded for the next visit.
+  const sweptRef = useRef(false)
+  useEffect(() => {
+    if (!me || !data || sweptRef.current || typeof window === 'undefined') return
+    sweptRef.current = true
+    const sweep = async () => {
+      const entries = readDraftPublications(window.localStorage)
+      if (entries.length === 0) return
+      const draftIds = new Set(drafts.map(d => String(d.id)))
+      const itemStatusById = {}
+      await Promise.all(entries
+        .filter(e => draftIds.has(String(e.draftId)))
+        .map(async e => {
+          try {
+            const { data: itemData } = await client.query({
+              query: DRAFT_PUBLICATION_ITEM_STATUS,
+              variables: { id: String(e.itemId) },
+              fetchPolicy: 'network-only' // a cached feeStatus defeats the sweep
+            })
+            // item null (author-deleted or abandoned) keeps the draft
+            itemStatusById[String(e.itemId)] = itemData?.item?.feeStatus ?? null
+          } catch {
+            // query failed: unknown outcome — retry on the next load
+            itemStatusById[String(e.itemId)] = undefined
+          }
+        }))
+      const { deleteDraftIds, remainingEntries } = resolveDraftPublications(entries, { draftIds, itemStatusById })
+      if (deleteDraftIds.length > 0) {
+        const outcomes = await Promise.allSettled(deleteDraftIds.map(id => deleteDraft({ variables: { id } })))
+        // a delete that failed (or was never attempted) keeps its entry so the
+        // next sweep retries — persisting before the mutations are known would
+        // silently re-open the original bug for that draft
+        const retryEntries = deleteDraftIds
+          .filter((id, i) => outcomes[i].status === 'rejected')
+          .map(id => entries.find(e => String(e.draftId) === String(id)))
+          .filter(Boolean)
+        writeDraftPublications(window.localStorage, [...remainingEntries, ...retryEntries])
+        // the sweep deleting the draft that's currently open leaves a stale
+        // editing session behind — reset it to a clean form (same as remove)
+        if (loadedDraftId && deleteDraftIds.some(id => String(id) === String(loadedDraftId))) {
+          router.replace({ query: { ...router.query, draft: undefined } }, undefined, { shallow: true })
+        }
+        await refetch()
+      } else {
+        writeDraftPublications(window.localStorage, remainingEntries)
+      }
+    }
+    sweep().catch(() => {})
+  }, [me, data, drafts, client, deleteDraft, refetch, router, loadedDraftId])
 
   const save = async () => {
     if (!formik) return // picker-page instance: list-only, nothing to save

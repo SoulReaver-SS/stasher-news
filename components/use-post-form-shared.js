@@ -4,6 +4,7 @@ import useItemSubmit from './use-item-submit'
 import { useApolloClient, useQuery } from '@apollo/client/react'
 import { useRouter } from 'next/router'
 import { MY_DRAFT, DELETE_DRAFT } from '@/fragments/draft'
+import { recordDraftPublication, clearDraftPublication } from '@/lib/draft-publication-ledger'
 import { getPayIn, isPostingFeeSubmit } from '@/lib/pay-in'
 
 /**
@@ -79,8 +80,13 @@ export function usePostFormShared ({ item, subs, mutation, schemaFn, storageKeyP
   // the deletion now runs at fee-paid via onPostingFeePaid. If the modal never
   // sees the payment (browser closed, paid later from the wallet), the draft
   // survives until the 90-day TTL sweep — content loss becomes a stale draft.
+  // That leak is closed client-side by the publication ledger
+  // (lib/draft-publication-ledger.js): fee-gated submits record
+  // { draftId, itemId } and the drafts menu deletes the draft on a later load
+  // once the item proves live.
   const deletePublishedDraft = () => {
     if (!draftId) return
+    if (typeof window !== 'undefined') clearDraftPublication(window.localStorage, draftId)
     client.mutate({
       mutation: DELETE_DRAFT,
       variables: { id: draftId },
@@ -111,7 +117,17 @@ export function usePostFormShared ({ item, subs, mutation, schemaFn, storageKeyP
         // fee-gated: only a PENDING_FEE item exists behind a QR — strip
         // ?draft (remount key / clean form) but leave the draft deletion to
         // onPostingFeePaid (H2: the draft is the only durable copy until the
-        // fee is observed)
+        // fee is observed).
+        //
+        // The modal can vanish before the flip (its own copy invites closing
+        // right after sending; tab closed; paid later from the wallet), and
+        // then nothing deletes the draft. Record { draftId, itemId } so the
+        // drafts menu's ledger sweep can finish the job on a later load
+        // (2026-10-14 draft-post bug: jerry's drafts 252/256).
+        const postId = getPayIn(data)?.payerPrivates?.result?.id
+        if (postId != null && typeof window !== 'undefined') {
+          recordDraftPublication(window.localStorage, { draftId, itemId: postId })
+        }
         router.replace({ query: { ...router.query, draft: undefined } }, undefined, { shallow: true })
       } else {
         // free publish: the post is durable the moment the mutation resolves,
