@@ -852,6 +852,20 @@ test('an older unpaid reward and the next pool cannot be swept for ops', async (
   expect(models.store.opsSweptPiconeros).toBe(result.swept)
 })
 
+test('a multiweek rewards rollover stays protected while ops sweeps more than one XMR', async () => {
+  const dist = makeDistribution({ opsAvailablePiconeros: 8n * XMR, rolledOverPiconeros: 4n * XMR })
+  const models = makeFakeModels(dist)
+  const fee = 2_000_000_000n
+  const wallet = makeFakeWallet({ unlocked: 10n * XMR, fee })
+  const result = await sweepOpsEarmark({ distribution: dist, models, wallet })
+  // All 4 XMR held for later weeks remain protected, not just next week's cap.
+  // Available debit room = 10 XMR - 4 XMR rewards - 0.001 XMR fee reserve.
+  expect(result.state).toBe('SWEPT')
+  expect(result.swept).toBe(5_997_000_000_000n)
+  expect(result.swept + fee).toBe(6n * XMR - MIN_FLOOR)
+  expect(models.store.rolledOverPiconeros).toBe(4n * XMR)
+})
+
 test('a negative ops carry is a deferral, never a spend', async () => {
   const dist = makeDistribution({ opsAvailablePiconeros: 10_000_000_000n, opsNetworkFeesAccountedPiconeros: 0n })
   const models = makeFakeModels(dist)

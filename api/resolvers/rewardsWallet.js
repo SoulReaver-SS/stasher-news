@@ -24,7 +24,7 @@ import { GqlInputError } from '@/lib/error'
 //     consolidations included),
 //   - balance  = received - principal - network fees. A negative balance is
 //     real debt and is never clamped,
-//   - rewards  = the next distribution's pool (the same computation /rewards
+//   - rewards  = the full rewards pool, including future weeks (the computation /rewards
 //     uses), ops = the SIGNED fee-adjusted pending sweep. A negative ops figure
 //     is an unfunded debt (hot-wallet costs and sweeps exceeded the ops
 //     earmark), surfaced separately as opsDeficitPiconeros.
@@ -114,7 +114,7 @@ export default {
           outstandingRewardsPiconeros: ledger.outstandingRewardsPiconeros,
           opsDeficitPiconeros,
           // Literal current allocations (never a pro-rata slice of the
-          // balance): rewards = the next distribution's pool (same value
+          // balance): rewards = the full pool, not the capped curator budget (same value
           // /rewards shows), ops = the signed fee-adjusted pending sweep.
           rewardsEarmarkPiconeros: pool.poolPiconeros,
           opsEarmarkPiconeros: pool.pendingSweepPiconeros,

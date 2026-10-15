@@ -6,7 +6,7 @@ import { reconcileWalletTransactions, errorLabel } from '@/api/monero/rewardsTra
 import logger, { logInfo, logError } from '@/lib/logger'
 import { alert } from '@/lib/alert'
 import { moneroDistributionStatus } from '@/lib/metrics'
-import { opsCarry, walletScope } from '@/lib/rewardsAccounting'
+import { opsCarry, walletScope, WEEKLY_CURATOR_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 import { readRewardsInflow } from '@/api/monero/rewardsInflow'
 import { readRewardsWalletLedger } from '@/api/monero/rewardsLedger'
 import { withRewardsPhase } from './rewardsPhase'
@@ -18,8 +18,8 @@ import { withRewardsPhase } from './rewardsPhase'
 //      posting/territory fees) for the period;
 //   2. applies the PlatformFeeConfig allocation split to get the rewards earmark;
 //   3. adds the prior period's rolledOverPiconeros to form the pool;
-//   4. calls computeCuratorShares (Task 7) to apportion the pool to the curators
-//      (tippers) of the period's top content;
+//   4. calls computeCuratorShares (Task 7) to apportion up to 1 XMR to the
+//      curators (tippers) of the period's top content;
 //   5. writes one RewardDistribution row + one QUEUED RewardPayout per curator
 //      who has a registered receiving address. Curators with no address are
 //      excluded — their share joins the rollover.
@@ -164,6 +164,9 @@ async function distribute (models) {
     // --- Pool: this week's earmark + the prior period's rollover ---
     const rolledOver = toBigInt(lastDistribution?.rolledOverPiconeros)
     const poolPiconeros = rewardsInflow + rolledOver
+    // Keep the FULL pool in the ledger and protected from ops sweeps. Only the
+    // curator budget is capped; referrals still use the full pool's remainder.
+    const curatorBudget = poolPiconeros < WEEKLY_CURATOR_CAP_PICONEROS ? poolPiconeros : WEEKLY_CURATOR_CAP_PICONEROS
 
     // Ops earmark rollover: the prior period's unswept ops carried in, LESS the
     // network costs incurred after that snapshot's checkpoint (and with a
@@ -201,7 +204,7 @@ async function distribute (models) {
     // but passing tx keeps the reads in the same serializable snapshot as the
     // writes below — fully consistent at no extra cost. ---
     const { shares } = await computeCuratorShares(
-      periodStart, periodEnd, poolPiconeros,
+      periodStart, periodEnd, curatorBudget,
       { minPayout: toBigInt(config.distributionMinPayoutPiconeros), topN: config.distributionTopN, trustWeightFloor },
       tx)
 
@@ -271,7 +274,8 @@ async function distribute (models) {
     // --- Final ledger (atomic with the payout createMany below) ---
     // distributedPiconeros is the sum of the CREATED payouts (after address
     // filtering). rolledOverPiconeros is whatever is left — this captures BOTH
-    // Task 7's sub-minPayout/topN rollover AND the addressless-curator rollover.
+    // the weekly cap's excess, Task 7's sub-minPayout/topN rollover, and the
+    // addressless-curator rollover, less any additional referral payouts.
     const distributedPiconeros = payoutRows.reduce((acc, p) => acc + p.piconeros, 0n)
     const finalRolledOverPiconeros = poolPiconeros - distributedPiconeros
 

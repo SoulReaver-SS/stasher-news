@@ -16,6 +16,7 @@ import { useMemo } from 'react'
 import { CompactLongCountdown } from '@/components/countdown'
 import { payTypeShortName } from '@/lib/pay-in'
 import DonateModal from '@/components/donate-modal'
+import { WEEKLY_CURATOR_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 
 const GrowthPieChart = dynamic(() => import('@/components/charts').then(mod => mod.GrowthPieChart), {
   loading: () => <GrowthPieChartSkeleton />
@@ -40,7 +41,7 @@ export function RewardLine ({ total, time, xmr }) {
   return (
     <>
       <span style={{ whiteSpace: 'nowrap' }}>
-        {xmr ? piconerosToXmr(BigInt(total), 3) : piconerosToMXmr(BigInt(total))} in rewards
+        {xmr ? piconerosToXmr(BigInt(total), 3) : piconerosToMXmr(BigInt(total))} in rewards pool
       </span>
       {time &&
         <small style={{ whiteSpace: 'nowrap' }}>
@@ -72,6 +73,7 @@ export default function Rewards ({ ssrData }) {
   }, [dat])
 
   if (!dat) return <PageLoading />
+  const curatorBudget = BigInt(total) < WEEKLY_CURATOR_CAP_PICONEROS ? BigInt(total) : WEEKLY_CURATOR_CAP_PICONEROS
 
   return (
     <Layout footerLinks>
@@ -92,6 +94,10 @@ export default function Rewards ({ ssrData }) {
                 <small><small><small>wallet transparency</small></small></small>
               </Link>
             </h3>
+            <p className='text-center text-muted'>
+              Up to {piconerosToXmr(curatorBudget)} for curators at the next weekly distribution.
+              Remaining funds roll over to the following week.
+            </p>
             {sources?.length > 0 &&
               <div className='my-3 w-100'>
                 <GrowthPieChart data={sources} />

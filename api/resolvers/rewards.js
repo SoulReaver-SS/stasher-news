@@ -34,8 +34,8 @@ async function getActiveRewards (models) {
   // The next distribution's pool = this cycle's rewards earmark + the prior
   // cycle's rollover (rewardsDistributor: poolPiconeros = rewardsInflow +
   // lastDistribution.rolledOverPiconeros). Surface the rollover as a source so
-  // the pool shown on /rewards and the transparency countdown reflect what will
-  // actually be distributed, not just this cycle's new inflow.
+  // the pool shown on /rewards and transparency reflects the FULL rewards
+  // reserve, including funds held for future capped weekly distributions.
   if (rolledOverPiconeros > 0n) {
     return [{ total: poolPiconeros, time, sources: [...sources, { name: 'rolled over', value: rolledOverPiconeros.toString() }] }]
   }

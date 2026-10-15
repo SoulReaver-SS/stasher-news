@@ -8,6 +8,7 @@ import { useQuery } from '@apollo/client/react'
 import { useData } from '@/components/use-data'
 import { SSR, FAST_POLL_INTERVAL_MS } from '@/lib/constants'
 import { piconerosToXmr } from '@/lib/format'
+import { WEEKLY_CURATOR_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 
 const REWARDS_WALLET = gql`
   query rewardsWalletInfo {
@@ -196,16 +197,19 @@ export default function Transparency ({ ssrData }) {
           <p className='text-muted'>
             <small>
               The wallet holds one consolidated balance. The two figures below are
-              what it is literally allocated to right now: the pool that pays out at
-              the next weekly distribution, and the platform's share — unswept from
+              what it is literally allocated to right now: the full rewards pool,
+              including funds held for future weeks, and the platform's share — unswept from
               the last distribution (after proven sweeps and real network fees) plus
               this week's accrual — awaiting its sweep to the ops wallet. They are
               literal allocations, not a pro-rata slice of the balance; a negative
-              ops figure is unfunded debt, not free cash.
+              ops figure is unfunded debt, not free cash. Weekly curator payouts are
+              capped at {piconerosToXmr(WEEKLY_CURATOR_CAP_PICONEROS)}; referral payouts may be
+              additional, limited by the remaining pool. All unused rewards roll over.
+              The ops sweep has no weekly amount cap; network fees are paid by ops.
             </small>
           </p>
           <div className='d-flex flex-wrap justify-content-between border-bottom border-top py-3 my-2'>
-            <Stat label='Rewards allocation' value={piconerosToXmr(toBigInt(w.nextPoolPiconeros))} sub='pays out at the next distribution' />
+            <Stat label='Rewards allocation' value={piconerosToXmr(toBigInt(w.nextPoolPiconeros))} sub='full pool — weekly curator cap applies; excess rolls over' />
             <Stat label='Ops allocation' value={piconerosToXmr(toBigInt(w.pendingSweepPiconeros))} sub='unswept from the last distribution + accruing this week' />
           </div>
 
@@ -236,7 +240,8 @@ export default function Transparency ({ ssrData }) {
               Recent weekly curator distributions. Each payout is a real on-chain
               Monero transaction from the rewards wallet — verify any tx hash on
               the explorer. Curator handles are shown as nyms; sub-threshold
-              shares roll over to the next period. The ops allocation is swept to
+              shares and funds above the weekly curator cap roll over (less any
+              additional referral payouts). The ops allocation is swept to
               the ops wallet when the hot wallet has enough unlocked change; when
               it doesn't (recent incoming outputs are still locked), the sweep is
               deferred and the unswept amount rolls into next week's opsAvailable

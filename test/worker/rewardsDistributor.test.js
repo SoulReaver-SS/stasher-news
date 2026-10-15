@@ -744,6 +744,16 @@ test('distributedPiconeros + rolledOverPiconeros reconciles to the pool exactly'
   expect(result.distributedPiconeros + result.rolledOverPiconeros).toBe(result.poolPiconeros)
 })
 
+test('a pool above the weekly curator cap still allocates at most the cap to curators in the default suite', async () => {
+  const curatorEarns = await prisma.earn.aggregate({
+    where: { distributionId: result.id, type: { in: ['TIP_POST', 'TIP_COMMENT'] } },
+    _sum: { piconeros: true }
+  })
+  expect(result.poolPiconeros).toBeGreaterThan(600_000_000_000n)
+  expect(curatorEarns._sum.piconeros).toBeGreaterThan(0n)
+  expect(curatorEarns._sum.piconeros).toBeLessThanOrEqual(600_000_000_000n)
+})
+
 test('opsInflowPiconeros is the exact complement of the rewards earmark (totalInflow - rewardsInflow)', async () => {
   // Drift-robust: recompute the period's actual confirmed inflow from the DB
   // (genuine stagenet activity may add to the pool on the live dev DB) with

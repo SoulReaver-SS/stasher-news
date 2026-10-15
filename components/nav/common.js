@@ -111,7 +111,9 @@ export function SearchItem ({ prefix, className }) {
 export function NavPrice ({ className }) {
   return (
     <Nav.Item className={classNames(styles.price, className)}>
-      <Price className='nav-link text-monospace' />
+      {/* no text-monospace: the price inherits the top bars' Chakra Petch (the
+        cluster's font on desktop; the bar font on mobile/sticky bars) */}
+      <Price className='nav-link' />
     </Nav.Item>
   )
 }
