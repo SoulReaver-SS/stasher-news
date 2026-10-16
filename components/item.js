@@ -84,7 +84,7 @@ function ItemLink ({ url, rel }) {
     const privacy = privacyUrls(url)
 
     return (
-      <span>
+      <span className={styles.linkWrapper}>
         {/* eslint-disable-next-line react/jsx-no-target-blank */}
         <a className={styles.link} target='_blank' href={privacy?.primary ?? url} rel={rel ?? UNKNOWN_LINK_REL}>
           {url.replace(/(^https?:|^)\/\//, '')}

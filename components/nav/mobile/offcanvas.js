@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Dropdown, Image, Nav, Navbar, Offcanvas } from 'react-bootstrap'
-import { MEDIA_URL } from '@/lib/constants'
+import { PUBLIC_MEDIA_URL } from '@/lib/constants'
 import Link from 'next/link'
 import { Indicator, LoginButtons, LogoutDropdownItem, NavWalletSummary } from '../common'
 import AnonIcon from '@/svgs/spy-fill.svg'
@@ -10,7 +10,7 @@ import classNames from 'classnames'
 import { useWalletIndicator } from '@/wallets/client/hooks'
 
 function MeImage ({ me }) {
-  const src = useMemo(() => me?.photoId ? `${MEDIA_URL}/${me.photoId}` : '/xmrgirl.jpg', [me?.photoId])
+  const src = useMemo(() => me?.photoId ? `${PUBLIC_MEDIA_URL}/${me.photoId}` : '/xmrgirl.jpg', [me?.photoId])
   if (!me) {
     return <AnonIcon aria-hidden='true' focusable='false' width='22' height='22' className='text-muted' />
   }
