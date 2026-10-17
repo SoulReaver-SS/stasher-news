@@ -18,7 +18,7 @@ import { withRewardsPhase } from './rewardsPhase'
 //      posting/territory fees) for the period;
 //   2. applies the PlatformFeeConfig allocation split to get the rewards earmark;
 //   3. adds the prior period's rolledOverPiconeros to form the pool;
-//   4. calls computeCuratorShares (Task 7) to apportion up to 1 XMR to the
+//   4. calls computeCuratorShares (Task 7) to apportion up to 0.6 XMR to the
 //      curators (tippers) of the period's top content;
 //   5. writes one RewardDistribution row + one QUEUED RewardPayout per curator
 //      who has a registered receiving address. Curators with no address are
