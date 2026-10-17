@@ -41,14 +41,6 @@ import { withRewardsPhase } from './rewardsPhase'
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 const DAY_MS = 24 * 60 * 60 * 1000
 
-// Scheduling-jitter grace for the weekly idempotency guard. Consecutive runs
-// land L ms after Monday 00:00 UTC (pg-boss pickup latency, observed ~4s);
-// with zero slack, L1 >= L2 puts last week's periodEnd at/inside this week's
-// periodStart and the run silently skips. 1h is ~900x that margin and keeps
-// every same-week re-run (cron + manual `sndev monero distribute`, FAILED
-// re-drives) inside the skip window for 6d23h of the week.
-const IDEMPOTENCY_GRACE_MS = 60 * 60 * 1000
-
 const DISTRIBUTION_STATUS_GAUGE = { PENDING: 0, SENDING: 1, COMPLETE: 2, FAILED: 3 }
 
 // One weekly distribution. The testable core: no pg-boss worker, no network.
@@ -90,12 +82,17 @@ export async function runDistributionOnce ({ models, sendPayouts: injectSendPayo
 
 async function distribute (models) {
   const periodEnd = new Date()
-  // Run-time-anchored window, used ONLY by the idempotency guard below. It must
-  // stay run-time anchored: the inflow window (periodStart) starts at the last
-  // distribution's periodEnd, so feeding periodStart to the guard would put the
-  // previous row's periodEnd at/below the window start and a same-week re-run
-  // would double-distribute instead of skipping.
-  const runWindowStart = new Date(periodEnd.getTime() - WEEK_MS)
+  // Allocation eligibility uses the UTC calendar week: a run creates at most
+  // one distribution per week beginning Monday 00:00 UTC. A delayed prior run
+  // consumes only the week it was actually created in, never the following
+  // Monday. The inflow window stays independently anchored to the previous
+  // distribution's exact periodEnd (see periodStart below).
+  const weekStart = new Date(periodEnd)
+  weekStart.setUTCHours(0, 0, 0, 0)
+  weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7))
+  // First distribution only: fall back to the trailing seven days for the
+  // inflow window (matching lib/rewardsPool.js's open-cycle fallback).
+  const firstRunPeriodStart = new Date(periodEnd.getTime() - WEEK_MS)
 
   // The whole ledger write is atomic: the idempotency check, the read-only
   // inflow/share computations, the RewardDistribution create, and the
@@ -112,33 +109,48 @@ async function distribute (models) {
   //     (finds the existing distribution on retry) or errors cleanly. No partial
   //     write is ever visible.
   return await models.$transaction(async (tx) => {
-    // Idempotency: if a distribution already exists whose periodEnd falls
-    // inside (or after) this week's window — minus a scheduling-jitter grace —
-    // a run already happened this week; return it verbatim instead of
-    // double-distributing. The grace absorbs pg-boss pickup latency: weekly
-    // runs fire L1/L2 ms after Monday 00:00 UTC, and comparing with zero
-    // slack made last week's periodEnd (L1) collide with this week's
-    // periodStart (L2) whenever L1 >= L2, silently skipping the run. The
-    // resumability path is preserved: a FAILED distribution re-driven later
-    // the same week is still found here and re-finalized.
+    // Idempotency: a distribution whose periodEnd falls in this UTC week (or
+    // later) means the week's allocation already happened; return it verbatim
+    // instead of double-distributing. Calendar weeks replace the old rolling
+    // seven-day cutoff, where a prior allocation created >1h late suppressed
+    // the following Monday. The resumability path is preserved: a FAILED
+    // distribution re-driven later the same week is still found here and
+    // re-finalized.
     const existing = await tx.rewardDistribution.findFirst({
-      where: { periodEnd: { gte: new Date(runWindowStart.getTime() + IDEMPOTENCY_GRACE_MS) } },
+      where: { periodEnd: { gte: weekStart } },
       orderBy: { periodEnd: 'desc' },
       include: { payouts: true }
     })
     if (existing) {
-      logInfo('rewardsDistributor: distribution already exists for this period; skipping')
+      logInfo('rewardsDistributor: allocation already exists for this UTC week (or later); reusing')
       return existing
     }
 
+    // Cross-week sender serialization: a prior week's distribution can still be
+    // actively signing at the UTC boundary. The old rolling guard incidentally
+    // skipped the next run in that case; a calendar-week guard would otherwise
+    // start a second wallet send. Defer the new allocation until the in-flight
+    // sender settles (its own completion or the stale-SENDING watchdog); a later
+    // run then allocates with contiguous inflow, so nothing is lost.
+    const inFlight = await tx.rewardDistribution.findFirst({
+      where: { status: 'SENDING', startedAt: { not: null } },
+      orderBy: { periodEnd: 'desc' },
+      include: { payouts: true }
+    })
+    if (inFlight) {
+      logInfo('rewardsDistributor: another distribution is SENDING; deferring this allocation until it settles')
+      return inFlight
+    }
+
     // Inflow window: contiguous with the previous distribution — start exactly
-    // where it ended. A late run (cron delay/outage) must absorb its gap window
-    // rather than drop it, and a run inside the jitter grace must not overlap
-    // the previous window (double-allocation). Before the first distribution,
-    // fall back to the trailing 7 days (matching lib/rewardsPool.js's open-cycle
-    // fallback). Read inside the transaction: it also yields the rollover input.
+    // where it ended, so a late run absorbs its gap window rather than dropping
+    // it and consecutive windows never overlap. This accounting boundary is
+    // deliberately NOT rounded to the UTC week. Before the first distribution,
+    // fall back to the trailing 7 days (matching lib/rewardsPool.js's
+    // open-cycle fallback). Read inside the transaction: it also yields the
+    // rollover input.
     const lastDistribution = await tx.rewardDistribution.findFirst({ orderBy: { periodEnd: 'desc' } })
-    const periodStart = lastDistribution?.periodEnd ?? runWindowStart
+    const periodStart = lastDistribution?.periodEnd ?? firstRunPeriodStart
 
     // --- Allocation config (platform singleton row, id=1) ---
     const config = await tx.platformFeeConfig.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } })
@@ -394,8 +406,9 @@ function warnPayoutsStranded (distribution, payouts) {
 //     and both call the signer on the same QUEUED rows — the loser's UPDATE
 //     matches zero rows and it bails before sending. No double-send.
 //   - Resumable after failure: a FAILED distribution that still has QUEUED
-//     payouts is re-driven on the next run. sendPayouts is idempotent on QUEUED
-//     rows (it filters `state === 'QUEUED'`, so already-SENT payouts are
+//     payouts is re-driven on the next run in the same UTC week; after that,
+//     recovery is manual via requeueFailedPayouts. sendPayouts is idempotent on
+//     QUEUED rows (it filters `state === 'QUEUED'`, so already-SENT payouts are
 //     skipped), so resuming never double-pays. (FAILED is in the CAS set above
 //     for exactly this reason.)
 //   - Nothing left to send: an empty week (0 payouts), or a row whose payouts
@@ -404,7 +417,7 @@ function warnPayoutsStranded (distribution, payouts) {
 //   - SENDING / COMPLETE: a no-op for this call (another process is mid-send, or
 //     the run already finished).
 //   - Catastrophic signer failure: flip to FAILED. QUEUED payouts are untouched
-//     (funds never left the wallet), so the next run resumes as above.
+//     (funds never left the wallet), so the next same-week run resumes as above.
 //   - Incomplete send summary: if sendPayouts reports any skipped or failed
 //     payouts (skipped > 0 || failed > 0), the distribution is marked FAILED
 //     (resumable) with a CRITICAL alert — it never reaches COMPLETE until every
@@ -631,9 +644,9 @@ export async function completeAndEnqueue (models, distribution, signer, { boss, 
 // Recovery re-entry for stranded payouts (2026-09-28 incident): a terminal
 // FAILED payout with NULL txHash provably never moved money (FAILED is only
 // written in relayBucketTx's createTx catch, where no tx exists), but nothing
-// re-drives it — finalizeDistribution resumes only QUEUED rows and the weekly
-// idempotency window stops returning the distribution after ~7d. This is the
-// "manual re-entry" tool the R03 alert always referenced.
+// re-drives it — finalizeDistribution resumes only QUEUED rows and the
+// calendar-week idempotency guard stops returning the distribution once its UTC
+// week ends. This is the "manual re-entry" tool the R03 alert always referenced.
 //
 // Modes:
 //   dry-run (default): report candidates, mutate nothing.
@@ -731,15 +744,15 @@ export async function requeueFailedPayouts (models, distributionId, { confirm = 
 }
 
 // Safety net (2026-09-28 incident): payouts strand invisibly once their
-// distribution leaves the weekly idempotency window (~7d) — QUEUED rows are
-// never re-driven (no cron path owns out-of-window distributions) and
-// terminal FAILED rows are alerted once at failure, then never again. This
-// read-only check runs at the top of every distribution run and nags until a
-// human recovers them with requeueFailedPayouts. Best-effort by design: a
-// check failure must never break the distribution itself. 8d = the 7d window
-// + 1h grace + slack, so nothing the current run's idempotency guard still
-// owns is flagged. Dev caveat: real-DB test residue can trigger this until
-// ./scripts/clean-rewards-test-residue.sh runs.
+// distribution leaves the calendar-week idempotency window (as soon as its UTC
+// week ends) — QUEUED rows are never re-driven (no cron path owns out-of-window
+// distributions) and terminal FAILED rows are alerted once at failure, then
+// never again. This read-only check runs at the top of every distribution run
+// and nags until a human recovers them with requeueFailedPayouts. Best-effort
+// by design: a check failure must never break the distribution itself. 8d is
+// safely beyond the longest possible calendar week, so nothing the current
+// run's idempotency guard still owns is flagged. Dev caveat: real-DB test
+// residue can trigger this until ./scripts/clean-rewards-test-residue.sh runs.
 export async function warnUndeliveredDistributions (models) {
   try {
     const cutoff = new Date(Date.now() - (WEEK_MS + DAY_MS))

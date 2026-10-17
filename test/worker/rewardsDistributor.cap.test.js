@@ -97,8 +97,7 @@ const START = new Date('2026-10-19T00:00:00Z')
     return account
   }
 
-  async function seedCuration (tipperId = curatorId) {
-    const createdAt = new Date(Date.now() - DAY)
+  async function seedCuration (tipperId = curatorId, createdAt = new Date(Date.now() - DAY)) {
     const [item] = await db.$queryRaw`
       INSERT INTO "Item" ("userId", title, "weightedVotes", created_at)
       VALUES (${authorId}::int, 'cap test post', 10, ${createdAt}) RETURNING id::int`
@@ -149,6 +148,44 @@ const START = new Date('2026-10-19T00:00:00Z')
     const distribution = await runDistributionOnce({ models: db, sendPayouts, scheduleOpsSweep: false })
     if (!created.distributions.includes(distribution.id)) created.distributions.push(distribution.id)
     return distribution
+  }
+
+  // Test-only client wrapper that holds both allocation transactions after
+  // their first guard read. Without a barrier, two concurrent promises may
+  // serialize naturally and prove nothing about the overlapping-read race.
+  function overlapModels (onGuardRead) {
+    const wrapTx = tx => {
+      const rewardDistribution = new Proxy(tx.rewardDistribution, {
+        get (target, prop) {
+          const value = Reflect.get(target, prop)
+          if (prop === 'findFirst') {
+            return async args => {
+              const found = await target.findFirst(args)
+              // Only the idempotency lookup carries a periodEnd lower bound.
+              if (args?.where?.periodEnd?.gte) await onGuardRead()
+              return found
+            }
+          }
+          return typeof value === 'function' ? value.bind(target) : value
+        }
+      })
+      return new Proxy(tx, {
+        get (target, prop) {
+          if (prop === 'rewardDistribution') return rewardDistribution
+          const value = Reflect.get(target, prop)
+          return typeof value === 'function' ? value.bind(target) : value
+        }
+      })
+    }
+    return new Proxy(db, {
+      get (target, prop) {
+        if (prop === '$transaction') {
+          return (fn, opts) => target.$transaction(tx => fn(wrapTx(tx)), opts)
+        }
+        const value = Reflect.get(target, prop)
+        return typeof value === 'function' ? value.bind(target) : value
+      }
+    })
   }
 
   async function expectConserved (distribution) {
@@ -311,6 +348,306 @@ const START = new Date('2026-10-19T00:00:00Z')
     expect(await db.earn.count({ where: { distributionId: again.id } })).toBe(2)
     await expectConserved(again)
   })
+
+  test.each([
+    ['Monday 02:00', 2 * 60 * 60 * 1000],
+    ['Tuesday', DAY],
+    ['Sunday 23:00', 6 * DAY + 23 * 60 * 60 * 1000]
+  ])('late creation on %s does not block next Monday', async (_label, delay) => {
+    // A prior allocation created after Monday's scheduled run must only consume
+    // the UTC week it was actually created in. Under the old rolling seven-day
+    // guard, any creation >1h late suppressed the following Monday.
+    jest.setSystemTime(new Date(START.getTime() + delay))
+    await seedCuration()
+    await seedInflow(5n * XMR)
+    const previous = await run()
+
+    jest.setSystemTime(new Date(START.getTime() + 7 * DAY))
+    await seedCuration(curatorId, new Date(START.getTime() + 7 * DAY - 30 * 60 * 1000))
+    const next = await run()
+
+    expect(next.id).not.toBe(previous.id)
+    expect(next.periodStart).toEqual(previous.periodEnd)
+    expect(next.poolPiconeros).toBe(4_400_000_000_000n)
+    expect(next.distributedPiconeros).toBe(600_000_000_000n)
+    expect(next.rolledOverPiconeros).toBe(3_800_000_000_000n)
+    await expectConserved(next)
+  })
+
+  test('a rerun at the end of the same UTC week still reuses the allocation', async () => {
+    // The old grace window only skipped reruns for 6d23h after the allocation;
+    // a Sunday 23:59:59.999 rerun could allocate a second time. Calendar weeks
+    // must cover the whole week.
+    await seedInflow(5n * XMR)
+    const first = await run()
+    const payoutIds = first.payouts.map(p => p.id).sort((a, b) => a - b)
+    const earnCount = await db.earn.count({ where: { distributionId: first.id } })
+
+    jest.setSystemTime(new Date(START.getTime() + 7 * DAY - 1))
+    const again = await run()
+
+    expect(again.id).toBe(first.id)
+    expect(again.payouts.map(p => p.id).sort((a, b) => a - b)).toEqual(payoutIds)
+    expect(await db.earn.count({ where: { distributionId: first.id } })).toBe(earnCount)
+    expect(await db.rewardDistribution.count()).toBe(1)
+  })
+
+  test('an exactly-Monday 00:00 UTC allocation is reused later that week', async () => {
+    await seedInflow(5n * XMR)
+    const first = await run()
+    jest.setSystemTime(new Date(START.getTime() + 3 * DAY))
+    const again = await run()
+    expect(again.id).toBe(first.id)
+    expect(await db.rewardDistribution.count()).toBe(1)
+  })
+
+  test.each([
+    ['2026-10-18T23:59:59.999Z', '2026-10-19T00:00:00.000Z'],
+    ['2026-11-01T23:59:59.999Z', '2026-11-02T00:00:00.000Z'],
+    ['2027-01-03T23:59:59.999Z', '2027-01-04T00:00:00.000Z']
+  ])('a Sunday allocation ending at %s does not block the next Monday (%s)', async (sundayIso, mondayIso) => {
+    // Boundary pair, including a UTC month/year rollover. The seed timestamp
+    // equals the previous periodEnd, which is the inclusive start of the
+    // 1ms-wide next inflow window.
+    jest.setSystemTime(new Date(sundayIso))
+    const previous = await run()
+    await seedCuration(curatorId, previous.periodEnd)
+
+    jest.setSystemTime(new Date(mondayIso))
+    const next = await run()
+
+    expect(next.id).not.toBe(previous.id)
+    expect(next.periodStart).toEqual(previous.periodEnd)
+  })
+
+  test('a Wednesday allocation is reused on Friday of the same UTC week', async () => {
+    jest.setSystemTime(new Date(START.getTime() + 2 * DAY))
+    const first = await run()
+    jest.setSystemTime(new Date(START.getTime() + 4 * DAY))
+    const again = await run()
+    expect(again.id).toBe(first.id)
+    expect(await db.rewardDistribution.count()).toBe(1)
+  })
+
+  test('a same-week PENDING distribution is completed and reuses its committed payouts', async () => {
+    const distribution = await db.rewardDistribution.create({
+      data: {
+        periodStart: new Date(START.getTime() - 7 * DAY),
+        periodEnd: new Date(START.getTime() + 60 * 60 * 1000),
+        poolPiconeros: XMR,
+        distributedPiconeros: XMR,
+        rolledOverPiconeros: 0n,
+        payoutCount: 1,
+        status: 'PENDING'
+      }
+    })
+    created.distributions.push(distribution.id)
+    const account = await db.moneroAccount.findFirst({ where: { ownerUserId: curatorId } })
+    await db.rewardPayout.create({
+      data: { distributionId: distribution.id, curatorId, recipientAddress: account.address, piconeros: XMR }
+    })
+    await db.earn.create({
+      data: { distributionId: distribution.id, userId: curatorId, type: 'TIP_POST', piconeros: XMR }
+    })
+
+    jest.setSystemTime(new Date(START.getTime() + 2 * 60 * 60 * 1000))
+    const resumed = await run()
+    expect(resumed.id).toBe(distribution.id)
+    expect(resumed.status).toBe('COMPLETE')
+    expect(resumed.payouts[0].state).toBe('SENT')
+    expect(await db.rewardDistribution.count()).toBe(1)
+    await expectConserved(resumed)
+  })
+
+  test('a same-week SENDING distribution is left untouched with no second sender', async () => {
+    const distribution = await db.rewardDistribution.create({
+      data: {
+        periodStart: new Date(START.getTime() - 7 * DAY),
+        periodEnd: new Date(START.getTime() + 60 * 60 * 1000),
+        poolPiconeros: XMR,
+        distributedPiconeros: XMR,
+        rolledOverPiconeros: 0n,
+        payoutCount: 1,
+        status: 'SENDING',
+        startedAt: new Date(START.getTime() - 5 * 60 * 1000)
+      }
+    })
+    created.distributions.push(distribution.id)
+    const account = await db.moneroAccount.findFirst({ where: { ownerUserId: curatorId } })
+    const payout = await db.rewardPayout.create({
+      data: { distributionId: distribution.id, curatorId, recipientAddress: account.address, piconeros: XMR, state: 'QUEUED' }
+    })
+
+    const signer = jest.fn()
+    const resumed = await run(signer)
+    expect(resumed.id).toBe(distribution.id)
+    expect(resumed.status).toBe('SENDING')
+    expect(signer).not.toHaveBeenCalled()
+    expect((await db.rewardPayout.findUnique({ where: { id: payout.id } })).state).toBe('QUEUED')
+  })
+
+  test('a prior-week SENDING distribution defers the new allocation until it settles', async () => {
+    // The old rolling guard incidentally skipped a new allocation while a prior
+    // distribution was still signing. Preserve that wallet serialization across
+    // the UTC boundary without blocking a completed late allocation.
+    const inFlight = await db.rewardDistribution.create({
+      data: {
+        periodStart: new Date(START.getTime() - 7 * DAY),
+        periodEnd: new Date(START.getTime() - 60 * 60 * 1000),
+        poolPiconeros: XMR,
+        distributedPiconeros: XMR,
+        rolledOverPiconeros: 0n,
+        payoutCount: 1,
+        status: 'SENDING',
+        startedAt: new Date(START.getTime() - 30 * 60 * 1000)
+      }
+    })
+    created.distributions.push(inFlight.id)
+    const account = await db.moneroAccount.findFirst({ where: { ownerUserId: curatorId } })
+    const payout = await db.rewardPayout.create({
+      data: { distributionId: inFlight.id, curatorId, recipientAddress: account.address, piconeros: XMR, state: 'QUEUED' }
+    })
+
+    const signer = jest.fn()
+    const deferred = await run(signer)
+    expect(deferred.id).toBe(inFlight.id)
+    expect(deferred.status).toBe('SENDING')
+    expect(signer).not.toHaveBeenCalled()
+    expect(await db.rewardDistribution.count()).toBe(1)
+
+    // The in-flight sender finishes; the next run allocates contiguously.
+    await db.rewardDistribution.update({
+      where: { id: inFlight.id },
+      data: { status: 'COMPLETE', completedAt: new Date() }
+    })
+    await db.rewardPayout.update({
+      where: { id: payout.id },
+      data: { state: 'SENT', txHash: 'ab'.repeat(32) }
+    })
+    const next = await run()
+    expect(next.id).not.toBe(inFlight.id)
+    expect(next.periodStart).toEqual(inFlight.periodEnd)
+    expect(next.status).toBe('COMPLETE')
+    expect(await db.rewardDistribution.count()).toBe(2)
+  })
+
+  test('an on-time allocation completed on Tuesday does not block the following Monday', async () => {
+    // Only creation timing assigns a week; completion timing must not move the
+    // allocation boundary.
+    const previous = await db.rewardDistribution.create({
+      data: {
+        periodStart: new Date(START.getTime() - 7 * DAY),
+        periodEnd: START,
+        poolPiconeros: 0n,
+        distributedPiconeros: 0n,
+        rolledOverPiconeros: 0n,
+        payoutCount: 0,
+        status: 'COMPLETE',
+        completedAt: new Date(START.getTime() + DAY)
+      }
+    })
+    created.distributions.push(previous.id)
+
+    jest.setSystemTime(new Date(START.getTime() + 7 * DAY))
+    const next = await run()
+    expect(next.id).not.toBe(previous.id)
+    expect(next.periodStart).toEqual(previous.periodEnd)
+  })
+
+  test('a several-weeks-old allocation gets exactly one new capped contract and contiguous inflow', async () => {
+    const previous = await db.rewardDistribution.create({
+      data: {
+        periodStart: new Date(START.getTime() - 28 * DAY),
+        periodEnd: new Date(START.getTime() - 21 * DAY),
+        poolPiconeros: 0n,
+        distributedPiconeros: 0n,
+        rolledOverPiconeros: 0n,
+        payoutCount: 0,
+        status: 'COMPLETE'
+      }
+    })
+    created.distributions.push(previous.id)
+
+    await seedInflow(5n * XMR)
+    const next = await run()
+    expect(next.id).not.toBe(previous.id)
+    expect(next.periodStart).toEqual(previous.periodEnd)
+    expect(next.poolPiconeros).toBe(5n * XMR)
+    expect(next.distributedPiconeros).toBe(CAP)
+    expect(next.rolledOverPiconeros).toBe(4_400_000_000_000n)
+    expect(await db.rewardDistribution.count()).toBe(2)
+    await expectConserved(next)
+  })
+
+  test('a future-dated allocation conservatively blocks a new allocation', async () => {
+    const future = await db.rewardDistribution.create({
+      data: {
+        periodStart: START,
+        periodEnd: new Date(START.getTime() + 30 * DAY),
+        poolPiconeros: 0n,
+        distributedPiconeros: 0n,
+        rolledOverPiconeros: 0n,
+        payoutCount: 0,
+        status: 'COMPLETE'
+      }
+    })
+    created.distributions.push(future.id)
+
+    const again = await run()
+    expect(again.id).toBe(future.id)
+    expect(await db.rewardDistribution.count()).toBe(1)
+  })
+
+  test('overlapping runs allocate exactly once and never double-send', async () => {
+    await seedInflow(5n * XMR)
+
+    let guardReads = 0
+    let releaseBarrier
+    const bothArrived = new Promise(resolve => { releaseBarrier = resolve })
+    const gate = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('overlap barrier timed out')), 8000)
+      bothArrived.then(() => { clearTimeout(timer); resolve() })
+    })
+    const onGuardRead = async () => {
+      guardReads += 1
+      if (guardReads >= 2) releaseBarrier()
+      await gate
+    }
+    const overlappingModels = overlapModels(onGuardRead)
+    const delivered = []
+    const signer = async payouts => {
+      delivered.push(...payouts.map(p => p.id))
+      return await fakeSigner(payouts)
+    }
+
+    const results = await Promise.allSettled([
+      runDistributionOnce({ models: overlappingModels, sendPayouts: signer, scheduleOpsSweep: false }),
+      runDistributionOnce({ models: overlappingModels, sendPayouts: signer, scheduleOpsSweep: false })
+    ])
+    expect(guardReads).toBeGreaterThanOrEqual(2)
+    const fulfilled = results.filter(result => result.status === 'fulfilled')
+    const rejected = results.filter(result => result.status === 'rejected')
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    // The losing Serializable transaction aborts cleanly; retries are the
+    // caller's job, never an automatic second allocation here.
+    expect(rejected[0].reason.code).toBe('P2034')
+    if (!created.distributions.includes(fulfilled[0].value.id)) {
+      created.distributions.push(fulfilled[0].value.id)
+    }
+    expect(await db.rewardDistribution.count()).toBe(1)
+
+    // A same-week retry after the conflict reuses the winner's contract.
+    const retried = await run()
+    const latest = await db.rewardDistribution.findFirst({ orderBy: { periodEnd: 'desc' } })
+    expect(retried.id).toBe(latest.id)
+    expect(await db.rewardDistribution.count()).toBe(1)
+    expect(new Set(delivered).size).toBe(delivered.length)
+
+    const payouts = await db.rewardPayout.findMany({ where: { distributionId: retried.id } })
+    expect(delivered.sort((a, b) => a - b)).toEqual(payouts.map(p => p.id).sort((a, b) => a - b))
+    await expectConserved(retried)
+  }, 20000)
 
   test('leaves the full rollover protected and the separate ops allocation uncapped', async () => {
     await seedInflow(10n * XMR, 50)

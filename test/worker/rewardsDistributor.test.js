@@ -133,6 +133,30 @@ async function seedStrandedDistribution ({ status = 'FAILED', failedTxHash = nul
 
 const DAY = 24 * 60 * 60 * 1000
 
+// Monday 00:00 UTC of the week containing `date` — the allocation boundary the
+// distributor's idempotency guard uses.
+function utcWeekStart (date) {
+  const weekStart = new Date(date)
+  weekStart.setUTCHours(0, 0, 0, 0)
+  weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7))
+  return weekStart
+}
+
+// Fixed UTC Tuesday for the two allocation-boundary tests. Freezing Date keeps
+// fixture creation and the run in the same UTC week even if a test straddles a
+// Sunday→Monday rollover. 2099 keeps the synthetic week clear of real dev
+// distributions. Prisma's IO/timeout timers stay real.
+const FIXED_NOW = new Date('2099-01-06T12:00:00.000Z')
+const REAL_TIMER_APIS = ['hrtime', 'nextTick', 'performance', 'queueMicrotask', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout']
+
+// Wednesday noon of the beforeAll distribution's UTC week. Freezing the two
+// inherited same-week tests here keeps `result` in the guard's current week
+// even when the suite crosses a Sunday→Monday boundary.
+function resultWeekNoon () {
+  const weekStart = utcWeekStart(result.periodEnd)
+  return new Date(weekStart.getTime() + 2 * DAY + 12 * 60 * 60 * 1000)
+}
+
 // Tracks every row created across tests so afterAll can tear them down in
 // FK-safe order.
 const created = {
@@ -1255,6 +1279,10 @@ test('R02 hardening: terminal writes are CAS-guarded — a stale finalizer canno
   await finalizeDistribution(prisma, { ...dist, status: 'PENDING', payouts: [] }, fakeSigner)
   const updated = await prisma.rewardDistribution.findUnique({ where: { id: dist.id } })
   expect(updated.status).toBe('SENDING') // not clobbered
+  // A fresh SENDING fixture must not leak into later allocation tests; the
+  // cross-week sender-serialization guard correctly treats it as in flight.
+  await prisma.rewardPayout.deleteMany({ where: { distributionId: dist.id } })
+  await prisma.rewardDistribution.delete({ where: { id: dist.id } })
 })
 
 test('R02: a stale SENDING distribution is watchdog-flipped FAILED, alerted, and re-driven to COMPLETE', async () => {
@@ -1311,39 +1339,53 @@ test('R02: a FRESH SENDING distribution is untouched by the watchdog', async () 
   const updated = await prisma.rewardDistribution.findUnique({ where: { id: dist.id } })
   expect(updated.status).toBe('SENDING')
   expect(signerInvocations).toBe(invocationsBefore)
+  // A fresh SENDING fixture must not leak into later allocation tests; the
+  // cross-week sender-serialization guard correctly treats it as in flight.
+  await prisma.rewardPayout.deleteMany({ where: { distributionId: dist.id } })
+  await prisma.rewardDistribution.delete({ where: { id: dist.id } })
 })
 
 test('R02: runDistributionOnce wires the watchdog — a stale row is recovered by a normal run', async () => {
-  const curatorId = await createUser()
-  const dist = await prisma.rewardDistribution.create({
-    data: {
-      periodStart: new Date(Date.now() - 33 * DAY),
-      periodEnd: new Date(Date.now() - 32 * DAY),
-      poolPiconeros: 1_000_000_000n,
-      distributedPiconeros: 1_000_000_000n,
-      rolledOverPiconeros: 0n,
-      payoutCount: 1,
-      status: 'SENDING',
-      startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000)
-    }
-  })
-  created.distributions.push(dist.id)
-  await prisma.rewardPayout.create({
-    data: { distributionId: dist.id, curatorId, recipientAddress: makeAddress(), piconeros: 1_000_000_000n, state: 'QUEUED' }
-  })
-  // The week's distribution (beforeAll result) occupies the idempotency
-  // window, so this run only exercises the watchdog + a no-op finalize.
-  await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
-  const updated = await prisma.rewardDistribution.findUnique({ where: { id: dist.id } })
-  expect(updated.status).toBe('COMPLETE')
+  jest.useFakeTimers({ now: resultWeekNoon(), doNotFake: REAL_TIMER_APIS })
+  try {
+    const curatorId = await createUser()
+    const dist = await prisma.rewardDistribution.create({
+      data: {
+        periodStart: new Date(Date.now() - 33 * DAY),
+        periodEnd: new Date(Date.now() - 32 * DAY),
+        poolPiconeros: 1_000_000_000n,
+        distributedPiconeros: 1_000_000_000n,
+        rolledOverPiconeros: 0n,
+        payoutCount: 1,
+        status: 'SENDING',
+        startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000)
+      }
+    })
+    created.distributions.push(dist.id)
+    await prisma.rewardPayout.create({
+      data: { distributionId: dist.id, curatorId, recipientAddress: makeAddress(), piconeros: 1_000_000_000n, state: 'QUEUED' }
+    })
+    // The week's distribution (beforeAll result) occupies the idempotency
+    // window, so this run only exercises the watchdog + a no-op finalize.
+    await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
+    const updated = await prisma.rewardDistribution.findUnique({ where: { id: dist.id } })
+    expect(updated.status).toBe('COMPLETE')
+  } finally {
+    jest.useRealTimers()
+  }
 })
 
 test('a second run within the same week is idempotent (returns the existing distribution)', async () => {
-  const before = await prisma.rewardPayout.count({ where: { distributionId: result.id } })
-  const again = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
-  expect(again.id).toBe(result.id)
-  const after = await prisma.rewardPayout.count({ where: { distributionId: result.id } })
-  expect(after).toBe(before)
+  jest.useFakeTimers({ now: resultWeekNoon(), doNotFake: REAL_TIMER_APIS })
+  try {
+    const before = await prisma.rewardPayout.count({ where: { distributionId: result.id } })
+    const again = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
+    expect(again.id).toBe(result.id)
+    const after = await prisma.rewardPayout.count({ where: { distributionId: result.id } })
+    expect(after).toBe(before)
+  } finally {
+    jest.useRealTimers()
+  }
 })
 
 test('referred curators produce a FOREVER_REFERRAL payout + Earn row for the referrer', async () => {
@@ -1525,85 +1567,94 @@ test('R04: referral payouts are computed from PAID curators only (a wallet-less 
   expect(referralPayout.piconeros).toBe(paidPayout.piconeros / 10n)
 })
 
-test('a previous weekly run whose periodEnd sits at this run\'s periodStart boundary does not skip (no jitter coin flip)', async () => {
-  // Regression: the guard compared periodEnd >= periodStart with zero slack.
-  // Consecutive weekly runs land L1/L2 ms after Monday 00:00 UTC (pg-boss
-  // pickup latency); when L1 >= L2 the previous run's periodEnd sits ON or
-  // INSIDE this run's periodStart and the weekly run silently skipped. Seed
-  // the exact collision: a "previous run" whose periodEnd is 4s inside this
-  // run's periodStart (previous Monday fired 4s later in its minute than
-  // this run does). It must proceed, not return the boundary row.
-  //
-  // Purge any same-week distribution first (the referral tests above left
-  // one behind — same FK-safe pattern as the line-841 cleanup; afterAll's
-  // deleteMany on already-deleted ids is a harmless no-op).
-  const weekAgo = new Date(Date.now() - 7 * DAY)
-  const current = await prisma.rewardDistribution.findMany({ where: { periodEnd: { gte: weekAgo } } })
-  for (const d of current) {
-    await prisma.earn.deleteMany({ where: { distributionId: d.id } })
-    await prisma.rewardPayout.deleteMany({ where: { distributionId: d.id } })
-    await prisma.rewardDistribution.deleteMany({ where: { id: d.id } })
-  }
-
-  // Previous weekly run: periodEnd 4s AFTER this run's periodStart — the
-  // L1 >= L2 collision that used to skip.
-  const boundary = await prisma.rewardDistribution.create({
-    data: {
-      periodStart: new Date(Date.now() - 14 * DAY + 4000),
-      periodEnd: new Date(Date.now() - 7 * DAY + 4000),
-      poolPiconeros: 0n,
-      distributedPiconeros: 0n,
-      rolledOverPiconeros: 0n,
-      payoutCount: 0,
-      status: 'COMPLETE'
+test('a prior-week allocation ending just before Monday does not block this week\'s allocation', async () => {
+  // Regression: the old rolling seven-day guard compared periodEnd against
+  // now - 7d (+ a 1h grace), so a prior allocation created later than the
+  // current run suppressed the following Monday. Allocation eligibility is now
+  // the UTC calendar week: anything before this Monday cannot block it.
+  jest.useFakeTimers({ now: FIXED_NOW, doNotFake: REAL_TIMER_APIS })
+  try {
+    // Purge any current-week distribution first (the referral tests above left
+    // one behind — same FK-safe pattern as the line-841 cleanup; afterAll's
+    // deleteMany on already-deleted ids is a harmless no-op).
+    const weekStart = utcWeekStart(FIXED_NOW)
+    const current = await prisma.rewardDistribution.findMany({ where: { id: { in: created.distributions }, periodEnd: { gte: weekStart } } })
+    for (const d of current) {
+      await prisma.earn.deleteMany({ where: { distributionId: d.id } })
+      await prisma.rewardPayout.deleteMany({ where: { distributionId: d.id } })
+      await prisma.rewardDistribution.deleteMany({ where: { id: d.id } })
     }
-  })
-  created.distributions.push(boundary.id)
 
-  const dist = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
-  created.distributions.push(dist.id)
+    // Never delete an untracked row: the shared dev DB can hold real
+    // distributions. If one occupies this fixed week, fail instead of purging it.
+    expect(await prisma.rewardDistribution.count({ where: { periodEnd: { gte: weekStart } } })).toBe(0)
 
-  expect(dist.id).not.toBe(boundary.id)
-  // The new period's inflow window starts exactly where the boundary row
-  // ended — contiguous periods, so no confirmed inflow can fall into a gap
-  // (late run) or be double-counted (jitter overlap) between distributions.
-  // The old run-time-derived periodStart sat ~4s BEFORE boundary.periodEnd,
-  // re-allocating that sliver of inflow into both periods.
-  expect(dist.periodStart.toISOString()).toBe(boundary.periodEnd.toISOString())
-  const rows = await prisma.rewardDistribution.findMany({ where: { id: { in: [boundary.id, dist.id] } } })
-  expect(rows).toHaveLength(2) // two consecutive weekly runs -> two rows
+    // Prior week's final millisecond: the closest possible row to this Monday.
+    const boundary = await prisma.rewardDistribution.create({
+      data: {
+        periodStart: new Date(weekStart.getTime() - 7 * DAY - 1),
+        periodEnd: new Date(weekStart.getTime() - 1),
+        poolPiconeros: 0n,
+        distributedPiconeros: 0n,
+        rolledOverPiconeros: 0n,
+        payoutCount: 0,
+        status: 'COMPLETE'
+      }
+    })
+    created.distributions.push(boundary.id)
+
+    const dist = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
+    created.distributions.push(dist.id)
+
+    expect(dist.id).not.toBe(boundary.id)
+    // The new period's inflow window starts exactly where the boundary row
+    // ended — contiguous periods, so no confirmed inflow can fall into a gap
+    // (late run) or be double-counted between distributions.
+    expect(dist.periodStart.toISOString()).toBe(boundary.periodEnd.toISOString())
+    const rows = await prisma.rewardDistribution.findMany({ where: { id: { in: [boundary.id, dist.id] } } })
+    expect(rows).toHaveLength(2) // two consecutive weekly runs -> two rows
+  } finally {
+    jest.useRealTimers()
+  }
 })
 
-test('a run later in the same week still skips when a distribution ended mid-week (grace must not enable double-payouts)', async () => {
-  // The complement of the boundary test: a distribution that ran 3 days ago
-  // (periodEnd well inside this week's window) must still short-circuit the
-  // run. Guards against over-correcting the boundary bug in the other
-  // direction (the rejected periodStart-gte fix double-distributed here).
-  // Purge the boundary test's rows first (same FK-safe pattern).
-  const weekAgo = new Date(Date.now() - 7 * DAY)
-  const current = await prisma.rewardDistribution.findMany({ where: { periodEnd: { gte: weekAgo } } })
-  for (const d of current) {
-    await prisma.earn.deleteMany({ where: { distributionId: d.id } })
-    await prisma.rewardPayout.deleteMany({ where: { distributionId: d.id } })
-    await prisma.rewardDistribution.deleteMany({ where: { id: d.id } })
-  }
-
-  const earlierThisWeek = await prisma.rewardDistribution.create({
-    data: {
-      periodStart: new Date(Date.now() - 10 * DAY),
-      periodEnd: new Date(Date.now() - 3 * DAY),
-      poolPiconeros: 0n,
-      distributedPiconeros: 0n,
-      rolledOverPiconeros: 0n,
-      payoutCount: 0,
-      status: 'COMPLETE'
+test('a run later in the same UTC week still reuses the existing allocation', async () => {
+  // The complement of the boundary test: a distribution created earlier this
+  // UTC week must short-circuit the run, regardless of the weekday. Guards
+  // against over-correcting the boundary bug in the other direction.
+  jest.useFakeTimers({ now: FIXED_NOW, doNotFake: REAL_TIMER_APIS })
+  try {
+    const weekStart = utcWeekStart(FIXED_NOW)
+    const current = await prisma.rewardDistribution.findMany({ where: { id: { in: created.distributions }, periodEnd: { gte: weekStart } } })
+    for (const d of current) {
+      await prisma.earn.deleteMany({ where: { distributionId: d.id } })
+      await prisma.rewardPayout.deleteMany({ where: { distributionId: d.id } })
+      await prisma.rewardDistribution.deleteMany({ where: { id: d.id } })
     }
-  })
-  created.distributions.push(earlierThisWeek.id)
 
-  const again = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
-  expect(again.id).toBe(earlierThisWeek.id) // found -> returned verbatim, no new row
-  expect(again.status).toBe('COMPLETE') // finalizeDistribution early-returns on COMPLETE
+    // Never delete an untracked row: the shared dev DB can hold real
+    // distributions. If one occupies this fixed week, fail instead of purging it.
+    expect(await prisma.rewardDistribution.count({ where: { periodEnd: { gte: weekStart } } })).toBe(0)
+
+    const earlierThisWeek = await prisma.rewardDistribution.create({
+      data: {
+        periodStart: new Date(weekStart.getTime() - 7 * DAY),
+        periodEnd: new Date(weekStart.getTime() + 60 * 60 * 1000),
+        poolPiconeros: 0n,
+        distributedPiconeros: 0n,
+        rolledOverPiconeros: 0n,
+        payoutCount: 0,
+        status: 'COMPLETE'
+      }
+    })
+    created.distributions.push(earlierThisWeek.id)
+
+    const again = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
+    expect(again.id).toBe(earlierThisWeek.id) // found -> returned verbatim, no new row
+    expect(again.status).toBe('COMPLETE') // finalizeDistribution early-returns on COMPLETE
+  } finally {
+    jest.useRealTimers()
+  }
 })
 
 describe('requeueFailedPayouts (2026-09-28 recovery tool)', () => {
