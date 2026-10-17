@@ -28,6 +28,7 @@ import * as util from 'node:util'
 import { runDistributionOnce, finalizeDistribution, recoverStaleDistributions, requeueFailedPayouts, warnUndeliveredDistributions } from '@/worker/rewardsDistributor'
 import { applyTipDetected } from '@/api/monero/ranking'
 import { getNextRewardsPool } from '@/lib/rewardsPool'
+import { USER_ID } from '@/lib/constants'
 
 // lib/alert is mocked so operator pages are assertable without a network side
 // effect (same pattern as test/worker/reconcilePendingTips.test.js).
@@ -260,6 +261,16 @@ async function createPayoutAccount (ownerUserId) {
   return account
 }
 
+// FK-safe removal of distribution fixtures created inside a test. Used by the
+// fixed-week boundary tests so a 2099 fixture cannot remain the global latest
+// and shadow the real-now fixtures of later tests.
+async function deleteDistributionRows (ids) {
+  if (!ids.length) return
+  await prisma.earn.deleteMany({ where: { distributionId: { in: ids } } })
+  await prisma.rewardPayout.deleteMany({ where: { distributionId: { in: ids } } })
+  await prisma.rewardDistribution.deleteMany({ where: { id: { in: ids } } })
+}
+
 let tipSeq = 0
 async function seedTip ({ postId, tipperId, piconeros, confirmedAt, recipientAccountId }) {
   tipSeq += 1
@@ -376,7 +387,9 @@ async function purgePriorResidue () {
   const tipperIds = [...new Set(priorTips.map(t => t.tipperId).filter(Boolean))]
   const testPostIds = [...new Set(priorTips.map(t => t.postId).filter(Boolean))]
   const priorAuthorIds = (await prisma.item.findMany({ where: { title: 'rewards test post' }, select: { userId: true } })).map(i => i.userId)
-  const testUserIds = [...new Set([...tipperIds, ...priorAuthorIds])]
+  // Never delete the migration-seeded founder account, even when a prior run's
+  // rdtip fixtures name it as a tipper.
+  const testUserIds = [...new Set([...tipperIds, ...priorAuthorIds])].filter(id => id !== USER_ID.stasher)
 
   // Prior-run "prior" distributions (8 days old, so missed by the 7-day stale
   // cleanup below) plus their payouts/earn.
@@ -1567,6 +1580,58 @@ test('R04: referral payouts are computed from PAID curators only (a wallet-less 
   expect(referralPayout.piconeros).toBe(paidPayout.piconeros / 10n)
 })
 
+test('stasher receives neither a curator payout nor a referral payout', async () => {
+  // Same clearing pattern as the referral tests above: replace the previous
+  // test's current-week distribution with this test's fresh run.
+  const current = await prisma.rewardDistribution.findFirst({ where: { periodEnd: { gte: new Date(Date.now() - 7 * DAY) } } })
+  if (current) {
+    await prisma.earn.deleteMany({ where: { distributionId: current.id } })
+    await prisma.rewardPayout.deleteMany({ where: { distributionId: current.id } })
+    await prisma.rewardDistribution.deleteMany({ where: { id: current.id } })
+  }
+
+  // Give stasher a payout account so its absence is an ELIGIBILITY exclusion,
+  // not the address filter. It is both the referrer here and a qualifying
+  // tipper on the post below; neither role may produce a payout or Earn row.
+  const referrer = USER_ID.stasher
+  await createPayoutAccount(referrer)
+  const curator = await createUser()
+  await prisma.user.update({ where: { id: curator }, data: { referrerId: referrer } })
+  await createPayoutAccount(curator)
+  // Filler curator: NO payout account. Their share rolls over and funds the
+  // referral budget, keeping the 10% referral calculation exact.
+  const filler = await createUser()
+  const author = await createUser()
+
+  const recipientAccount = await createRecipientAccount()
+  // weightedVotes 4e6 strictly outranks the prior referral tests' posts, so
+  // this is unambiguously the top post and only its curators clear minPayout.
+  const post = await createRootPost(author, 4_000_000, new Date(Date.now() - DAY))
+  const at = new Date(Date.now() - DAY + 1000)
+  await seedTip({ postId: post, tipperId: curator, piconeros: 1_000_000_000n, confirmedAt: at, recipientAccountId: recipientAccount.id })
+  await seedTip({ postId: post, tipperId: filler, piconeros: 1_000_000_000n, confirmedAt: new Date(at.getTime() + 60000), recipientAccountId: recipientAccount.id })
+  await seedTip({ postId: post, tipperId: referrer, piconeros: 1_000_000_000n, confirmedAt: new Date(at.getTime() + 120000), recipientAccountId: recipientAccount.id })
+
+  const dist = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
+  created.distributions.push(dist.id)
+
+  const curatorPayout = dist.payouts.find(p => p.curatorId === curator)
+  expect(curatorPayout).toBeDefined()
+  expect(curatorPayout.state).toBe('SENT')
+  // Exactly one payout for the referred curator: the 10% referral commission
+  // was not redirected elsewhere when its stasher beneficiary was excluded.
+  expect(dist.payouts.filter(p => p.curatorId === curator)).toHaveLength(1)
+  // stasher is neither a paid curator nor a paid referrer.
+  expect(dist.payouts.some(p => p.curatorId === referrer)).toBe(false)
+  expect(await prisma.earn.count({ where: { userId: referrer, distributionId: dist.id } })).toBe(0)
+  expect(await prisma.earn.count({ where: { userId: referrer, type: 'FOREVER_REFERRAL', distributionId: dist.id } })).toBe(0)
+
+  // The Earn contract still closes: no orphaned rows from the excluded payout.
+  const allEarns = await prisma.earn.findMany({ where: { distributionId: dist.id } })
+  const total = allEarns.reduce((acc, e) => acc + e.piconeros, 0n)
+  expect(total).toBe(dist.distributedPiconeros)
+})
+
 test('a prior-week allocation ending just before Monday does not block this week\'s allocation', async () => {
   // Regression: the old rolling seven-day guard compared periodEnd against
   // now - 7d (+ a 1h grace), so a prior allocation created later than the
@@ -1613,6 +1678,8 @@ test('a prior-week allocation ending just before Monday does not block this week
     expect(dist.periodStart.toISOString()).toBe(boundary.periodEnd.toISOString())
     const rows = await prisma.rewardDistribution.findMany({ where: { id: { in: [boundary.id, dist.id] } } })
     expect(rows).toHaveLength(2) // two consecutive weekly runs -> two rows
+
+    await deleteDistributionRows([boundary.id, dist.id])
   } finally {
     jest.useRealTimers()
   }
@@ -1652,6 +1719,8 @@ test('a run later in the same UTC week still reuses the existing allocation', as
     const again = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
     expect(again.id).toBe(earlierThisWeek.id) // found -> returned verbatim, no new row
     expect(again.status).toBe('COMPLETE') // finalizeDistribution early-returns on COMPLETE
+
+    await deleteDistributionRows([earlierThisWeek.id])
   } finally {
     jest.useRealTimers()
   }

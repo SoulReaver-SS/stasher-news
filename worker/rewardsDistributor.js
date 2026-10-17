@@ -7,6 +7,7 @@ import logger, { logInfo, logError } from '@/lib/logger'
 import { alert } from '@/lib/alert'
 import { moneroDistributionStatus } from '@/lib/metrics'
 import { opsCarry, walletScope, WEEKLY_CURATOR_CAP_PICONEROS } from '@/lib/rewardsAccounting'
+import { USER_ID } from '@/lib/constants'
 import { readRewardsInflow } from '@/api/monero/rewardsInflow'
 import { readRewardsWalletLedger } from '@/api/monero/rewardsLedger'
 import { withRewardsPhase } from './rewardsPhase'
@@ -42,6 +43,30 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 const DAY_MS = 24 * 60 * 60 * 1000
 
 const DISTRIBUTION_STATUS_GAUGE = { PENDING: 0, SENDING: 1, COMPLETE: 2, FAILED: 3 }
+
+// Allocate the capped referral budget in insertion order. A referrer without a
+// receiving account is skipped without consuming budget (legacy behavior).
+// The excluded founder account is different: its otherwise-payable, capped
+// commission is RESERVED and not paid, so a later referrer can never receive
+// the excluded money. The caller's distributed/rolled-over split then leaves
+// that reserved amount in rolledOverPiconeros.
+export async function allocateReferralPayouts (models, referralByReferrer, referralBudget) {
+  const rows = []
+  let remainingBudget = referralBudget
+  for (const [referrerId, entry] of referralByReferrer) {
+    if (remainingBudget <= 0n) break
+    const piconeros = entry.piconeros < remainingBudget ? entry.piconeros : remainingBudget
+    if (referrerId === USER_ID.stasher) {
+      remainingBudget -= piconeros
+      continue
+    }
+    const account = await models.moneroAccount.findFirst({ where: { ownerUserId: referrerId } })
+    if (!account) continue
+    rows.push({ curatorId: referrerId, recipientAddress: account.address, piconeros })
+    remainingBudget -= piconeros
+  }
+  return { rows, remainingBudget }
+}
 
 // One weekly distribution. The testable core: no pg-boss worker, no network.
 // Accepts the Prisma client (so tests pass their own); creates a throwaway
@@ -244,12 +269,20 @@ async function distribute (models) {
     // a MoneroAccount is skipped (their cut rolls over — mirroring address-less
     // curators). The total of curator + referral payouts is capped at the pool so
     // rolledOverPiconeros never goes negative.
+    //
+    // The founder account stasher is excluded from referral payouts too — as a
+    // recipient (someone else's referrer) and as a source (its own curator share,
+    // already absent from `shares`). Its 10% cut is not redirected to another
+    // recipient; it simply remains part of the distribution's rollover.
     const curatorTotal = payoutRows.reduce((acc, p) => acc + p.piconeros, 0n)
-    let referralBudget = poolPiconeros - curatorTotal
+    const referralBudget = poolPiconeros - curatorTotal
 
     const referralByReferrer = new Map() // referrerId -> { piconeros }
     for (const share of shares) {
       if (share.sharePiconeros <= 0n) continue
+      // Defensive: stasher is already absent from computeCuratorShares, but an
+      // excluded curator must never generate a referral commission either.
+      if (share.curatorId === USER_ID.stasher) continue
       // R04: referral payouts are earned on PAID curator shares only. A
       // wallet-less curator's share rolls over — 10% of money that was never
       // paid must not leak to their referrer.
@@ -259,6 +292,8 @@ async function distribute (models) {
         select: { referrerId: true }
       })
       if (!curator?.referrerId) continue
+      // Keep a stasher entry in the map: allocateReferralPayouts reserves its
+      // capped commission so it cannot be redirected to another referrer.
       const referralPiconeros = share.sharePiconeros / 10n
       if (referralPiconeros <= 0n) continue
       const entry = referralByReferrer.get(curator.referrerId) || { piconeros: 0n }
@@ -271,17 +306,9 @@ async function distribute (models) {
     // contributes BOTH row kinds (same curatorId) — without the tag, the curator
     // loop re-emits the referrer's TIP_* earns and the referral loop emits a
     // FOREVER_REFERRAL row for the referrer's own curator share.
-    const referralPayoutRows = new Set()
-    for (const [referrerId, entry] of referralByReferrer) {
-      if (referralBudget <= 0n) break
-      const referrerAccount = await tx.moneroAccount.findFirst({ where: { ownerUserId: referrerId } })
-      if (!referrerAccount) continue
-      const piconeros = entry.piconeros < referralBudget ? entry.piconeros : referralBudget
-      const row = { curatorId: referrerId, recipientAddress: referrerAccount.address, piconeros }
-      payoutRows.push(row)
-      referralPayoutRows.add(row)
-      referralBudget -= piconeros
-    }
+    const { rows: referralPayouts } = await allocateReferralPayouts(tx, referralByReferrer, referralBudget)
+    const referralPayoutRows = new Set(referralPayouts)
+    payoutRows.push(...referralPayouts)
 
     // --- Final ledger (atomic with the payout createMany below) ---
     // distributedPiconeros is the sum of the CREATED payouts (after address

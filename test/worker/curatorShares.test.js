@@ -51,10 +51,10 @@ async function purgePriorResidue () {
   const tipperIds = [...new Set(priorTips.map(t => t.tipperId).filter(Boolean))]
   const testPostIds = [...new Set(priorTips.map(t => t.postId).filter(Boolean))]
   const priorAuthorIds = (await prisma.item.findMany({
-    where: { title: { in: ['top post', 'mid post', 'low post', 'normal handicap control post', 'staff handicapped post', 'trust weighted post one', 'trust weighted post two'] } },
+    where: { title: { in: ['top post', 'mid post', 'low post', 'normal handicap control post', 'staff handicapped post', 'trust weighted post one', 'trust weighted post two', 'founder excluded post', 'founder excluded control post', 'founder excluded topn post', 'founder excluded topn control one', 'founder excluded only post'] } },
     select: { userId: true }
   })).map(i => i.userId)
-  const testUserIds = [...new Set([...tipperIds, ...priorAuthorIds])].filter(id => id !== HANDICAP_USER_ID)
+  const testUserIds = [...new Set([...tipperIds, ...priorAuthorIds])].filter(id => id !== HANDICAP_USER_ID && id !== USER_ID.stasher)
 
   // FK-safe order: tips -> item aggregates/items -> accounts -> users.
   await prisma.observedTip.deleteMany({ where: { txHash: { startsWith: 'cs' }, paymentId: { startsWith: 'cstest' } } })
@@ -63,7 +63,7 @@ async function purgePriorResidue () {
     await prisma.item.deleteMany({ where: { id } })
   }
   await prisma.item.deleteMany({
-    where: { title: { in: ['top post', 'mid post', 'low post', 'normal handicap control post', 'staff handicapped post', 'trust weighted post one', 'trust weighted post two'] } }
+    where: { title: { in: ['top post', 'mid post', 'low post', 'normal handicap control post', 'staff handicapped post', 'trust weighted post one', 'trust weighted post two', 'founder excluded post', 'founder excluded control post', 'founder excluded topn post', 'founder excluded topn control one', 'founder excluded only post'] } }
   })
   await prisma.$executeRaw`DELETE FROM "MoneroAccount" WHERE address ~ '^74{94}[0-9]+$'`
   if (testUserIds.length) await prisma.userSubTrust.deleteMany({ where: { userId: { in: testUserIds } } })
@@ -113,6 +113,27 @@ async function createRootPost (userId, title, weightedVotes) {
   await prisma.$executeRaw`UPDATE "Item" SET path = ${String(id)}::ltree WHERE id = ${id}::int`
   created.items.push(id)
   return id
+}
+
+// Root post with an explicit created_at so a test can use its own isolated
+// reward window and avoid sharing proportions with the suite's fixtures.
+async function createRootPostAt (userId, title, weightedVotes, createdAt) {
+  const rows = await prisma.$queryRaw`
+    INSERT INTO "Item" ("userId", title, "weightedVotes", "created_at")
+    VALUES (${userId}::int, ${title}, ${weightedVotes}::float, ${createdAt})
+    RETURNING id::int AS id`
+  const id = rows[0].id
+  await prisma.$executeRaw`UPDATE "Item" SET path = ${String(id)}::ltree WHERE id = ${id}::int`
+  created.items.push(id)
+  return id
+}
+
+// The founder account is migration-seeded, so it normally already exists.
+// Track it for teardown only when this test actually created it.
+async function ensureFounderUser () {
+  const inserted = await prisma.$queryRaw`
+    INSERT INTO users (id) VALUES (${USER_ID.stasher}) ON CONFLICT DO NOTHING RETURNING id::int AS id`
+  if (inserted.length > 0) created.users.push(USER_ID.stasher)
 }
 
 // A minimal MoneroAccount to satisfy ObservedTip.recipientAccountId (FK RESTRICT).
@@ -339,6 +360,106 @@ test('staff curators (HANDICAP_IDS) get a 0.5x curator proportion', async () => 
   // Both curators tipped identical amounts on identical posts; the staff
   // handicap halves the proportion, so the staff share is exactly half.
   expect(staffShare.sharePiconeros).toBe(normalShare.sharePiconeros / 2n)
+})
+
+// --- Founder exclusion: stasher is not a curator-reward recipient ---
+
+const FOUNDER_EXCLUSION_DAY = 24 * 60 * 60 * 1000
+
+test('stasher earns no post or comment curator share', async () => {
+  await ensureFounderUser()
+  const curator = await createUser()
+  const account = await seedAccount()
+  const base = Date.now() + 90 * FOUNDER_EXCLUSION_DAY
+
+  const founderPost = await createRootPostAt(USER_ID.stasher, 'founder excluded post', 10, new Date(base))
+  const curatorPost = await createRootPostAt(curator, 'founder excluded control post', 10, new Date(base + 1000))
+  const confirmedAt = new Date(base + 2000)
+  await seedTip({
+    postId: founderPost,
+    tipperId: USER_ID.stasher,
+    piconeros: 1_000_000_000n,
+    confirmedAt,
+    recipientAccountId: account.id
+  })
+  await seedTip({
+    postId: curatorPost,
+    tipperId: curator,
+    piconeros: 1_000_000_000n,
+    confirmedAt: new Date(confirmedAt.getTime() + 1000),
+    recipientAccountId: account.id
+  })
+
+  const { shares } = await computeCuratorShares(
+    new Date(base - 1000), new Date(base + FOUNDER_EXCLUSION_DAY), POOL,
+    { minPayout: 0n, topN: 100 }, prisma)
+
+  expect(shares.map(s => s.curatorId)).not.toContain(USER_ID.stasher)
+  const curatorShare = shares.find(s => s.curatorId === curator)
+  expect(curatorShare).toBeDefined()
+  expect(curatorShare.sharePiconeros).toBeGreaterThan(0n)
+})
+
+test('stasher does not consume a topN slot or reward rank', async () => {
+  await ensureFounderUser()
+  const largerCurator = await createUser()
+  const account = await seedAccount()
+  const base = Date.now() + 180 * FOUNDER_EXCLUSION_DAY
+
+  // The founder post carries most of the vote weight, so an unfiltered
+  // stasher would outrank the control curator even through the 0.5x handicap.
+  const founderPost = await createRootPostAt(USER_ID.stasher, 'founder excluded topn post', 100, new Date(base))
+  const largerPost = await createRootPostAt(largerCurator, 'founder excluded topn control one', 10, new Date(base + 1000))
+  const confirmedAt = new Date(base + 3000)
+  await seedTip({
+    postId: founderPost,
+    tipperId: USER_ID.stasher,
+    // Large enough to still top the ranking through the 0.5x founder
+    // handicap, so an unfiltered stasher would consume the only topN slot.
+    piconeros: 10_000_000_000_000n,
+    confirmedAt,
+    recipientAccountId: account.id
+  })
+  await seedTip({
+    postId: largerPost,
+    tipperId: largerCurator,
+    piconeros: 10_000_000_000n,
+    confirmedAt: new Date(confirmedAt.getTime() + 1000),
+    recipientAccountId: account.id
+  })
+
+  const { shares } = await computeCuratorShares(
+    new Date(base - 1000), new Date(base + FOUNDER_EXCLUSION_DAY), POOL,
+    { minPayout: 0n, topN: 1 }, prisma)
+
+  // If stasher were filtered after topN, its larger proportion would consume
+  // the only slot and this list would be empty. If it were filtered after the
+  // rank window, the surviving curator's rank would be 2.
+  expect(shares).toHaveLength(1)
+  expect(shares[0].curatorId).toBe(largerCurator)
+  expect(shares[0].earns[0].rank).toBe(1)
+})
+
+test('a period with only stasher curator tips rolls the whole pool over', async () => {
+  await ensureFounderUser()
+  const account = await seedAccount()
+  const base = Date.now() + 270 * FOUNDER_EXCLUSION_DAY
+  const founderPost = await createRootPostAt(USER_ID.stasher, 'founder excluded only post', 10, new Date(base))
+  await seedTip({
+    postId: founderPost,
+    tipperId: USER_ID.stasher,
+    piconeros: 1_000_000_000n,
+    confirmedAt: new Date(base + 1000),
+    recipientAccountId: account.id
+  })
+
+  const { shares, distributedPiconeros, rolledOverPiconeros } = await computeCuratorShares(
+    new Date(base - 1000), new Date(base + FOUNDER_EXCLUSION_DAY), POOL,
+    { minPayout: 0n, topN: 100 }, prisma)
+
+  expect(shares).toEqual([])
+  expect(distributedPiconeros).toBe(0n)
+  expect(rolledOverPiconeros).toBe(POOL)
 })
 
 // --- #6: trust-weight floor helpers (pure, no DB) ---

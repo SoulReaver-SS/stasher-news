@@ -1,7 +1,7 @@
 import createPrisma from '@/lib/create-prisma'
 import { nymsToIds, HANDICAP_NYMS } from '@/lib/founderNyms'
 import { logError } from '@/lib/logger'
-import { META_SUB } from '@/lib/constants'
+import { META_SUB, USER_ID } from '@/lib/constants'
 
 // computeCuratorShares — the share-computation core of StasherNews' weekly
 // rewardsDistributor (Phase 4 Task 7 / design spec §5). It ports Stacker.news'
@@ -19,9 +19,15 @@ import { META_SUB } from '@/lib/constants'
 // What was kept: NTILE(100) percentile cutoff, the "islands" contiguous-zap
 // dedupe, the power(sum, 0.25) quad-root diminishing returns, the
 // 1/LN(rank + e - 1) early-tipper boost, the HANDICAP_NYMS / HANDICAP_ZAP_MULT
-// 0.5x curator multiplier (staff/founder users weigh half; restored per A-09), the
-// per-partition (post vs comment) normalization split by EACH_ZAP_PORTION, and
-// the per-user total_proportion roll-up.
+// 0.5x curator multiplier (staff/founder users weigh half; restored per A-09),
+// the per-partition (post vs comment) normalization split by EACH_ZAP_PORTION,
+// and the per-user total_proportion roll-up.
+//
+// One StasherNews-specific exception: the founder account `stasher` is not a
+// curator-reward recipient at all. Its tips still participate in the earlier
+// tip-ordering and trust stages, but it is removed from the final post/comment
+// attribution before normalization and ranking, so it never earns a share or
+// consumes a topN slot.
 //
 // This module is PURE: it computes shares and returns them. It touches no wallet,
 // creates no rows, and wires no job (Task 8's rewardsDistributor calls this and
@@ -54,7 +60,16 @@ const ZAP_THRESHOLD_PICONEROS = 100_000_000n
 // 'stasher' (616) and 'sn' (4502) are migration-guaranteed; 'untraceable'
 // (the founder's personal account) resolves once it exists. Anon is
 // deliberately NOT handicapped (never reaches curator attribution anyway).
+// The founder account `stasher` is excluded outright below, so its handicap
+// entry is inert; the multiplier still applies to the remaining accounts.
 const HANDICAP_ZAP_MULT = 0.5
+
+// The founder account is not eligible for weekly curator rewards. Use the
+// migration-guaranteed id (not the mutable display name). This filter runs in
+// the final attribution query, after tip islands/trust and before the rank and
+// normalization windows, so stasher's tips can still affect early-tipper
+// ordering and item-level proportions but stasher itself never earns.
+const CURATOR_EXCLUDED_ID = USER_ID.stasher
 
 // --- Curator trust weighting (#6) ---
 
@@ -259,6 +274,7 @@ async function compute (models, periodStart, periodEnd, poolPiconeros, minPayout
       FROM item_zapper_ratios
       WHERE item_zapper_proportion > 0
         AND ${EACH_ZAP_PORTION} > 0
+        AND "userId" <> ${CURATOR_EXCLUDED_ID}::int
     )
     -- roll every curator's per-type proportions up into one total, keeping the
     -- per-type breakdown (type/rank/typeProportion) for Earn row writing.
