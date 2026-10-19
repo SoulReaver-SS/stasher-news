@@ -2134,6 +2134,120 @@ describe('warnUndeliveredDistributions (stranding visibility net)', () => {
     expect(boss.send).not.toHaveBeenCalled()
   })
 
+  test('a cross-week recovery requeues only null-hash FAILED rows, preserves Earn/allocation facts, and never re-sends on repeat', async () => {
+    const sentHash = '5e'.repeat(32)
+    const { dist, curatorId } = await seedDistribution({
+      status: 'FAILED',
+      periodEnd: new Date(Date.now() - 16 * DAY),
+      payouts: [
+        { state: 'SENT', txHash: sentHash, piconeros: 1_000_000_000n },
+        { state: 'FAILED', piconeros: 2_000_000_000n },
+        { state: 'FAILED', piconeros: 3_000_000_000n }
+      ]
+    })
+    expect(Date.now() - dist.periodEnd.getTime()).toBeGreaterThanOrEqual(15 * DAY)
+    await prisma.earn.createMany({
+      data: [
+        { userId: curatorId, piconeros: 1_000_000_000n, type: 'TIP_POST', rank: 1, typeId: null, distributionId: dist.id, createdAt: new Date(Date.now() - 16 * DAY) },
+        { userId: curatorId, piconeros: 2_000_000_000n, type: 'TIP_COMMENT', rank: 2, typeId: null, distributionId: dist.id, createdAt: new Date(Date.now() - 16 * DAY) },
+        { userId: curatorId, piconeros: 3_000_000_000n, type: 'POST', rank: null, typeId: null, distributionId: dist.id, createdAt: new Date(Date.now() - 16 * DAY) }
+      ]
+    })
+
+    const before = await prisma.rewardDistribution.findUnique({
+      where: { id: dist.id },
+      include: { payouts: true }
+    })
+    const earnsBefore = await prisma.earn.findMany({
+      where: { distributionId: dist.id },
+      orderBy: { id: 'asc' }
+    })
+    const payoutFactsBefore = before.payouts
+      .map(p => ({ id: p.id, state: p.state, txHash: p.txHash }))
+      .sort((a, b) => a.id - b.id)
+    const sentPayout = before.payouts.find(p => p.state === 'SENT')
+    const failedIds = before.payouts
+      .filter(p => p.state === 'FAILED')
+      .map(p => p.id)
+      .sort((a, b) => a - b)
+    expect(failedIds).toHaveLength(2)
+
+    const drySigner = jest.fn()
+    const dry = await requeueFailedPayouts(prisma, dist.id, {
+      confirm: false, sendPayouts: drySigner, scheduleOpsSweep: false
+    })
+    expect(dry.requeued).toBe(0)
+    expect(dry.drove).toBe(false)
+    expect(drySigner).not.toHaveBeenCalled()
+    const afterDry = await prisma.rewardDistribution.findUnique({
+      where: { id: dist.id },
+      include: { payouts: true }
+    })
+    expect(afterDry.status).toBe(before.status)
+    expect(afterDry.poolPiconeros).toBe(before.poolPiconeros)
+    expect(afterDry.distributedPiconeros).toBe(before.distributedPiconeros)
+    expect(afterDry.rolledOverPiconeros).toBe(before.rolledOverPiconeros)
+    expect(afterDry.payouts
+      .map(p => ({ id: p.id, state: p.state, txHash: p.txHash }))
+      .sort((a, b) => a.id - b.id)).toEqual(payoutFactsBefore)
+
+    const signer = jest.fn(async (rows, { models }) => {
+      const eligible = rows.filter(p => p.state === 'QUEUED')
+      expect(eligible).toHaveLength(2)
+      // Prisma relation order is unspecified: assign hashes by payout ID, not
+      // by the order findUnique happens to return the two rows.
+      const hashByPayoutId = new Map(failedIds.map((id, index) =>
+        [id, testHash(index === 0 ? '5100' : '5101')]))
+      const eligibleById = [...eligible].sort((a, b) => a.id - b.id)
+      expect(eligibleById.map(p => p.id)).toEqual(failedIds)
+      for (const payout of eligibleById) {
+        await models.rewardPayout.update({
+          where: { id: payout.id },
+          data: { state: 'SENT', txHash: hashByPayoutId.get(payout.id) }
+        })
+      }
+      return { sent: 2, failed: 0, skipped: 0, unpersisted: 0, accountingUnpersisted: 0 }
+    })
+    const summary = await requeueFailedPayouts(prisma, dist.id, {
+      confirm: true, sendPayouts: signer, scheduleOpsSweep: false
+    })
+    expect(summary.requeued).toBe(2)
+    expect(summary.drove).toBe(true)
+    expect(summary.finalStatus).toBe('COMPLETE')
+
+    const after = await prisma.rewardDistribution.findUnique({
+      where: { id: dist.id },
+      include: { payouts: true }
+    })
+    expect(after.status).toBe('COMPLETE')
+    expect(after.completedAt).toBeTruthy()
+    expect(after.poolPiconeros).toBe(before.poolPiconeros)
+    expect(after.distributedPiconeros).toBe(before.distributedPiconeros)
+    expect(after.rolledOverPiconeros).toBe(before.rolledOverPiconeros)
+    expect(after.payoutCount).toBe(before.payoutCount)
+    expect(after.payouts.find(p => p.id === sentPayout.id)).toMatchObject({
+      state: 'SENT', txHash: sentHash
+    })
+    expect(after.payouts.find(p => p.id === failedIds[0])).toMatchObject({
+      state: 'SENT', txHash: testHash('5100')
+    })
+    expect(after.payouts.find(p => p.id === failedIds[1])).toMatchObject({
+      state: 'SENT', txHash: testHash('5101')
+    })
+    expect(await prisma.earn.findMany({
+      where: { distributionId: dist.id },
+      orderBy: { id: 'asc' }
+    })).toEqual(earnsBefore)
+
+    const second = await requeueFailedPayouts(prisma, dist.id, {
+      confirm: true, sendPayouts: signer, scheduleOpsSweep: false
+    })
+    expect(second.requeued).toBe(0)
+    expect(second.drove).toBe(false)
+    expect(second.finalStatus).toBe('COMPLETE')
+    expect(signer).toHaveBeenCalledTimes(1)
+  })
+
   // The routed Task 8 finding: a proven payout relay persists the recipients
   // but the journal fee persist fails (drive 1 -> accountingUnpersisted). The
   // no-QUEUED path must not flip COMPLETE (or schedule a sweep) until the

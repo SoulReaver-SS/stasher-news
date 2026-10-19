@@ -12,6 +12,8 @@
 //   docker exec -u apprunner app npx jest test/api/monero/rewards.test.js
 
 import { sendPayouts, resolveRewardsRestoreHeight, ensureFeeAccounts, planAccountSends } from '@/api/monero/rewards'
+import { prepareWalletTransaction } from '@/api/monero/rewardsTransactions'
+import { createPaymentProofKeyProvider } from '@/api/monero/paymentProofKeys'
 import { alert } from '../../../lib/alert'
 import * as util from 'node:util'
 import { ed25519 } from '@noble/curves/ed25519'
@@ -126,6 +128,8 @@ function makeFakeJournalModel ({ failJournalCreate = 0, failRelayedPersist = 0, 
     if (where.network !== undefined && row.network !== where.network) return false
     if (where.walletAddress !== undefined && row.walletAddress !== where.walletAddress) return false
     if (where.kind !== undefined && row.kind !== where.kind) return false
+    if (where.accountIndex !== undefined && row.accountIndex !== where.accountIndex) return false
+    if (where.distributionId !== undefined && row.distributionId !== where.distributionId) return false
     if (where.state !== undefined && row.state !== where.state) return false
     if ('relayAttemptedAt' in where) {
       if (where.relayAttemptedAt === null ? row.relayAttemptedAt !== null : row.relayAttemptedAt === null) return false
@@ -292,15 +296,17 @@ function makeFakeModels (rows, journalOptions = {}) {
 let txHashSeq = 0
 const nextTxHash = () => 'ab' + String(++txHashSeq).padStart(6, '0') + 'cd'.repeat(28) // 64 hex chars
 
-function makeFakeWallet ({ unlocked = 1_000_000_000_000_000n, unlockedByAccount, unlockedAfterSync, throwsOn = {}, throwsOnAccount = {}, fee = 0n, feeByAccount = {}, outgoing = [] } = {}) {
+function makeFakeWallet ({ unlocked = 1_000_000_000_000_000n, unlockedByAccount, unlockedAfterSync, throwsOn = {}, throwsOnAccount = {}, fee = 0n, feeByAccount = {}, lockedByAccount = {}, lockRemainderAfterRelay = false, sweepTxCount = 1, outgoing = [], sizeErrorWhen = () => false } = {}) {
   const calls = [] // createTx requests only
   const relayCalls = [] // relayTx requests
   const sweepCalls = []
   const order = []
   const records = new Map() // txHash -> { accountIndex, destinations, fee, relayed }
   let byAccount = { ...(unlockedByAccount || { 0: unlocked }) }
+  const lockedBy = { ...(lockedByAccount || {}) }
 
   const balanceOf = idx => BigInt(byAccount[idx] ?? 0n)
+  const lockedOf = idx => BigInt(lockedBy[idx] ?? 0n)
   const feeOf = idx => BigInt(feeByAccount[idx] ?? fee)
 
   const recordTx = (accountIndex, destinations, networkFee) => {
@@ -338,6 +344,12 @@ function makeFakeWallet ({ unlocked = 1_000_000_000_000_000n, unlockedByAccount,
       rec.relayed = true
       const spend = rec.destinations.reduce((acc, d) => acc + d.amount, 0n) + rec.fee
       byAccount[rec.accountIndex] = balanceOf(rec.accountIndex) - spend
+      if (lockRemainderAfterRelay) {
+        // The post-relay remainder is still a real output but is now locked:
+        // total balance stays positive while unlocked funds are zero.
+        lockedBy[rec.accountIndex] = lockedOf(rec.accountIndex) + balanceOf(rec.accountIndex)
+        byAccount[rec.accountIndex] = 0n
+      }
     }
     return hash // the real wallet returns the relayed tx hash
   }
@@ -357,7 +369,7 @@ function makeFakeWallet ({ unlocked = 1_000_000_000_000_000n, unlockedByAccount,
       order.push('getUnlockedBalance')
       return balanceOf(idx)
     },
-    async getBalance (idx) { return balanceOf(idx) },
+    async getBalance (idx) { return balanceOf(idx) + lockedOf(idx) },
     async getOutgoingTransfers () {
       const built = [...records.values()].map(rec => ({
         getDestinations: () => rec.destinations.map(d => ({ getAddress: () => d.address, getAmount: () => d.amount })),
@@ -377,6 +389,9 @@ function makeFakeWallet ({ unlocked = 1_000_000_000_000_000n, unlockedByAccount,
       const hardThrown = throwsOnAccount[accountIndex] ||
         (req.destinations || []).map(d => throwsOn[d.address]).find(Boolean)
       if (hardThrown) throw hardThrown
+      if (sizeErrorWhen(req)) {
+        throw new Error('Transaction would be too large.  Try create_txs()')
+      }
       // fee-aware balance validation mirrors the real wallet: fee is charged
       // on top of the destination sum, from the source account.
       if (req.relay === false) {
@@ -388,15 +403,31 @@ function makeFakeWallet ({ unlocked = 1_000_000_000_000_000n, unlockedByAccount,
       return recordTx(accountIndex, req.destinations, feeOf(accountIndex))
     },
     relayTx,
-    async sweepUnlocked ({ accountIndex, address, relay }) {
+    async sweepUnlocked ({ accountIndex, address, relay, sweepEachSubaddress }) {
       order.push('sweepUnlocked')
-      sweepCalls.push({ accountIndex, address, relay })
+      const call = { accountIndex, address, relay }
+      if (sweepEachSubaddress !== undefined) call.sweepEachSubaddress = sweepEachSubaddress
+      sweepCalls.push(call)
       const networkFee = feeOf(accountIndex)
       const bal = balanceOf(accountIndex)
-      if (bal <= networkFee) return []
-      const tx = recordTx(accountIndex, [{ address, amount: bal - networkFee }], networkFee)
-      if (relay === true) await relayTx(tx) // the real wallet relays immediately when relay is true
-      return [tx]
+      // The count models the SDK returning several disjoint sweep txs for one
+      // account-wide combine. Split the spendable value minus the REAL total
+      // fees across them; never let each tx claim the whole source balance.
+      const count = Math.max(1, Number(sweepTxCount))
+      const totalFee = networkFee * BigInt(count)
+      if (bal <= totalFee) return []
+      const distributable = bal - totalFee
+      const base = distributable / BigInt(count)
+      const remainder = distributable % BigInt(count)
+      const txs = []
+      for (let i = 0; i < count; i += 1) {
+        const amount = base + (i === count - 1 ? remainder : 0n)
+        txs.push(recordTx(accountIndex, [{ address, amount }], networkFee))
+      }
+      if (relay === true) {
+        for (const tx of txs) await relayTx(tx) // the real wallet relays immediately when relay is true
+      }
+      return txs
     }
   }
 }
@@ -493,7 +524,7 @@ test('a "tx not possible" on one account skips only that bucket; the healthy acc
   expect(wallet.sweepCalls.length).toBeGreaterThan(0)
 })
 
-test('a retryable build failure logs the guarded state dump (plan-time vs failure-time unlocked, heights) with stringified BigInts', async () => {
+test('a retryable build failure logs the guarded state dump (pre-build vs failure-time unlocked, heights) with stringified BigInts', async () => {
   const p = makePayout({ id: 1 })
   const models = makeFakeModels([p])
   const wallet = makeFakeWallet({
@@ -507,7 +538,7 @@ test('a retryable build failure logs the guarded state dump (plan-time vs failur
       accountIndex: 0,
       payoutCount: 1,
       dump: expect.objectContaining({
-        unlockedAtPlan: '3000000000',
+        unlockedBeforeBuild: '3000000000',
         unlockedNow: '3000000000',
         walletHeight: 1234,
         daemonHeight: 2345
@@ -1215,6 +1246,1281 @@ test('a fill candidate with a hard build error is FAILED while the base bucket s
   expect(wallet.relayCalls).toHaveLength(1)
 })
 
+test('a singleton size rejection stays queued and never relays a payout', async () => {
+  const p = makePayout({ id: 1, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 20_000_000_000n },
+    sizeErrorWhen: () => true
+  })
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, failed: 0, skipped: 1 })
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  expect([...models.journal.rows.values()].filter(r => r.kind === 'PAYOUT')).toHaveLength(0)
+})
+
+test('a size-rejected fill preserves the valid base', async () => {
+  const a = makePayout({ id: 1, piconeros: 5_000_000_000n })
+  const b = makePayout({ id: 2, piconeros: 4_000_000_000n })
+  const c = makePayout({ id: 3, piconeros: 3_000_000_000n })
+  const models = makeFakeModels([a, b, c])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 10_000_000_000n },
+    fee: 2_000_000_000n,
+    sizeErrorWhen: req => req.destinations.some(d => d.address === c.recipientAddress)
+  })
+  const result = await sendPayouts([a, b, c], { models, wallet })
+  expect(result).toMatchObject({ sent: 1, failed: 0, skipped: 2 })
+  expect(models.store.get(a.id).state).toBe('SENT')
+  expect(models.store.get(c.id).state).toBe('QUEUED')
+  expect(wallet.sweepCalls).toHaveLength(0)
+})
+
+test('a standalone fill size rejection is counted once', async () => {
+  const a = makePayout({ id: 1, piconeros: 5_000_000_000n })
+  const b = makePayout({ id: 2, piconeros: 4_000_000_000n })
+  const models = makeFakeModels([a, b])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 5_000_000_000n },
+    fee: 500_000_000n,
+    sizeErrorWhen: req => req.destinations[0].address === b.recipientAddress
+  })
+  const result = await sendPayouts([a, b], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, failed: 0, skipped: 2 })
+  expect([...models.store.values()].every(p => p.state === 'QUEUED')).toBe(true)
+  // Its source cannot leave a whole payout plus headroom after the real fee:
+  // the targeted cycle is attempted but refuses before journaling or relaying.
+  expect(wallet.sweepCalls).toHaveLength(1)
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect([...models.journal.rows.values()].filter(r => r.kind === 'CONSOLIDATION')).toHaveLength(0)
+})
+
+test('18 rewards use disjoint chunks with one authentic journal per transaction', async () => {
+  const rows = Array.from({ length: 18 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 100_000_000_000n },
+    fee: 10_000_000n,
+    sizeErrorWhen: req => req.destinations.length > 15
+  })
+  expect(await sendPayouts(rows, { models, wallet })).toEqual({
+    sent: 18, failed: 0, skipped: 0, unpersisted: 0, accountingUnpersisted: 0
+  })
+  expect(wallet.calls.map(c => c.destinations.length)).toEqual([15, 3])
+  const journals = [...models.journal.rows.values()].filter(r => r.kind === 'PAYOUT')
+  expect(journals).toHaveLength(2)
+  expect(journals.every(r => r.state === 'RELAYED' && r.proofId)).toBe(true)
+  const ids = journals.flatMap(r => r.metadata.payouts.map(p => p.payoutId))
+  expect(ids.sort((a, b) => a - b)).toEqual(rows.map(p => p.id))
+  expect(new Set(ids).size).toBe(18)
+  expect(journals.reduce((n, r) => n + r.networkFeePiconeros, 0n)).toBe(20_000_000n)
+})
+
+test('smaller input-weight limits bisect without repeating a parent', async () => {
+  const rows = Array.from({ length: 8 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({ sizeErrorWhen: req => req.destinations.length > 2 })
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toMatchObject({ sent: 8, failed: 0, skipped: 0 })
+  expect(wallet.calls.map(c => c.destinations.length)).toEqual([8, 4, 2, 2, 4, 2, 2])
+  expect(wallet.calls.length).toBeLessThanOrEqual(2 * rows.length - 1)
+  expect(wallet.relayCalls).toHaveLength(4)
+})
+
+test('fee exhaustion between chunks leaves the final chunk queued without inventing capacity', async () => {
+  const rows = Array.from({ length: 16 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 16_000_000_000n },
+    fee: 1_000_000_000n
+  })
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 15, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls.map(c => c.destinations.length)).toEqual([15, 1])
+  expect(wallet.relayCalls).toHaveLength(1)
+  expect(models.store.get(16)).toMatchObject({ state: 'QUEUED', txHash: null })
+  expect(wallet.sweepCalls).toHaveLength(0)
+})
+
+test('a positive post-relay remainder that becomes locked stops the next chunk and never authorizes a sweep', async () => {
+  const rows = Array.from({ length: 16 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  // 16e9 initially covers the 15e9 principal + 1e9 fee and leaves a POSITIVE
+  // 4e9 remainder. The fake then moves exactly that remainder to LOCKED after
+  // the first relay, so only a fresh UNLOCKED read (0) can stop chunk two —
+  // fee exhaustion alone would also have stopped it. createTx/sweepUnlocked
+  // are constrained to the unlocked side, and the sweep gate must not treat
+  // the locked 4e9 as recovery capacity.
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    fee: 1_000_000_000n,
+    lockRemainderAfterRelay: true
+  })
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 15, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls.map(c => c.destinations.length)).toEqual([15, 1])
+  expect(models.store.get(16)).toMatchObject({ state: 'QUEUED', txHash: null })
+  expect(await wallet.getBalance(1)).toBe(4_000_000_000n) // positive post-fee remainder...
+  expect(await wallet.getUnlockedBalance(1)).toBe(0n) // ...but it locked after the relay
+  expect(wallet.sweepCalls).toHaveLength(0) // locked funds never authorize a fee-burning sweep
+
+  // Fresh pre-build read: after relay #1 the second chunk reads unlocked funds
+  // BEFORE it attempts a build, and that build sees the locked remainder.
+  const firstRelay = wallet.order.indexOf('relayTx')
+  const secondBuild = wallet.order.indexOf('createTx', firstRelay + 1)
+  const secondUnlocked = wallet.order.indexOf('getUnlockedBalance', firstRelay + 1)
+  expect(firstRelay).toBeGreaterThanOrEqual(0)
+  expect(secondUnlocked).toBeGreaterThan(firstRelay)
+  expect(secondBuild).toBeGreaterThan(secondUnlocked)
+  // The sweep seam is unlocked-only too: the positive locked remainder cannot
+  // produce a sweep transaction.
+  expect(await wallet.sweepUnlocked({
+    accountIndex: 1, address: REWARDS_ADDRESS, relay: false
+  })).toEqual([])
+})
+
+// Durable CONSOLIDATION history fixtures for the targeted size-recovery gate.
+// The source query is scoped by network/wallet/account and the pure policy also
+// looks at distributionId, so the fake journal matcher must honor both filters.
+const seedConsolidationHistory = (models, {
+  id = 900,
+  accountIndex = 1,
+  distributionId = 7,
+  state = 'RELAYED',
+  network,
+  walletAddress,
+  relayAttemptedAt
+} = {}) => {
+  models.journal.rows.set(id, {
+    id,
+    network: network ?? String(process.env.MONERO_NETWORK || 'stagenet').toUpperCase(),
+    walletAddress: walletAddress ?? REWARDS_ADDRESS,
+    txHash: (String(id) + 'c0').padEnd(64, 'a').slice(0, 64),
+    kind: 'CONSOLIDATION',
+    state,
+    accountIndex,
+    distributionId,
+    principalPiconeros: 0n,
+    networkFeePiconeros: 1_000_000n,
+    metadata: { selfTransfer: true, destination: REWARDS_ADDRESS },
+    proofId: `00000000-0000-4000-8000-${String(id).padStart(12, '0')}`,
+    relayAttemptedAt: relayAttemptedAt === undefined
+      ? (state === 'RELAYED' ? new Date() : null)
+      : relayAttemptedAt,
+    relayedAt: state === 'RELAYED' ? new Date() : null
+  })
+  return models
+}
+
+const consolidationsOf = models => [...models.journal.rows.values()].filter(r => r.kind === 'CONSOLIDATION')
+
+// An authentic captured-but-unattempted CONSOLIDATION pair through the real
+// journal/proof store: the exact prepare->claim interruption a restart leaves
+// behind. Kept local to this suite; the fake wallet never relays it.
+const prepareUnattemptedConsolidation = async (models, { accountIndex = 1, distributionId = 7 } = {}) => {
+  const scope = {
+    network: String(process.env.MONERO_NETWORK || 'stagenet').toUpperCase(),
+    walletAddress: REWARDS_ADDRESS
+  }
+  const pairWallet = makeFakeWallet({ unlockedByAccount: { [accountIndex]: 20_000_000_000n } })
+  const [tx] = await pairWallet.sweepUnlocked({
+    accountIndex,
+    address: REWARDS_ADDRESS,
+    relay: false,
+    sweepEachSubaddress: false
+  })
+  await prepareWalletTransaction({
+    models,
+    wallet: pairWallet,
+    scope,
+    tx,
+    kind: 'CONSOLIDATION',
+    accountIndex,
+    distributionId,
+    principalPiconeros: 0n,
+    metadata: { selfTransfer: true, destination: REWARDS_ADDRESS },
+    keyProvider: createPaymentProofKeyProvider(process.env)
+  })
+  const row = consolidationsOf(models).find(candidate =>
+    candidate.accountIndex === accountIndex && candidate.distributionId === distributionId)
+  expect(row).toMatchObject({ state: 'PREPARED', relayAttemptedAt: null })
+  return row
+}
+
+const legacyRecoveryAlert = stage => alert.mock.calls.find(call =>
+  String(call[1]).includes(`legacy recovery ${stage}`))
+
+const fragmentedAlert = () => alert.mock.calls.find(call => String(call[1]).includes('fragmented-inputs'))
+
+const expectRefusalWording = (call, severity = 'warn') => {
+  expect(call[0]).toBe(severity)
+  const body = String(call[2])
+  expect(body).toContain('No consolidation transaction or output')
+  expect(body).toContain('Resolve the reported source condition')
+  expect(body).toContain('check that the wallet reports unlocked funds')
+  expect(body).toContain('scripts/requeue-failed-payouts.js')
+  expect(body).not.toContain('consolidated outputs unlocked')
+}
+
+const expectUncertainRecoveryInstructions = (call, { accountIndex, distributionId }) => {
+  expect(call[0]).toBe('critical')
+  const body = String(call[2])
+  expect(body).toContain(`distribution ${distributionId}`)
+  expect(body).toContain(`source account ${accountIndex}`)
+  expect(body).toContain('Stop.')
+  expect(body).toContain('resolve the exact existing journal/reservation')
+  expect(body).toContain('ANY actually relayed recovery outputs')
+  expect(body).toContain('scripts/requeue-failed-payouts.js')
+  expect(body.toLowerCase()).toContain('do not resend')
+  expect(body.toLowerCase()).toContain('do not cancel')
+  expect(body.toLowerCase()).toContain('tear down')
+  expect(body.toLowerCase()).toContain('journal/proof')
+  const resolveAt = body.indexOf('resolve the exact existing journal/reservation')
+  const unlockAt = body.indexOf('ANY actually relayed recovery outputs')
+  const retryAt = body.indexOf('scripts/requeue-failed-payouts.js')
+  expect(resolveAt).toBeGreaterThanOrEqual(0)
+  expect(unlockAt).toBeGreaterThan(resolveAt)
+  expect(retryAt).toBeGreaterThan(unlockAt)
+}
+
+test('targeted size recovery sweeps only the fragmented source and journals attributed zero-principal consolidations', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n, 3: 2_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  logInfo.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toEqual([
+    { accountIndex: 1, address: REWARDS_ADDRESS, relay: false, sweepEachSubaddress: false }
+  ])
+  const consolidations = consolidationsOf(models)
+  expect(consolidations).toHaveLength(1)
+  expect(consolidations[0]).toMatchObject({
+    state: 'RELAYED',
+    accountIndex: 1,
+    distributionId: 7,
+    principalPiconeros: 0n
+  })
+  expect(consolidations[0].proofId).toBeTruthy()
+  expect(consolidations[0].metadata).toEqual({ selfTransfer: true, destination: REWARDS_ADDRESS })
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  const recoveryLog = logInfo.mock.calls.find(([fields, message]) =>
+    fields?.reason === 'fragmented-inputs' && fields.distributionId === 7 &&
+    String(message).includes('requeue-failed-payouts'))
+  expect(recoveryLog[0]).toMatchObject({ distributionId: 7, accountIndex: 1 })
+  expect(String(recoveryLog[1])).toContain('requeue-failed-payouts')
+})
+
+test('targeted size recovery permits primary account 0 self-consolidation', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 20_000_000_000n, 3: 2_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, failed: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toEqual([
+    { accountIndex: 0, address: REWARDS_ADDRESS, relay: false, sweepEachSubaddress: false }
+  ])
+  const consolidation = consolidationsOf(models)[0]
+  expect(consolidation).toMatchObject({
+    state: 'RELAYED', accountIndex: 0, distributionId: 7, principalPiconeros: 0n
+  })
+  expect(consolidation.metadata.destination).toBe(REWARDS_ADDRESS)
+})
+
+test('a targeted cycle below the dust floor is an explicit no-op alert', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 50_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 50_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  logWarn.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toHaveLength(0)
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  expect(models.store.get(p.id).state).toBe('QUEUED')
+  expect(logWarn.mock.calls.some(([fields]) =>
+    fields?.reason === 'fragmented-inputs' && fields?.stage === 'dust')).toBe(true)
+  const dustAlert = fragmentedAlert()
+  expect(dustAlert[1]).toContain('dust')
+  expect(String(dustAlert[2])).toContain('distribution 7')
+  expect(String(dustAlert[2])).toContain('source account 1')
+  expectRefusalWording(dustAlert, 'warn')
+})
+
+test('mixed distributions on one source run one bounded cycle and log the suppressed group', async () => {
+  const first = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const second = makePayout({ id: 2, distributionId: 8, piconeros: 4_000_000_000n })
+  const models = makeFakeModels([first, second])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d =>
+      d.address === first.recipientAddress || d.address === second.recipientAddress)
+  })
+  logWarn.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([first, second], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, failed: 0, skipped: 2, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toHaveLength(1) // one cycle for the source this drive
+  const consolidations = consolidationsOf(models)
+  expect(consolidations).toHaveLength(1)
+  expect(consolidations[0].distributionId).toBe(7)
+  expect(logWarn.mock.calls.some(([fields]) =>
+    fields?.reason === 'fragmented-inputs' &&
+    fields?.stage === 'suppressed-mixed-distribution' &&
+    fields?.accountIndex === 1 && fields?.distributionId === 8)).toBe(true)
+  const suppressedAlert = alert.mock.calls.find(call =>
+    String(call[1]).includes('suppressed-mixed-distribution'))
+  expect(suppressedAlert[1]).toContain('suppressed-mixed-distribution')
+  expect(String(suppressedAlert[2])).toContain('distribution 8')
+  expect(String(suppressedAlert[2])).toContain('source account 1')
+  expectRefusalWording(suppressedAlert, 'warn')
+  expect([...models.store.values()].every(row => row.state === 'QUEUED')).toBe(true)
+})
+
+test('an exhausted distribution/source cycle is never swept again on a later drive', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const sizeError = req => req.destinations.some(d => d.address === p.recipientAddress)
+  const firstWallet = makeFakeWallet({ unlockedByAccount: { 1: 20_000_000_000n }, sizeErrorWhen: sizeError })
+  const first = await sendPayouts([p], { models, wallet: firstWallet })
+  expect(first).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(consolidationsOf(models)).toHaveLength(1)
+
+  logWarn.mockClear()
+  alert.mockClear()
+  const secondWallet = makeFakeWallet({ unlockedByAccount: { 1: 20_000_000_000n }, sizeErrorWhen: sizeError })
+  const second = await sendPayouts([models.store.get(p.id)], { models, wallet: secondWallet })
+  expect(second).toMatchObject({ sent: 0, skipped: 1, failed: 0, accountingUnpersisted: 0 })
+  expect(secondWallet.sweepCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(1) // no second durable cycle
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  expect(logWarn.mock.calls.some(([fields]) =>
+    fields?.reason === 'fragmented-inputs' && fields?.stage === 'exhausted')).toBe(true)
+  const exhaustedAlert = fragmentedAlert()
+  expect(exhaustedAlert[1]).toContain('exhausted')
+  expect(String(exhaustedAlert[2])).toContain('distribution 7')
+  expect(String(exhaustedAlert[2])).toContain('source account 1')
+  expectRefusalWording(exhaustedAlert, 'warn')
+})
+
+test('an unresolved PREPARED recovery reserves the source after stale-pair reconciliation', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const scope = {
+    network: String(process.env.MONERO_NETWORK || 'stagenet').toUpperCase(),
+    walletAddress: REWARDS_ADDRESS
+  }
+  // Capture-grade but never claimed: the exact prepare->claim interruption the
+  // stale-pair reconciliation must surface before the targeted history gate.
+  const pairWallet = makeFakeWallet({ unlockedByAccount: { 1: 20_000_000_000n } })
+  const [tx] = await pairWallet.sweepUnlocked({
+    accountIndex: 1,
+    address: REWARDS_ADDRESS,
+    relay: false,
+    sweepEachSubaddress: false
+  })
+  await prepareWalletTransaction({
+    models,
+    wallet: pairWallet,
+    scope,
+    tx,
+    kind: 'CONSOLIDATION',
+    accountIndex: 1,
+    distributionId: 6,
+    principalPiconeros: 0n,
+    metadata: { selfTransfer: true, destination: REWARDS_ADDRESS },
+    keyProvider: createPaymentProofKeyProvider(process.env)
+  })
+  const reserved = consolidationsOf(models)
+  expect(reserved).toHaveLength(1)
+  expect(reserved[0]).toMatchObject({ state: 'PREPARED', relayAttemptedAt: null })
+  expect(reserved[0].dispatchId).toBeTruthy()
+  expect(models.journal.proofs.get(String(reserved[0].proofId))).toBeTruthy()
+
+  alert.mockClear()
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 1 })
+  expect(wallet.sweepCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(1) // only the reservation fixture
+  expect(models.store.get(p.id).state).toBe('QUEUED')
+  expect(alert).toHaveBeenCalledWith('critical', 'Rewards wallet pair reserved (durable but unattempted)',
+    expect.stringContaining(reserved[0].txHash), expect.objectContaining({
+      dedupeKey: `rewards-pair-unattempted-${reserved[0].txHash}`
+    }))
+  const blockedAlert = fragmentedAlert()
+  expect(blockedAlert[1]).toContain('reserved')
+  expect(String(blockedAlert[2])).toContain('distribution 7')
+  expect(String(blockedAlert[2])).toContain('source account 1')
+  expectUncertainRecoveryInstructions(blockedAlert, { accountIndex: 1, distributionId: 7 })
+})
+
+test('another distribution\'s PREPARED recovery blocks a fresh cycle', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = seedConsolidationHistory(makeFakeModels([p]), {
+    accountIndex: 1, distributionId: 6, state: 'PREPARED', relayAttemptedAt: null
+  })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 1 })
+  expect(wallet.sweepCalls).toHaveLength(0)
+  expect(wallet.relayCalls).toHaveLength(0)
+})
+
+test.each(['network', 'wallet'])('recovery history scoped to another %s does not block this source', async foreign => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  seedConsolidationHistory(models, {
+    accountIndex: 1,
+    distributionId: 7,
+    network: foreign === 'network' ? 'MAINNET' : undefined,
+    walletAddress: foreign === 'wallet' ? makeAddress(250) : undefined
+  })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toHaveLength(1)
+  expect(consolidationsOf(models)).toHaveLength(2)
+})
+
+test('a source-history read failure fails closed without leaking the exception', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const findMany = models.rewardsWalletTransaction.findMany.bind(models.rewardsWalletTransaction)
+  let sourceReads = 0
+  models.rewardsWalletTransaction.findMany = async args => {
+    if (args?.where?.kind === 'CONSOLIDATION' && args.where.accountIndex !== undefined) {
+      sourceReads += 1
+      throw new Error('source history unavailable')
+    }
+    return findMany(args)
+  }
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  logError.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(sourceReads).toBe(1)
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 1 })
+  expect(wallet.sweepCalls).toHaveLength(0)
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  const failureLog = logError.mock.calls.find(([fields]) =>
+    fields?.reason === 'fragmented-inputs' && fields?.stage === 'history-unavailable')
+  expect(failureLog[0]).toMatchObject({ accountIndex: 1, errorClass: 'unknown' })
+  expect(JSON.stringify(logError.mock.calls)).not.toContain('source history unavailable')
+  const readAlert = fragmentedAlert()
+  expect(readAlert[1]).toContain('history')
+  expect(String(readAlert[2])).toContain('distribution 7')
+  expect(String(readAlert[2])).toContain('source account 1')
+  expectUncertainRecoveryInstructions(readAlert, { accountIndex: 1, distributionId: 7 })
+})
+
+test('multiple targeted sweep transactions become separate proofs and fee facts', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    fee: 1_000_000_000n,
+    sweepTxCount: 2,
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toHaveLength(1)
+  expect(wallet.relayCalls).toHaveLength(2) // both constituent sweeps relayed
+  const consolidations = consolidationsOf(models)
+  expect(consolidations).toHaveLength(2)
+  expect(consolidations.every(r => r.state === 'RELAYED' && r.principalPiconeros === 0n &&
+    r.distributionId === 7 && r.accountIndex === 1 && r.proofId)).toBe(true)
+  expect(new Set(consolidations.map(r => r.txHash)).size).toBe(2)
+  expect(new Set(consolidations.map(r => r.proofId)).size).toBe(2)
+  // Each journal row is bound to its own persisted, authentic proof record.
+  const proofs = consolidations.map(r => models.journal.proofs.get(String(r.proofId)))
+  expect(proofs.every(Boolean)).toBe(true)
+  for (const [i, proof] of proofs.entries()) {
+    expect(proof).toMatchObject({
+      id: consolidations[i].proofId,
+      rewardsJournalId: consolidations[i].id,
+      claimDigest: consolidations[i].claimDigest
+    })
+    expect(proof.bindingDigest).toMatch(/^[0-9a-f]{64}$/)
+    expect(Buffer.from(proof.ciphertext).length).toBeGreaterThan(0)
+  }
+  expect(proofs[0].bindingDigest).not.toBe(proofs[1].bindingDigest)
+  expect(proofs[0].ciphertext.equals(proofs[1].ciphertext)).toBe(false)
+  expect(consolidations.reduce((sum, r) => sum + r.networkFeePiconeros, 0n)).toBe(2_000_000_000n)
+  const swept = wallet.relayCalls.reduce((sum, tx) =>
+    sum + tx.getOutgoingTransfer().getDestinations().reduce((a, d) => a + d.getAmount(), 0n), 0n)
+  expect(swept + 2_000_000_000n).toBe(20_000_000_000n) // split, never double-claimed
+})
+
+test.each(['duplicate', 'empty'])('targeted recovery refuses a %s sweep hash set before any relay', async mode => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  wallet.sweepUnlocked = async ({ accountIndex, address, relay, sweepEachSubaddress }) => {
+    wallet.sweepCalls.push({ accountIndex, address, relay, sweepEachSubaddress })
+    const hash = mode === 'empty' ? '' : 'dd'.repeat(32)
+    const tx = {
+      getHash: () => hash,
+      getFee: async () => 0n,
+      getOutgoingTransfer: () => ({ getDestinations: () => [{ getAddress: () => address, getAmount: () => 1n }] }),
+      getChangeAddress: () => null,
+      getChangeAmount: async () => null,
+      getKey: () => secretBundleHex(400n, 1)
+    }
+    return [tx, tx]
+  }
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toHaveLength(1)
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  expect(models.store.get(p.id).state).toBe('QUEUED')
+  const call = fragmentedAlert()
+  expect(call[1]).toContain('hash-invalid')
+  expectRefusalWording(call, 'critical')
+})
+
+test('targeted recovery states a fixed reason and leaves payouts queued when fees leave no useful capacity', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 6_000_000_000n },
+    fee: 2_000_000_000n,
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  logWarn.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toHaveLength(1)
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0) // no invented fee fact
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  expect(logWarn.mock.calls.some(([fields]) =>
+    fields?.reason === 'fragmented-inputs' && fields?.stage === 'unaffordable')).toBe(true)
+  const unaffordableAlert = fragmentedAlert()
+  expect(unaffordableAlert[1]).toContain('unaffordable')
+  expect(String(unaffordableAlert[2])).toContain('distribution 7')
+  expect(String(unaffordableAlert[2])).toContain('source account 1')
+  expectRefusalWording(unaffordableAlert, 'warn')
+  expect(String(unaffordableAlert[2]).toLowerCase()).not.toContain('blind')
+  expect(String(unaffordableAlert[2]).toLowerCase()).not.toContain('teardown')
+})
+
+test('an empty targeted sweep is not successful recovery', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  wallet.sweepUnlocked = async args => {
+    wallet.sweepCalls.push(args)
+    return []
+  }
+  logWarn.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.sweepCalls).toHaveLength(1)
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  expect(models.store.get(p.id).state).toBe('QUEUED')
+  expect(logWarn.mock.calls.some(([fields]) =>
+    fields?.reason === 'fragmented-inputs' && fields?.stage === 'empty')).toBe(true)
+  const emptyAlert = fragmentedAlert()
+  expect(emptyAlert[1]).toContain('empty')
+  expect(String(emptyAlert[2])).toContain('distribution 7')
+  expect(String(emptyAlert[2])).toContain('source account 1')
+  expectRefusalWording(emptyAlert, 'warn')
+})
+
+test('a targeted preparation failure alerts with the fixed recovery contract', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p], { failJournalCreate: 99 })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 1 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  const call = fragmentedAlert()
+  expect(call[1]).toContain('preparation')
+  expectUncertainRecoveryInstructions(call, { accountIndex: 1, distributionId: 7 })
+})
+
+test('a targeted claim failure alerts with the fixed recovery contract', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const $transaction = models.$transaction.bind(models)
+  let transactions = 0
+  models.$transaction = async fn => {
+    transactions += 1
+    if (transactions === 2) throw new Error('claim database unavailable')
+    return $transaction(fn)
+  }
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(transactions).toBe(2) // prepare, then the claim attempt
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 1 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  const rows = consolidationsOf(models)
+  expect(rows).toHaveLength(1)
+  expect(rows[0]).toMatchObject({ state: 'PREPARED', relayAttemptedAt: null })
+  const call = fragmentedAlert()
+  expect(call[1]).toContain('claim')
+  expectUncertainRecoveryInstructions(call, { accountIndex: 1, distributionId: 7 })
+})
+
+test('a targeted journal-state accounting failure alerts with the fixed recovery contract', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p], { failRelayedPersist: 2 })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 1 })
+  expect(wallet.relayCalls).toHaveLength(1) // the sweep DID relay; only its journal state failed
+  const rows = consolidationsOf(models)
+  expect(rows).toHaveLength(1)
+  expect(rows[0]).toMatchObject({ state: 'PREPARED' })
+  expect(rows[0].relayAttemptedAt).not.toBeNull()
+  const call = fragmentedAlert()
+  expect(call[1]).toContain('journal')
+  expectUncertainRecoveryInstructions(call, { accountIndex: 1, distributionId: 7 })
+})
+
+test('a targeted sweep-build failure alerts with the fixed recovery contract', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  wallet.sweepUnlocked = async () => { throw new Error('sweep build unavailable') }
+  logError.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  expect(logError.mock.calls.some(([fields]) =>
+    fields?.reason === 'fragmented-inputs' && fields?.stage === 'sweep-failed')).toBe(true)
+  const call = fragmentedAlert()
+  expect(call[1]).toContain('sweep')
+  expect(String(call[2])).toContain('distribution 7')
+  expect(String(call[2])).toContain('source account 1')
+  expectRefusalWording(call, 'critical')
+  expect(JSON.stringify(logError.mock.calls)).not.toContain('sweep build unavailable')
+})
+
+test('a targeted fee-read failure escalates as a critical fixed alert', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  wallet.sweepUnlocked = async ({ accountIndex, address, relay, sweepEachSubaddress }) => {
+    wallet.sweepCalls.push({ accountIndex, address, relay, sweepEachSubaddress })
+    return [{
+      getHash: () => 'e1'.repeat(32),
+      getFee: async () => { throw new Error('fee read unavailable') }
+    }]
+  }
+  logError.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  expect(logError.mock.calls.some(([fields]) =>
+    fields?.reason === 'fragmented-inputs' && fields?.stage === 'fee-read')).toBe(true)
+  expect(JSON.stringify(logError.mock.calls)).not.toContain('fee read unavailable')
+  const call = fragmentedAlert()
+  expect(call[1]).toContain('fee-read')
+  expectRefusalWording(call, 'critical')
+})
+
+test('a targeted invalid-fee result escalates as a critical fixed alert', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === p.recipientAddress)
+  })
+  wallet.sweepUnlocked = async ({ accountIndex, address, relay, sweepEachSubaddress }) => {
+    wallet.sweepCalls.push({ accountIndex, address, relay, sweepEachSubaddress })
+    return [{
+      getHash: () => 'e2'.repeat(32),
+      getFee: async () => -1n
+    }]
+  }
+  logError.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 0 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  expect(logError.mock.calls.some(([fields]) =>
+    fields?.reason === 'fragmented-inputs' && fields?.stage === 'invalid-fee')).toBe(true)
+  const call = fragmentedAlert()
+  expect(call[1]).toContain('invalid-fee')
+  expectRefusalWording(call, 'critical')
+})
+
+test('an uncertain targeted relay is never replaced by another consolidation', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const sizeError = req => req.destinations.some(d => d.address === p.recipientAddress)
+  const wallet = makeFakeWallet({ unlockedByAccount: { 1: 20_000_000_000n }, sizeErrorWhen: sizeError })
+  const originalRelay = wallet.relayTx.bind(wallet)
+  wallet.relayTx = async tx => {
+    await originalRelay(tx) // the sweep DID broadcast...
+    throw new Error('acknowledgement lost') // ...but the outcome is unresolved
+  }
+  alert.mockClear()
+  const first = await sendPayouts([p], { models, wallet })
+  expect(first).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 1 })
+  const attempted = consolidationsOf(models)
+  expect(attempted).toHaveLength(1)
+  expect(attempted[0].state).toBe('PREPARED')
+  expect(attempted[0].relayAttemptedAt).not.toBeNull()
+  const originalHash = attempted[0].txHash
+  const call = fragmentedAlert()
+  expect(call[1]).toContain('uncertain')
+  expectUncertainRecoveryInstructions(call, { accountIndex: 1, distributionId: 7 })
+
+  const secondWallet = makeFakeWallet({ unlockedByAccount: { 1: 20_000_000_000n }, sizeErrorWhen: sizeError })
+  const second = await sendPayouts([models.store.get(p.id)], { models, wallet: secondWallet })
+  expect(second).toMatchObject({ sent: 0, skipped: 1, failed: 0 })
+  expect(secondWallet.sweepCalls).toHaveLength(0)
+  expect(secondWallet.relayCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(1)
+  expect(consolidationsOf(models)[0].txHash).toBe(originalHash)
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+})
+
+test('a targeted cycle halts after the first constituent relays and keeps its durable row', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const sizeError = req => req.destinations.some(d => d.address === p.recipientAddress)
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    fee: 1_000_000_000n,
+    sweepTxCount: 2,
+    sizeErrorWhen: sizeError
+  })
+  const originalRelay = wallet.relayTx.bind(wallet)
+  let relayAttempts = 0
+  wallet.relayTx = async tx => {
+    relayAttempts += 1
+    if (relayAttempts >= 2) throw new Error('second relay failed')
+    return originalRelay(tx)
+  }
+  const first = await sendPayouts([p], { models, wallet })
+  expect(first).toMatchObject({ sent: 0, skipped: 1, accountingUnpersisted: 1 })
+  expect(relayAttempts).toBe(2) // second attempt was made but failed
+  const rows = consolidationsOf(models)
+  expect(rows).toHaveLength(2)
+  expect(rows.filter(r => r.state === 'RELAYED')).toHaveLength(1)
+  expect(rows.filter(r => r.state === 'PREPARED' && r.relayAttemptedAt)).toHaveLength(1)
+  expect(new Set(rows.map(r => r.txHash)).size).toBe(2)
+
+  const secondWallet = makeFakeWallet({ unlockedByAccount: { 1: 20_000_000_000n }, sizeErrorWhen: sizeError })
+  const second = await sendPayouts([models.store.get(p.id)], { models, wallet: secondWallet })
+  expect(second).toMatchObject({ sent: 0, skipped: 1, failed: 0 })
+  expect(secondWallet.sweepCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(2) // no replacement cycle
+})
+
+test('nested bisection with K>1 initial chunks uses at most the exact 2P-K planned-call bound', async () => {
+  const rows = Array.from({ length: 20 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 100_000_000_000n },
+    sizeErrorWhen: () => true
+  })
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 20, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls.map(req => req.destinations.length).slice(0, 2)).toEqual([15, 8])
+  expect(wallet.calls).toHaveLength(2 * rows.length - 2) // K=2: 2P-K (all singleton rejects)
+  expect(consolidationsOf(models)).toHaveLength(1) // targeted recovery is a separate bounded cycle
+})
+
+test('a generic retryable multi-chunk halt keeps legacy consolidation recovery', async () => {
+  const rows = Array.from({ length: 35 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({ unlockedByAccount: { 1: 100_000_000_000n } })
+  const createTx = wallet.createTx.bind(wallet)
+  const buildAttempts = []
+  wallet.createTx = async req => {
+    buildAttempts.push(req.destinations.length)
+    if (buildAttempts.length === 2) throw new Error('tx not possible') // second of [15, 15, 5]
+    return createTx(req)
+  }
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 15, failed: 0, skipped: 20, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(buildAttempts).toEqual([15, 15]) // the third chunk is never attempted
+  expect(wallet.calls.map(req => req.destinations.length)).toEqual([15]) // the failed build recorded no tx
+  expect(wallet.sweepCalls).toEqual([
+    { accountIndex: 1, address: REWARDS_ADDRESS, relay: false } // legacy recovery, default shape
+  ])
+  expect(consolidationsOf(models)).toHaveLength(1)
+})
+
+test('a generic failure on another source cannot bypass an exhausted size-recovery budget', async () => {
+  const fragmented = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const retryable = makePayout({ id: 2, distributionId: 7, piconeros: 2_000_000_000n })
+  const models = seedConsolidationHistory(makeFakeModels([fragmented, retryable]), {
+    accountIndex: 1, distributionId: 7, state: 'RELAYED'
+  })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 5_000_000_000n, 3: 2_000_000_000n },
+    throwsOnAccount: { 3: new Error('tx not possible') },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === fragmented.recipientAddress)
+  })
+  const result = await sendPayouts([fragmented, retryable], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, failed: 0, skipped: 2 })
+  expect(wallet.sweepCalls).toEqual([
+    { accountIndex: 3, address: REWARDS_ADDRESS, relay: false }
+  ])
+  const rows = consolidationsOf(models)
+  expect(rows).toHaveLength(2) // the seeded exhausted cycle + generic account-3 recovery
+  expect(rows.filter(r => r.accountIndex === 1)).toHaveLength(1)
+  expect(rows.filter(r => r.accountIndex === 3 && r.state === 'RELAYED')).toHaveLength(1)
+})
+
+test('a restart with an authentic PREPARED recovery and a generic error never sweeps the reserved source', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const reserved = await prepareUnattemptedConsolidation(models, { accountIndex: 1, distributionId: 7 })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    throwsOnAccount: { 1: new Error('tx not possible') }
+  })
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 1 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(wallet.sweepCalls).toHaveLength(0) // legacy recovery never spends the reserved source
+  expect(consolidationsOf(models)).toEqual([reserved]) // retained, never deleted or rewritten
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  const refusal = legacyRecoveryAlert('reserved')
+  expect(refusal[0]).toBe('critical')
+  expect(String(refusal[2])).toContain('source account 1')
+  expect(String(refusal[2])).toContain('distribution 7')
+  expectUncertainRecoveryInstructions(refusal, { accountIndex: 1, distributionId: 7 })
+})
+
+test('a restart with a RELAYED linked cycle and a generic error never burns another recovery fee', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = seedConsolidationHistory(makeFakeModels([p]), {
+    accountIndex: 1, distributionId: 7, state: 'RELAYED'
+  })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    throwsOnAccount: { 1: new Error('tx not possible') }
+  })
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(wallet.sweepCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(1)
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  const refusal = legacyRecoveryAlert('exhausted')
+  expect(refusal[0]).toBe('warn')
+  expect(String(refusal[2])).toContain('distribution 7')
+  expect(String(refusal[2])).toContain('source account 1')
+})
+
+test('a planner omission never consolidates protected funds into a fee-burning no-op', async () => {
+  // No singleton size failure this drive: 12e9 is simply too large for any
+  // account. Account 1's 10e9 is protected by a PREPARED recovery, so it must
+  // not be counted as recovery capacity that would authorize sweeping account
+  // 3's 6e9 for a payout that still cannot be funded.
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 12_000_000_000n })
+  const models = makeFakeModels([p])
+  await prepareUnattemptedConsolidation(models, { accountIndex: 1, distributionId: 7 })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 1_000_000_000n, 1: 10_000_000_000n, 3: 6_000_000_000n }
+  })
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 1 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(wallet.sweepCalls).toHaveLength(0) // protected funds cannot authorize fees
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  expect(consolidationsOf(models)).toHaveLength(1)
+  expect(legacyRecoveryAlert('reserved')[0]).toBe('critical')
+})
+
+test('a planner omission with protected funds still recovers from an independent healthy source', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 7_000_000_000n })
+  const models = makeFakeModels([p])
+  await prepareUnattemptedConsolidation(models, { accountIndex: 1, distributionId: 6 })
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 3_000_000_000n, 1: 3_000_000_000n, 3: 6_000_000_000n }
+  })
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 1 })
+  expect(wallet.sweepCalls).toEqual([
+    { accountIndex: 3, address: REWARDS_ADDRESS, relay: false } // legacy recovery, default shape
+  ])
+  const rows = consolidationsOf(models)
+  expect(rows).toHaveLength(2) // the reservation + the healthy source's new cycle
+  expect(rows.find(row => row.accountIndex === 1)).toMatchObject({ state: 'PREPARED', relayAttemptedAt: null })
+  expect(rows.find(row => row.accountIndex === 3)).toMatchObject({ state: 'RELAYED', distributionId: null })
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+})
+
+test('an unreadable legacy recovery history fails closed without sweeping any source', async () => {
+  const p = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const findMany = models.rewardsWalletTransaction.findMany.bind(models.rewardsWalletTransaction)
+  models.rewardsWalletTransaction.findMany = async args => {
+    if (args?.where?.kind === 'CONSOLIDATION' && args.where.accountIndex === 1) {
+      throw new Error('source history unavailable')
+    }
+    return findMany(args)
+  }
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 20_000_000_000n },
+    throwsOnAccount: { 1: new Error('tx not possible') }
+  })
+  logError.mockClear()
+  alert.mockClear()
+  const result = await sendPayouts([p], { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 1, unpersisted: 0, accountingUnpersisted: 1 })
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(wallet.sweepCalls).toHaveLength(0)
+  expect(consolidationsOf(models)).toHaveLength(0)
+  expect(models.store.get(p.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  const failureLog = logError.mock.calls.find(([fields]) =>
+    fields?.reason === 'legacy-recovery' && fields?.stage === 'history-unavailable')
+  expect(failureLog[0]).toMatchObject({ accountIndex: 1, errorClass: 'unknown' })
+  expect(JSON.stringify(logError.mock.calls)).not.toContain('source history unavailable')
+  expect(legacyRecoveryAlert('history-unavailable')[0]).toBe('critical')
+})
+
+test.each(['throws', 'empty'])('a failed targeted sweep (%s) is not retried by legacy recovery in the same drive', async outcome => {
+  const fragmented = makePayout({ id: 1, distributionId: 7, piconeros: 5_000_000_000n })
+  const retryable = makePayout({ id: 2, distributionId: 7, piconeros: 2_000_000_000n })
+  const models = makeFakeModels([fragmented, retryable])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 5_000_000_000n, 3: 2_000_000_000n },
+    throwsOnAccount: { 3: new Error('tx not possible') },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === fragmented.recipientAddress)
+  })
+  const sweepUnlocked = wallet.sweepUnlocked.bind(wallet)
+  const sweepAttempts = []
+  wallet.sweepUnlocked = async args => {
+    sweepAttempts.push(args.accountIndex)
+    if (args.accountIndex === 1) {
+      if (outcome === 'throws') throw new Error('targeted sweep unavailable')
+      return []
+    }
+    return sweepUnlocked(args)
+  }
+  const result = await sendPayouts([fragmented, retryable], { models, wallet })
+  expect(result).toMatchObject({ sent: 0, failed: 0, skipped: 2, accountingUnpersisted: 0 })
+  expect(sweepAttempts).toEqual([1, 3]) // legacy never repeats the source this drive
+  const rows = consolidationsOf(models)
+  expect(rows).toHaveLength(1)
+  expect(rows[0]).toMatchObject({ accountIndex: 3, state: 'RELAYED' })
+  expect([...models.store.values()].every(row => row.state === 'QUEUED')).toBe(true)
+})
+
+test('an uncertain chunk and a singleton size failure on the same source never consolidate', async () => {
+  const rows = Array.from({ length: 16 }, (_, i) => makePayout({ id: i + 1 }))
+  const special = rows[0]
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 1: 100_000_000_000n },
+    sizeErrorWhen: req => req.destinations.some(d => d.address === special.recipientAddress)
+  })
+  const originalRelay = wallet.relayTx.bind(wallet)
+  wallet.relayTx = async tx => {
+    await originalRelay(tx)
+    throw new Error('timeout after submission') // first successful chunk is uncertain
+  }
+  alert.mockClear()
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toMatchObject({ sent: 0, failed: 0, skipped: 16, accountingUnpersisted: 1 })
+  expect(wallet.sweepCalls).toHaveLength(0) // neither targeted nor legacy recovery
+  expect(consolidationsOf(models)).toHaveLength(0)
+  expect([...models.store.values()].every(p => p.state === 'QUEUED')).toBe(true)
+  const uncertainAlert = alert.mock.calls.find(call => String(call[1]).includes('account-uncertain'))
+  expect(uncertainAlert[1]).toContain('rewards fragmented-inputs recovery account-uncertain')
+  expectUncertainRecoveryInstructions(uncertainAlert, { accountIndex: 1, distributionId: 1 })
+})
+
+test('an unknown relay halts the account after its first chunk and leaves every row queued', async () => {
+  const rows = Array.from({ length: 18 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({ unlockedByAccount: { 1: 100_000_000_000n } })
+  const originalRelay = wallet.relayTx.bind(wallet)
+  wallet.relayTx = async tx => {
+    await originalRelay(tx)
+    throw new Error('timeout after submission')
+  }
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 18, unpersisted: 0, accountingUnpersisted: 1 })
+  expect(wallet.calls).toHaveLength(1)
+  expect(wallet.calls[0].destinations).toHaveLength(15)
+  expect(wallet.relayCalls).toHaveLength(1)
+  expect(wallet.sweepCalls).toHaveLength(0)
+  expect([...models.store.values()].every(p => p.state === 'QUEUED' && p.txHash === null)).toBe(true)
+})
+
+test('an unresolved prepare halts the account without building its later chunk', async () => {
+  const rows = Array.from({ length: 18 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows, { failJournalCreate: 99 })
+  const wallet = makeFakeWallet({ unlockedByAccount: { 1: 100_000_000_000n } })
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 18, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls).toHaveLength(1)
+  expect(wallet.calls[0].destinations).toHaveLength(15)
+  expect(wallet.relayCalls).toHaveLength(0)
+  expect(models.journal.rows.size).toBe(0)
+})
+
+test('a principal persistence failure withholds the next chunk and keeps proven rows counted', async () => {
+  const rows = Array.from({ length: 18 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const update = models.rewardPayout.update.bind(models.rewardPayout)
+  models.rewardPayout.update = async ({ where, data }) => {
+    if (data?.state === 'SENT') throw new Error('db down')
+    return update({ where, data })
+  }
+  const wallet = makeFakeWallet({ unlockedByAccount: { 1: 100_000_000_000n } })
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 15, failed: 0, skipped: 3, unpersisted: 15, accountingUnpersisted: 0 })
+  expect(wallet.calls).toHaveLength(1)
+  expect(wallet.calls[0].destinations).toHaveLength(15)
+  expect(wallet.relayCalls).toHaveLength(1)
+  expect([...models.journal.rows.values()].filter(r => r.kind === 'PAYOUT')).toHaveLength(1)
+  expect(rows.slice(15).every(p => models.store.get(p.id).state === 'QUEUED')).toBe(true)
+})
+
+test('an uncertain chunk on one account preserves another account progress without duplication', async () => {
+  const big = makePayout({ id: 1, piconeros: 30_000_000_000n })
+  const small = Array.from({ length: 18 }, (_, i) => makePayout({ id: i + 2 }))
+  const rows = [big, ...small]
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({ unlockedByAccount: { 0: 31_000_000_000n, 1: 20_000_000_000n } })
+  const originalRelay = wallet.relayTx.bind(wallet)
+  wallet.relayTx = async tx => {
+    const hash = await originalRelay(tx)
+    if (wallet.relayCalls.length === 2) throw new Error('acknowledgement lost')
+    return hash
+  }
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 1, failed: 0, skipped: 18, unpersisted: 0, accountingUnpersisted: 1 })
+  expect(wallet.calls.map(c => c.destinations.length)).toEqual([1, 15])
+  expect(wallet.relayCalls).toHaveLength(2)
+  expect(models.store.get(big.id).state).toBe('SENT')
+  expect(small.every(p => models.store.get(p.id).state === 'QUEUED')).toBe(true)
+  expect([...models.journal.rows.values()].filter(r => r.kind === 'PAYOUT')).toHaveLength(2)
+})
+
+test('all-singleton size rejection stays bounded and leaves every payout queued', async () => {
+  const rows = Array.from({ length: 8 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({ sizeErrorWhen: () => true })
+  logInfo.mockClear()
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 0, failed: 0, skipped: 8, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls).toHaveLength(2 * rows.length - 1)
+  expect(wallet.relayCalls).toHaveLength(1) // only the targeted consolidation relay
+  expect([...models.journal.rows.values()].filter(r => r.kind === 'PAYOUT')).toHaveLength(0)
+  expect([...models.journal.rows.values()].filter(r => r.kind === 'CONSOLIDATION')).toHaveLength(1)
+  const fragmentLog = logInfo.mock.calls.find(([fields]) => fields?.reason === 'fragmented-payout')
+  expect(fragmentLog[0].groups).toEqual([
+    { accountIndex: 0, payoutIds: rows.map(p => p.id), piconeros: '8000000000' }
+  ])
+})
+
+test('a rerun after a partial success only gives fresh hashes to rows still queued', async () => {
+  const rows = Array.from({ length: 16 }, (_, i) => makePayout({ id: i + 1 }))
+  const models = makeFakeModels(rows)
+  const firstWallet = makeFakeWallet({
+    unlockedByAccount: { 1: 16_000_000_000n },
+    fee: 1_000_000_000n
+  })
+  const first = await sendPayouts(rows, { models, wallet: firstWallet })
+  expect(first).toMatchObject({ sent: 15, skipped: 1 })
+  const firstHash = models.store.get(1).txHash
+  const firstJournal = [...models.journal.rows.values()].find(r => r.kind === 'PAYOUT')
+  const secondWallet = makeFakeWallet({
+    unlockedByAccount: { 1: 2_000_000_000n },
+    fee: 1_000_000_000n
+  })
+  const second = await sendPayouts([...models.store.values()].map(p => ({ ...p })), {
+    models,
+    wallet: secondWallet
+  })
+  expect(second).toEqual({ sent: 1, failed: 0, skipped: 0, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(models.store.get(1).txHash).toBe(firstHash)
+  expect(models.store.get(16)).toMatchObject({ state: 'SENT' })
+  expect(models.store.get(16).txHash).not.toBe(firstHash)
+  expect(firstJournal.metadata.payouts.map(p => p.payoutId)).toEqual(rows.slice(0, 15).map(p => p.id))
+  expect([...models.journal.rows.values()].filter(r => r.kind === 'PAYOUT')).toHaveLength(2)
+})
+
+test('a fresh unlocked source-0 wallet resumes remaining QUEUED rows after a linked consolidation without a second sweep or resending SENT chunks', async () => {
+  const sentA = makePayout({
+    id: 1, distributionId: 7, piconeros: 2_000_000_000n, state: 'SENT', txHash: '11'.repeat(32)
+  })
+  const sentB = makePayout({
+    id: 2, distributionId: 7, piconeros: 2_000_000_000n, state: 'SENT', txHash: '22'.repeat(32)
+  })
+  const queuedA = makePayout({ id: 3, distributionId: 7, piconeros: 2_000_000_000n })
+  const queuedB = makePayout({ id: 4, distributionId: 7, piconeros: 1_000_000_000n })
+  const models = seedConsolidationHistory(makeFakeModels([sentA, sentB, queuedA, queuedB]), {
+    id: 901, accountIndex: 0, distributionId: 7, state: 'RELAYED'
+  })
+  const prior = { ...consolidationsOf(models)[0] }
+  expect(prior).toMatchObject({
+    state: 'RELAYED', accountIndex: 0, distributionId: 7, principalPiconeros: 0n
+  })
+
+  // The recovery outputs from that linked consolidation have now unlocked on
+  // primary account 0. The size predicate still exists but permits this
+  // ordinary two-row resume chunk, so no new fragmentation is reported.
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 20_000_000_000n },
+    sizeErrorWhen: req => req.destinations.length > 2
+  })
+  const summary = await sendPayouts(
+    [...models.store.values()].map(p => ({ ...p })),
+    { models, wallet }
+  )
+
+  expect(summary).toEqual({ sent: 2, failed: 0, skipped: 0, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls).toHaveLength(1)
+  expect(wallet.calls[0].destinations.map(d => d.address).sort()).toEqual(
+    [queuedA.recipientAddress, queuedB.recipientAddress].sort()
+  )
+  expect(wallet.relayCalls).toHaveLength(1)
+  expect(wallet.sweepCalls).toHaveLength(0) // the linked cycle is not repeated
+  expect(consolidationsOf(models)).toHaveLength(1)
+  expect(consolidationsOf(models)[0]).toMatchObject({
+    id: prior.id,
+    state: 'RELAYED',
+    txHash: prior.txHash,
+    proofId: prior.proofId,
+    accountIndex: 0,
+    distributionId: 7
+  })
+
+  // Earlier chunks keep their exact hashes; only the resumed rows get the new one.
+  expect(models.store.get(sentA.id)).toMatchObject({ state: 'SENT', txHash: sentA.txHash })
+  expect(models.store.get(sentB.id)).toMatchObject({ state: 'SENT', txHash: sentB.txHash })
+  expect(models.store.get(queuedA.id).state).toBe('SENT')
+  expect(models.store.get(queuedB.id).state).toBe('SENT')
+  expect(models.store.get(queuedA.id).txHash).toBe(models.store.get(queuedB.id).txHash)
+  expect(models.store.get(queuedA.id).txHash).not.toBe(sentA.txHash)
+  expect(models.store.get(queuedA.id).txHash).not.toBe(sentB.txHash)
+  expect([...models.journal.rows.values()].filter(r => r.kind === 'PAYOUT')).toHaveLength(1)
+})
+
+test('a multi-row size split excludes fee-dropped rows from child membership', async () => {
+  const a = makePayout({ id: 1, piconeros: 5_000_000_000n })
+  const b = makePayout({ id: 2, piconeros: 4_000_000_000n })
+  const c = makePayout({ id: 3, piconeros: 3_000_000_000n })
+  const models = makeFakeModels([a, b, c])
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 12_000_000_000n },
+    fee: 2_000_000_000n,
+    sizeErrorWhen: req => req.destinations.length === 2
+  })
+  const result = await sendPayouts([a, b, c], { models, wallet })
+  expect(result).toEqual({ sent: 1, failed: 0, skipped: 2, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls.map(req => req.destinations.length)).toEqual([3, 2, 1, 1])
+  const droppedBuilds = wallet.calls.filter(req =>
+    req.destinations.some(d => d.address === c.recipientAddress))
+  expect(droppedBuilds).toHaveLength(1)
+  expect(models.store.get(a.id).state).toBe('SENT')
+  expect(models.store.get(b.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+  expect(models.store.get(c.id)).toMatchObject({ state: 'QUEUED', txHash: null })
+})
+
+test('phase-3 fills stop at the member cap and never build an oversized transaction', async () => {
+  const planned = Array.from({ length: 15 }, (_, i) => makePayout({ id: i + 1, piconeros: 4_000_000_000n }))
+  const fills = Array.from({ length: 3 }, (_, i) => makePayout({ id: i + 16, piconeros: 1_000_000_000n }))
+  const rows = [...planned, ...fills]
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 60_000_000_000n },
+    fee: 1_000_000_000n
+  })
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 15, failed: 0, skipped: 3, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls.map(req => req.destinations.length)).toEqual([15, 14, 15])
+  expect(wallet.relayCalls).toHaveLength(1)
+  expect(models.store.get(16).state).toBe('SENT')
+  expect(models.store.get(17).state).toBe('QUEUED')
+  expect(models.store.get(18).state).toBe('QUEUED')
+})
+
+test('fills never displace a later planned chunk member', async () => {
+  const planned = Array.from({ length: 15 }, (_, i) => makePayout({ id: i + 1, piconeros: 1_000_000_000n }))
+  const tail = makePayout({ id: 16, piconeros: 200_000_000n })
+  const fills = Array.from({ length: 2 }, (_, i) => makePayout({ id: i + 17, piconeros: 300_000_000n }))
+  const rows = [...planned, tail, ...fills]
+  const models = makeFakeModels(rows)
+  const wallet = makeFakeWallet({
+    unlockedByAccount: { 0: 15_200_000_000n },
+    fee: 400_000_000n
+  })
+  const result = await sendPayouts(rows, { models, wallet })
+  expect(result).toEqual({ sent: 15, failed: 0, skipped: 3, unpersisted: 0, accountingUnpersisted: 0 })
+  expect(wallet.calls.map(req => req.destinations.length)).toEqual([15, 14, 1])
+  expect(models.store.get(16).state).toBe('SENT')
+  expect(models.store.get(17)).toMatchObject({ state: 'QUEUED', txHash: null })
+  expect(models.store.get(18)).toMatchObject({ state: 'QUEUED', txHash: null })
+})
+
 test('a persistently failing pair preparation withholds the dispatch and leaves the payout QUEUED', async () => {
   const p = makePayout({ id: 1, recipientAddress: '5JOURNALFAIL', piconeros: 2_000_000_000n })
   const models = makeFakeModels([p], { failJournalCreate: 99 })
@@ -1587,7 +2893,7 @@ test('boundary 2: a credential-shaped build exception logs only the fixed label 
   let reads = 0
   retryWallet.getUnlockedBalance = async (idx) => {
     reads += 1
-    if (reads > 6) throw credentialShapedError() // planned reads succeed; the dump read fails
+    if (reads > 7) throw credentialShapedError() // six plan reads + one fresh chunk read succeed; the dump read fails
     return readUnlocked(idx)
   }
   logError.mockClear()
@@ -1598,5 +2904,25 @@ test('boundary 2: a credential-shaped build exception logs only the fixed label 
   expect(retryLog[0]).toMatchObject({ errorClass: 'unknown' })
   expect(JSON.stringify(retryLog[0].dump)).not.toContain(SECRET_MARKERS.message)
   expectNoCredentialLeak([retryLog])
+  expectNoCredentialLeak([...logError.mock.calls, ...logWarn.mock.calls])
+})
+
+test('boundary 3: a credential-shaped transaction-size exception logs only the fixed size reason', async () => {
+  const sizeMessage = 'Transaction  would   be  too  large.  Try create_txs()'
+  const p = makePayout({ id: 1, recipientAddress: '5SECRETSIZE', piconeros: 5_000_000_000n })
+  const models = makeFakeModels([p])
+  const wallet = makeFakeWallet({ unlockedByAccount: { 0: 20_000_000_000n } })
+  // The fake createTx seam must throw the ACTUAL credential-shaped error: the
+  // older sizeErrorWhen predicate only returned it and the fake replaced it
+  // with a plain fixed-message Error, making the no-leak assertions vacuous.
+  wallet.createTx = async () => { throw credentialShapedError(sizeMessage) }
+  logError.mockClear()
+  logWarn.mockClear()
+  const summary = await sendPayouts([p], { models, wallet })
+  expect(summary).toMatchObject({ sent: 0, failed: 0, skipped: 1 })
+  const sizeLog = logWarn.mock.calls.find(args => args[0]?.reason === 'transaction-size')
+  expect(sizeLog[0]).toMatchObject({ accountIndex: 0, payoutCount: 1, reason: 'transaction-size' })
+  expect(String(sizeLog[1])).toContain('smaller transactions')
+  expectNoCredentialLeak([sizeLog])
   expectNoCredentialLeak([...logError.mock.calls, ...logWarn.mock.calls])
 })

@@ -593,6 +593,39 @@ function closureFacts ({ ownership, txHash, claims, capturedFeePiconeros, builtS
       }
     }
   }
+  // Authenticated REWARDS/PAYOUT captures may legitimately carry UNKNOWN change:
+  // the pinned SDK leaves getChangeAddress/getChangeAmount unset while the
+  // chain still has a valid change output. Captured facts stay null; permit
+  // ONLY the independently derived source-primary (minor 0) position supplied
+  // by the session's prepared position/address map. This is a derived policy,
+  // never an observed amount: the raw ownership enumeration and the mandatory
+  // D−O−F−E closure still constrain the outputs. Missing mapping or evidence,
+  // a source-set mismatch, or any non-primary owned output remains refused.
+  // Explicitly captured change keeps its stricter existing checks below.
+  let unknownChangePolicyUnresolved = false
+  if (!skipSourceCheck && partitionRequired && claims.journalRole === 'REWARDS' &&
+    claims.kind === 'PAYOUT' && claims.change === null &&
+    (builtStructure?.changeAddress ?? null) === null &&
+    (builtStructure?.changeAmountPiconeros ?? null) === null) {
+    const derivedSources = sortedUnique([...sourceAccounts])
+    const capturedSources = sortedUnique((claims.sourceAccounts ?? []).map(account => String(account)))
+    const mapper = addressForPositionOf(session)
+    const major = derivedSources.length === 1 ? Number(derivedSources[0]) : null
+    const prepared = major !== null && isSafeNonNegativeInt(major) && Array.isArray(session?.derivedPositions)
+      ? session.derivedPositions.find(entry => isPlainObject(entry) &&
+        entry.majorIndex === major && entry.minorIndex === 0)
+      : null
+    const address = prepared ? mapper?.(major, 0) : null
+    if (derivedSources.length !== 1 || capturedSources.length !== 1 ||
+      capturedSources[0] !== derivedSources[0] || mapper === null ||
+      !isPlainObject(prepared) || typeof address !== 'string' || address === '' ||
+      prepared.address !== address) {
+      unknownChangePolicyUnresolved = true
+      addUnresolved(issues, 'CHAIN_EVIDENCE_INCOMPLETE')
+    } else {
+      addPosition(major, 0, address)
+    }
+  }
   for (const captured of positions.values()) {
     const mapper = addressForPositionOf(session)
     const derivedAddress = mapper?.(captured.accountIndex, captured.subaddressIndex)
@@ -610,9 +643,15 @@ function closureFacts ({ ownership, txHash, claims, capturedFeePiconeros, builtS
     }
     const position = `${row.accountIndex}:${row.subaddressIndex}`
     if (partitionRequired && !positions.has(position)) {
-      // Unestablished legacy policy is unresolved, not fabricated capture.
-      if (skipSourceCheck && positions.size === 0) addUnresolved(issues, 'CHAIN_EVIDENCE_INCOMPLETE')
-      else addMaterial(issues, 'OWNED_PARTITION_MISMATCH')
+      // Unestablished legacy / unknown-change policy is unresolved, not
+      // fabricated capture: without a prepare-domain map there is no basis to
+      // call an independently scanned owned output wrong. A source-set or
+      // explicit-capture mismatch is handled by its own material gate.
+      if ((skipSourceCheck || unknownChangePolicyUnresolved) && positions.size === 0) {
+        addUnresolved(issues, 'CHAIN_EVIDENCE_INCOMPLETE')
+      } else {
+        addMaterial(issues, 'OWNED_PARTITION_MISMATCH')
+      }
     }
     positionSums.set(position, (positionSums.get(position) ?? 0n) + row.amountPiconeros)
     O += row.amountPiconeros

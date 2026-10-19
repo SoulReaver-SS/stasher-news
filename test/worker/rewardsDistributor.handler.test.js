@@ -17,6 +17,18 @@ jest.mock(`${process.cwd()}/lib/alert`, () => ({
   alert: jest.fn()
 }))
 
+// The incomplete-summary cases below intentionally exercise the CRITICAL
+// resumable-FAILED path. Mock the logger so expected error output stays out of
+// the pure suite; assertions here remain on database writes and alerts.
+jest.mock(`${process.cwd()}/lib/logger`, () => ({
+  __esModule: true,
+  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+  logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+  logInfo: jest.fn(),
+  logWarn: jest.fn(),
+  logError: jest.fn()
+}))
+
 // reconcileCompletionAccounting reads the configured wallet scope; these pure
 // tests provide a placeholder identity (no wallet is ever opened here) and
 // restore the environment afterwards so the shared worker process stays clean.
@@ -157,6 +169,48 @@ test('scheduleOpsSweep:false completes without a boss and never sends', async ()
   const result = await completeAndEnqueue(models, distribution, jest.fn(), { scheduleOpsSweep: false })
   expect(result).toBe(fresh)
   expect(models.$queryRaw).toHaveBeenCalledTimes(1)
+})
+
+test.each([
+  { sent: 15, failed: 0, skipped: 3, unpersisted: 0, accountingUnpersisted: 0 },
+  { sent: 0, failed: 0, skipped: 18, unpersisted: 0, accountingUnpersisted: 1 },
+  { sent: 18, failed: 0, skipped: 0, unpersisted: 0, accountingUnpersisted: 1 }
+])('an incomplete chunked run never enqueues an ops sweep (%j)', async summary => {
+  const distribution = { id: 7, status: 'FAILED', payouts: [{ id: 1, state: 'QUEUED' }] }
+  const fresh = freshDistribution({ status: 'FAILED', payouts: distribution.payouts })
+  const models = fakeModels({ distribution, fresh })
+  const send = jest.fn()
+  const signer = jest.fn().mockResolvedValue(summary)
+  await completeAndEnqueue(models, distribution, signer, { boss: { send } })
+  expect(signer).toHaveBeenCalledTimes(1)
+  expect(send).not.toHaveBeenCalled()
+  expect(models.$queryRaw.mock.calls.some(([sql]) =>
+    sql.join('').includes("SET status = 'FAILED'"))).toBe(true)
+})
+
+test('a successful chunked run enqueues one delayed sweep for payouts under two hashes', async () => {
+  const distribution = {
+    id: 7,
+    status: 'FAILED',
+    payouts: [{ id: 1, state: 'QUEUED' }, { id: 2, state: 'QUEUED' }]
+  }
+  const fresh = freshDistribution({
+    status: 'COMPLETE',
+    payouts: [
+      { id: 1, state: 'SENT', txHash: 'a'.repeat(64) },
+      { id: 2, state: 'SENT', txHash: 'b'.repeat(64) }
+    ]
+  })
+  const models = fakeModels({ distribution, fresh })
+  const send = jest.fn().mockResolvedValue('job-id')
+  const signer = jest.fn().mockResolvedValue({
+    sent: 18, failed: 0, skipped: 0, unpersisted: 0, accountingUnpersisted: 0
+  })
+  await completeAndEnqueue(models, distribution, signer, { boss: { send } })
+  expect(signer).toHaveBeenCalledTimes(1)
+  expect(send).toHaveBeenCalledTimes(1) // one distribution completion, not one per payout tx
+  expect(send).toHaveBeenCalledWith('opsSweep', { distributionId: 7 },
+    { startAfter: OPS_SWEEP_DELAY_SECONDS, singletonKey: 'opsSweep-7' })
 })
 
 test.each([

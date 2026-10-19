@@ -7,6 +7,7 @@ import { readNextRewardsPool } from '@/lib/rewardsPool'
 import { readRewardsInflow } from '@/api/monero/rewardsInflow'
 import { readRewardsWalletLedger } from '@/api/monero/rewardsLedger'
 import { planPartialAccountSends } from '@/api/monero/rewardsPlan'
+import { MAX_PAYOUTS_PER_TX, bisectPayouts, chunkPayouts, isTransactionSizeError, sizeRecoveryDecision } from '@/api/monero/rewardsBatchPolicy'
 import {
   assertWalletScope,
   errorLabel,
@@ -244,7 +245,10 @@ function resolveNetworkType (api, env) {
 // Send a batch of RewardPayout rows split across the wallet's signer accounts:
 // unlocked balances are aggregated over accounts 0 + fee pools 1-5, whole
 // payouts are packed largest-first onto the accounts that can host them, and
-// each account's slice goes out as ONE multi-output on-chain tx. Planning
+// each account's slice is relayed as sequential whole-payout chunks of at most
+// MAX_PAYOUTS_PER_TX. A chunk the signer still rejects for size is bisected
+// until every member is sent, split further, or identified as a singleton too
+// large for any transaction. Planning
 // prefers the existing fee-reserved complete plan, then the same complete plan
 // unreserved (validated by the real createTx fee), then a deterministic
 // largest-first partial plan: during genuine shortage the largest affordable
@@ -261,15 +265,15 @@ function resolveNetworkType (api, env) {
 // state could not be persisted; an uncertain attempt leaves recipients QUEUED
 // until a fresh confirmed verification resolves it and it is never blindly re-relayed.
 //
-// Each account's batch is built create-then-relay: createTx({ relay: false })
+// Each chunk is built create-then-relay: createTx({ relay: false })
 // constructs + validates the tx (including its real fee) WITHOUT moving funds.
-// When the fee pushes a bucket over the account's unlocked balance, the
-// smallest payout is dropped and the bucket rebuilt — dropped payouts stay
-// QUEUED (resumable). A retryable "tx not possible" is a whole-bucket skip with
-// its diagnostic dump. After a reduced bucket builds, still-unassigned payouts
+// When the fee pushes a chunk over the account's unlocked balance, the
+// smallest payout is dropped and the chunk rebuilt — dropped payouts stay
+// QUEUED (resumable). A retryable "tx not possible" is a whole-chunk skip with
+// its diagnostic dump. After a reduced chunk builds, still-unassigned payouts
 // get one true-fee fill attempt each (largest first) against the residual
 // capacity after the built fee, without claiming global bin packing. A payout
-// is never split across txs and never assigned to two buckets.
+// is never split across txs and never assigned to two chunks/buckets.
 //
 // Fund-safety (unchanged): a hard createTx error marks the batch FAILED, but
 // the funds stay in the wallet (no loss of principal); a CRITICAL alert +
@@ -415,13 +419,14 @@ export async function sendPayouts (payouts, { models, wallet } = {}) {
   const retryableOmitted = []
   const filledIds = new Set()
   const attemptedFillIds = new Set()
+  const fragmentedGroups = []
+  const uncertainAccounts = new Set()
   // Unassigned whole payouts eligible for ONE true-fee fill attempt each,
   // shared across buckets so no payout is ever assigned to two of them.
   const fillPool = [...plannerSkipped]
 
   for (const bucket of buckets) {
-    const r = await relayBucketTx(w, models, bucket.accountIndex, bucket.payouts, {
-      unlockedAtPlan: unlockedByAccount[bucket.accountIndex],
+    const r = await relayAccountChunks(w, models, bucket.accountIndex, bucket.payouts, {
       fillPool,
       attemptedFillIds,
       scope
@@ -436,6 +441,10 @@ export async function sendPayouts (payouts, { models, wallet } = {}) {
     buildOmitted.push(...(r.dropped || []))
     retryableOmitted.push(...(r.retryableSkipped || []))
     for (const p of r.filled || []) filledIds.add(p.id)
+    if (r.accountUncertain) uncertainAccounts.add(bucket.accountIndex)
+    if (r.fragmented.length > 0) {
+      fragmentedGroups.push({ accountIndex: bucket.accountIndex, payouts: r.fragmented })
+    }
   }
 
   // A planner-skipped row is omitted only if no bucket ever attempted to fill
@@ -477,6 +486,33 @@ export async function sendPayouts (payouts, { models, wallet } = {}) {
       piconeros: retryableOmitted.reduce((acc, p) => acc + p.piconeros, 0n).toString()
     }, 'sendPayouts: retryable build omissions — the account build failed pre-relay; these whole payouts stay QUEUED')
   }
+  if (fragmentedGroups.length > 0) {
+    logInfo({
+      reason: 'fragmented-payout',
+      groups: fragmentedGroups.map(group => ({
+        accountIndex: group.accountIndex,
+        payoutIds: group.payouts.map(p => p.id),
+        piconeros: group.payouts.reduce((acc, p) => acc + p.piconeros, 0n).toString()
+      }))
+    }, 'sendPayouts: fragmented omissions — each whole payout alone exceeds the transaction limit (stay QUEUED)')
+  }
+  if (uncertainAccounts.size > 0) {
+    logWarn({
+      reason: 'account-uncertain',
+      accountIndexes: [...uncertainAccounts].sort((a, b) => a - b)
+    }, 'sendPayouts: unresolved account accounting stopped further chunks; no same-account retry this run')
+  }
+
+  // Targeted fragmentation recovery (Task 4): at most ONE bounded
+  // consolidation cycle per fragmented distribution/source-account pair. The
+  // durable CONSOLIDATION history is read BEFORE building anything; a failed
+  // read, a PREPARED reservation, or an already-spent pair withholds the sweep.
+  // Every fragmented source is excluded from legacy recovery below, whatever
+  // its decision, so a generic failure elsewhere cannot bypass this budget.
+  const sizeRecovery = await recoverFragmentedSources(w, models, scope, fragmentedGroups, uncertainAccounts)
+  accountingUnpersisted += sizeRecovery.accountingFailures
+  const sizeRecoveryAccounts = sizeRecovery.sizeRecoveryAccounts
+  const attemptedAccounts = new Set(sizeRecovery.attemptedAccounts)
 
   // Consolidation is useful-recovery only: a retryable pre-relay build failure,
   // or an unassigned payout no single account can cover but the aggregate can
@@ -486,22 +522,303 @@ export async function sendPayouts (payouts, { models, wallet } = {}) {
   // that cannot cure the remainder. A true aggregate shortage never
   // consolidates: repeated shortage runs must not burn repeated needless sweep
   // fees (spec §6). No recovery candidates means no extra balance reads.
+  //
+  // Durable history gates EVERY candidate source, including this legacy branch
+  // after a generic retryable error or planner omission with no singleton-size
+  // failure this drive: a PREPARED cycle reserves its source across
+  // distributions and an existing linked cycle exhausts that pair. A failed
+  // history read is accounting uncertainty (fail-closed). Protected accounts
+  // are excluded from the affordability calculation too, so their funds cannot
+  // authorize fee-burning sweeps of unprotected accounts.
   const unassigned = [...plannerOmitted, ...buildOmitted, ...retryableOmitted]
-  let consolidationNeeded = retryableBuildFailure
-  if (!consolidationNeeded && unassigned.length > 0) {
-    const freshUnlocked = {}
-    for (const idx of SIGNER_ACCOUNTS) freshUnlocked[idx] = BigInt(await w.getUnlockedBalance(idx))
-    consolidationNeeded = consolidationCanHelp(unassigned, freshUnlocked)
-  }
-  if (consolidationNeeded) {
-    const consolidation = await consolidateFeeAccounts(w, models, scope, {
-      reason: retryableBuildFailure ? 'retryable-build-failure' : 'oversized-payout'
-    })
-    accountingUnpersisted += consolidation.accountingFailures
+  if (unassigned.length > 0) {
+    const legacyAccountIndices = SIGNER_ACCOUNTS.filter(idx =>
+      idx !== 0 &&
+      !uncertainAccounts.has(idx) &&
+      !sizeRecoveryAccounts.has(idx) &&
+      !attemptedAccounts.has(idx))
+    if (legacyAccountIndices.length > 0) {
+      const distributionIds = new Set(unassigned
+        .map(p => p.distributionId)
+        .filter(id => id !== null && id !== undefined)
+        .map(String))
+      const sourceGate = await gateLegacyRecoverySources(models, scope, legacyAccountIndices, distributionIds)
+      accountingUnpersisted += sourceGate.accountingFailures
+      if (sourceGate.eligible.length > 0 && !uncertainAccounts.has(0)) {
+        // The primary is the sweep destination: only an unresolved reservation
+        // (or an unreadable history) withholds it; a spent pair there is not a
+        // source-budget violation for the fee accounts being swept.
+        const primaryGate = await gateLegacyRecoverySources(models, scope, [0], distributionIds, { asSource: false })
+        accountingUnpersisted += primaryGate.accountingFailures
+        if (primaryGate.eligible.length > 0) {
+          let consolidationNeeded = retryableBuildFailure
+          if (!consolidationNeeded) {
+            const freshUnlocked = {}
+            for (const idx of [0, ...sourceGate.eligible]) {
+              freshUnlocked[idx] = BigInt(await w.getUnlockedBalance(idx))
+            }
+            consolidationNeeded = consolidationCanHelp(unassigned, freshUnlocked)
+          }
+          if (consolidationNeeded) {
+            const consolidation = await consolidateFeeAccounts(w, models, scope, {
+              reason: retryableBuildFailure ? 'retryable-build-failure' : 'oversized-payout',
+              accountIndices: sourceGate.eligible
+            })
+            accountingUnpersisted += consolidation.accountingFailures
+          }
+        }
+      }
+    }
   }
 
   setBalanceGauge(models, totalUnlocked - sentPiconeros)
   return { sent, failed, skipped, unpersisted, accountingUnpersisted }
+}
+
+// One operator-facing contract for every targeted recovery refusal/failure.
+// The body always names the distribution and source account and gives a
+// resumable instruction; uncertain paths add the mandatory stop/reconcile-first
+// wording so an operator can never read this as permission to resend or tear
+// down the durable attempt.
+function alertFragmentedRecovery ({ stage, accountIndex, distributionId, detail, uncertain = false, critical = false }) {
+  const guidance = uncertain
+    ? 'Stop. First resolve the exact existing journal/reservation through the existing verification flow; do not resend or delete the journal/proof and do not cancel or tear down the attempt. Then wait for the wallet to report ANY actually relayed recovery outputs unlocked, and only then resume payouts with scripts/requeue-failed-payouts.js.'
+    : 'No consolidation transaction or output was created by this refusal. Resolve the reported source condition, then check that the wallet reports unlocked funds before resuming with scripts/requeue-failed-payouts.js.'
+  alert(uncertain || critical ? 'critical' : 'warn', `rewards fragmented-inputs recovery ${stage}`,
+    `distribution ${distributionId} source account ${accountIndex}: ${detail} ${guidance}`,
+    { dedupeKey: `rewards-fragmented-inputs-${stage}-${accountIndex}-${distributionId}` })
+}
+
+// Legacy generic recovery has the same durable stop conditions as targeted
+// recovery. The same operator-facing refusal/uncertainty contract is reused so
+// a restart cannot silently reinterpret a reserved or exhausted source.
+function alertLegacyRecovery ({ stage, accountIndex, distributionIds, detail, uncertain = false }) {
+  const guidance = uncertain
+    ? 'Stop. First resolve the exact existing journal/reservation through the existing verification flow; do not resend or delete the journal/proof and do not cancel or tear down the attempt. Then wait for the wallet to report ANY actually relayed recovery outputs unlocked, and only then resume payouts with scripts/requeue-failed-payouts.js.'
+    : 'No consolidation transaction or output was created by this refusal. Resolve the reported source condition, then check that the wallet reports unlocked funds before resuming with scripts/requeue-failed-payouts.js.'
+  const distributions = [...distributionIds].sort().join(',') || 'unknown'
+  alert(uncertain ? 'critical' : 'warn', `rewards legacy recovery ${stage}`,
+    `distribution ${distributions} source account ${accountIndex}: ${detail} ${guidance}`,
+    { dedupeKey: `rewards-legacy-recovery-${stage}-${accountIndex}` })
+}
+
+async function readConsolidationHistory (models, scope, accountIndex) {
+  return await models.rewardsWalletTransaction.findMany({
+    where: {
+      network: scope.network,
+      walletAddress: scope.walletAddress,
+      kind: 'CONSOLIDATION',
+      accountIndex
+    },
+    orderBy: { id: 'asc' }
+  })
+}
+
+// A PREPARED consolidation is a durable reservation of its source account for
+// EVERY distribution. For an actual source, any existing linked cycle for one
+// of this drive's distributions exhausts that distribution/source pair. The
+// primary account is only a legacy sweep DESTINATION, so an exhausted pair
+// there is not a reason to refuse a sweep from a different source; an
+// unresolved PREPARED destination still is.
+function legacyRecoveryDecision (rows, { accountIndex, distributionIds, asSource = true }) {
+  const source = (rows || []).filter(row => row.accountIndex === accountIndex)
+  if (source.some(row => row.state === 'PREPARED')) return 'reserved'
+  const linked = new Set([...distributionIds].map(String))
+  if (asSource && source.some(row =>
+    row.distributionId !== null && row.distributionId !== undefined && linked.has(String(row.distributionId)))) {
+    return 'exhausted'
+  }
+  return 'eligible'
+}
+
+// Gate every legacy recovery source through the scoped durable history BEFORE
+// any sweep is built. A required read failure (and a PREPARED reservation)
+// withholds the source and adds one accounting-uncertainty item; an exhausted
+// pair withholds it without claiming unresolved accounting. Sources with no
+// such protection stay eligible, preserving existing generic recovery.
+async function gateLegacyRecoverySources (models, scope, accountIndices, distributionIds, { asSource = true } = {}) {
+  const eligible = []
+  let accountingFailures = 0
+  for (const accountIndex of accountIndices) {
+    let rows
+    try {
+      rows = await readConsolidationHistory(models, scope, accountIndex)
+    } catch (err) {
+      accountingFailures += 1
+      logError({ reason: 'legacy-recovery', stage: 'history-unavailable', accountIndex, distributionIds: [...distributionIds].sort().join(','), errorClass: errorLabel(err) },
+        'sendPayouts: legacy recovery history unavailable — withholding the source (fail-closed)')
+      alertLegacyRecovery({
+        stage: 'history-unavailable',
+        accountIndex,
+        distributionIds,
+        uncertain: true,
+        detail: 'the durable consolidation history could not be read, so no legacy recovery sweep was attempted.'
+      })
+      continue
+    }
+    const decision = legacyRecoveryDecision(rows, { accountIndex, distributionIds, asSource })
+    if (decision === 'reserved') {
+      accountingFailures += 1
+      logWarn({ reason: 'legacy-recovery', stage: 'reserved', accountIndex, distributionIds: [...distributionIds].sort().join(',') },
+        'sendPayouts: legacy recovery reserved — an unresolved consolidation already owns this source account')
+      alertLegacyRecovery({
+        stage: 'reserved',
+        accountIndex,
+        distributionIds,
+        uncertain: true,
+        detail: 'a PREPARED consolidation is unresolved, so no legacy recovery sweep was attempted.'
+      })
+      continue
+    }
+    if (decision === 'exhausted') {
+      logWarn({ reason: 'legacy-recovery', stage: 'exhausted', accountIndex, distributionIds: [...distributionIds].sort().join(',') },
+        'sendPayouts: legacy recovery budget already spent for this distribution/source — operator investigation required')
+      alertLegacyRecovery({
+        stage: 'exhausted',
+        accountIndex,
+        distributionIds,
+        detail: 'a durable size-recovery cycle already exists for this distribution/source. No further automatic sweep is authorized; investigate the continuing recovery failure.'
+      })
+      continue
+    }
+    eligible.push(accountIndex)
+  }
+  return { eligible, accountingFailures }
+}
+
+// Read the scoped durable recovery history for every fragmented source account
+// and run only the eligible targeted cycles. Returns the full size-recovery
+// account set (including blocked/exhausted decisions) plus the accounts whose
+// sweep was actually invoked, so the legacy branch can never revisit them in
+// this drive. History is fail-closed: an unreadable query never means absence.
+async function recoverFragmentedSources (w, models, scope, fragmentedGroups, uncertainAccounts) {
+  const byAccount = new Map()
+  for (const group of fragmentedGroups) {
+    let byDistribution = byAccount.get(group.accountIndex)
+    if (!byDistribution) {
+      byDistribution = new Map()
+      byAccount.set(group.accountIndex, byDistribution)
+    }
+    for (const payout of group.payouts) {
+      let payouts = byDistribution.get(payout.distributionId)
+      if (!payouts) {
+        payouts = []
+        byDistribution.set(payout.distributionId, payouts)
+      }
+      payouts.push(payout)
+    }
+  }
+
+  const attempted = new Set()
+  const blockedAccounts = new Set()
+  let accountingFailures = 0
+
+  for (const [accountIndex, byDistribution] of byAccount) {
+    const distributionIds = [...byDistribution.keys()]
+    if (uncertainAccounts.has(accountIndex)) {
+      // The chunk runner already halted this account on unresolved accounting;
+      // a targeted sweep on top of it would be another blind spend.
+      logWarn({ reason: 'fragmented-inputs', stage: 'account-uncertain', accountIndex, distributionIds },
+        'sendPayouts: fragmented recovery withheld — the source account has an unresolved relay this run')
+      alertFragmentedRecovery({
+        stage: 'account-uncertain',
+        accountIndex,
+        distributionId: distributionIds.join(','),
+        uncertain: true,
+        detail: 'the source account has an unresolved relay, so no targeted consolidation was attempted.'
+      })
+      continue
+    }
+
+    let history
+    try {
+      history = await readConsolidationHistory(models, scope, accountIndex)
+    } catch (err) {
+      blockedAccounts.add(accountIndex)
+      logError({ reason: 'fragmented-inputs', stage: 'history-unavailable', accountIndex, distributionIds, errorClass: errorLabel(err) },
+        'sendPayouts: fragmented recovery history unavailable — withholding the sweep (fail-closed)')
+      alertFragmentedRecovery({
+        stage: 'history-unavailable',
+        accountIndex,
+        distributionId: distributionIds.join(','),
+        uncertain: true,
+        detail: 'the durable consolidation history could not be read, so no recovery sweep was attempted.'
+      })
+      continue
+    }
+
+    const rows = history || []
+    if (rows.some(row => row.accountIndex === accountIndex && row.state === 'PREPARED')) {
+      // ANY reserved/attempted consolidation on this source blocks a new cycle,
+      // even when it belongs to another distribution.
+      blockedAccounts.add(accountIndex)
+      logWarn({ reason: 'fragmented-inputs', stage: 'reserved', accountIndex, distributionIds },
+        'sendPayouts: fragmented recovery reserved — an unresolved consolidation already owns this source account')
+      alertFragmentedRecovery({
+        stage: 'reserved',
+        accountIndex,
+        distributionId: distributionIds.join(','),
+        uncertain: true,
+        detail: 'a PREPARED consolidation is unresolved, so no recovery sweep was attempted.'
+      })
+      continue
+    }
+
+    for (const [distributionId, payouts] of byDistribution) {
+      const decision = sizeRecoveryDecision(rows, { distributionId, accountIndex })
+      if (decision === 'exhausted') {
+        logWarn({ reason: 'fragmented-inputs', stage: 'exhausted', accountIndex, distributionId },
+          'sendPayouts: fragmented recovery budget already spent for this distribution/source — operator investigation required')
+        alertFragmentedRecovery({
+          stage: 'exhausted',
+          accountIndex,
+          distributionId,
+          detail: 'a durable size-recovery cycle already exists for this distribution/source. No further automatic sweep is authorized; investigate the continuing singleton size failure.'
+        })
+        continue
+      }
+      if (decision !== 'eligible') continue // defensive: PREPARED handled account-wide above
+      if (attempted.has(accountIndex)) {
+        logWarn({
+          reason: 'fragmented-inputs',
+          stage: 'suppressed-mixed-distribution',
+          accountIndex,
+          distributionId,
+          payoutIds: payouts.map(p => p.id),
+          piconeros: payouts.reduce((acc, p) => acc + p.piconeros, 0n).toString()
+        }, 'sendPayouts: fragmented recovery already used this source account this drive — later distribution group stays QUEUED')
+        alertFragmentedRecovery({
+          stage: 'suppressed-mixed-distribution',
+          accountIndex,
+          distributionId,
+          detail: 'another distribution group on this source was not swept because the bounded one-cycle-per-source-per-drive recovery was already used this drive.'
+        })
+        continue
+      }
+
+      const minimumRecoveryPiconeros = payouts.reduce(
+        (min, p) => (p.piconeros < min ? p.piconeros : min), payouts[0].piconeros
+      ) + TX_FEE_HEADROOM_PICONEROS
+      const result = await consolidateFeeAccounts(w, models, scope, {
+        reason: 'fragmented-inputs',
+        accountIndices: [accountIndex],
+        distributionId,
+        minimumRecoveryPiconeros,
+        sweepEachSubaddress: false
+      })
+      accountingFailures += result.accountingFailures
+      for (const idx of result.attemptedAccounts) attempted.add(idx)
+    }
+  }
+
+  // One accounting-uncertainty item per source account whose recovery was
+  // withheld by an unreadable or reserved history, never one per subgroup.
+  accountingFailures += blockedAccounts.size
+  return {
+    accountingFailures,
+    sizeRecoveryAccounts: new Set(byAccount.keys()),
+    attemptedAccounts: [...attempted]
+  }
 }
 
 // Can consolidation actually help an unassigned payout? Only when a payout no
@@ -615,14 +932,15 @@ async function reconcileUnpersistedPayouts (w, models, queued) {
 
 // Incident diagnostics (2026-09-28 handoff, tiers 1+2): when a pre-relay build
 // fails with the "tx not possible" class, capture the wallet's view AT THE
-// FAILURE INSTANT plus the plan-time unlocked snapshot, so the next occurrence
-// can discriminate the four hypotheses: fee-estimate spike (needed = sum +
-// est_fee > unlocked), plan->build state change, wallet/daemon height
-// divergence, balance-vs-spendable output disagreement. Every read is
+// FAILURE INSTANT plus the fresh unlocked snapshot read immediately BEFORE this
+// chunk's build, so the next occurrence can discriminate the four hypotheses:
+// fee-estimate spike (needed = sum + est_fee > unlocked), pre-build->failure
+// state change, wallet/daemon height divergence, balance-vs-spendable output
+// disagreement. The original account-planning snapshot is not retained here. Every read is
 // individually guarded — a diagnostic must NEVER break the payout flow — and
 // every BigInt is stringified (pino cannot serialize BigInt). Absent getOutputs
 // reads as null; a throwing or absent method otherwise reports 'read-failed: <msg>'.
-async function dumpBuildFailureState (w, accountIndex, unlockedAtPlan) {
+async function dumpBuildFailureState (w, accountIndex, unlockedBeforeBuild) {
   const guard = async (fn) => {
     try {
       const v = await fn()
@@ -648,7 +966,7 @@ async function dumpBuildFailureState (w, accountIndex, unlockedAtPlan) {
     walletHeight,
     daemonHeight,
     unspentOutputs,
-    unlockedAtPlan: unlockedAtPlan === undefined ? null : String(BigInt(unlockedAtPlan))
+    unlockedBeforeBuild: unlockedBeforeBuild === undefined ? null : String(BigInt(unlockedBeforeBuild))
   }
 }
 
@@ -670,26 +988,33 @@ const byLargestPayout = (a, b) => (a.piconeros > b.piconeros ? -1 : a.piconeros 
 // Three bounded phases (no unbounded loops, no revisits of rejected rows):
 //   1. planned members with drop-smallest rebuilds when the real fee overflows
 //      the account — dropped members stay QUEUED;
-//   2. if the bucket drained without a transaction, still-unassigned whole
+//   2. if the chunk drained without a transaction, still-unassigned whole
 //      payouts are validated largest-first (one attempt each) so an affordable
 //      smaller reward is never lost behind a larger row that overdrew its fee;
 //   3. once a tx exists, ONE true-fee fill attempt per remaining unassigned row
 //      against the residual capacity after the built fee (iterating a snapshot,
 //      so splicing an accepted row never skips the next candidate).
-// A retryable "tx not possible" always skips the whole bucket (no tx exists)
+// A retryable "tx not possible" always skips the whole chunk (no tx exists)
 // with the incident diagnostic dump. Hard errors on planned members mark them
 // FAILED; a hard error on a fill candidate marks ONLY that candidate FAILED
 // (funds stayed) while the valid base transaction is kept.
 // Returns { tx, batch, dropped, failed, filled, retryableSkipped,
-// retryableBuildFailure }: `batch` is the row list of the built tx, `dropped`
-// are fee-fit rows that stay QUEUED, `failed` are rows to persist FAILED,
-// `retryableSkipped` are QUEUED rows skipped by the retryable build failure,
-// and `filled` are the accepted fill candidates.
-async function buildBucketBatch (w, accountIndex, payouts, { unlockedAtPlan, fillPool = [], attemptedFillIds = new Set() } = {}) {
+// retryableBuildFailure, splitRequired, sizeSkipped, fragmented }: `batch` is
+// the row list of the built tx, `dropped` are fee-fit rows that stay QUEUED,
+// `failed` are rows to persist FAILED, `retryableSkipped` are QUEUED rows
+// skipped by the retryable build failure, and `filled` are the accepted fill
+// candidates. `splitRequired` are the remaining planned members of a
+// size-rejected multi-row build (still QUEUED until split into child groups),
+// while `sizeSkipped` are whole payouts a size rejection left QUEUED and
+// `fragmented` is the singleton subset of `sizeSkipped`.
+async function buildBucketBatch (w, accountIndex, payouts, { unlockedBeforeBuild, fillPool = [], attemptedFillIds = new Set() } = {}) {
   const batch = [...payouts]
   const dropped = []
   const failed = []
   const filled = []
+  const splitRequired = []
+  const sizeSkipped = []
+  const fragmented = []
   let retryableSkipped = []
   let retryableBuildFailure = false
   let tx = null
@@ -703,6 +1028,16 @@ async function buildBucketBatch (w, accountIndex, payouts, { unlockedAtPlan, fil
       })
       break // fits including the real fee
     } catch (err) {
+      if (isTransactionSizeError(err)) {
+        if (batch.length > 1) splitRequired.push(...batch)
+        else {
+          sizeSkipped.push(...batch)
+          fragmented.push(...batch)
+        }
+        logWarn({ accountIndex, payoutCount: batch.length, reason: 'transaction-size' },
+          'sendPayouts: payout build requires smaller transactions (nothing relayed)')
+        return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure: false, splitRequired, sizeSkipped, fragmented }
+      }
       if (isRetryableTxBuildError(err)) {
         // Pre-relay build failure: createTx threw, so no tx exists and
         // provably nothing was broadcast (2026-09-28 incident). Retryable
@@ -710,18 +1045,18 @@ async function buildBucketBatch (w, accountIndex, payouts, { unlockedAtPlan, fil
         // and a useful-only consolidation may sweep the account for a fresh
         // output set. NO drop-smallest loop here: each failed attempt cost
         // ~6.5 min in the incident and this is not a marginal fee-fit condition.
-        const dump = await dumpBuildFailureState(w, accountIndex, unlockedAtPlan)
+        const dump = await dumpBuildFailureState(w, accountIndex, unlockedBeforeBuild)
         logWarn({ accountIndex, payoutCount: batch.length, dump, errorClass: errorLabel(err) },
           'sendPayouts: account batch build failed pre-relay (retryable) — payouts stay QUEUED, resumable')
         retryableSkipped = [...batch]
         retryableBuildFailure = true
-        return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure }
+        return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure, splitRequired, sizeSkipped, fragmented }
       }
       if (!isBalanceError(err)) {
         // Hard error: funds stayed in the wallet.
         logError({ accountIndex, payoutCount: batch.length, errorClass: errorLabel(err) }, 'sendPayouts: account batch FAILED (funds stayed in wallet)')
         failed.push(...batch)
-        return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure: false }
+        return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure: false, splitRequired, sizeSkipped, fragmented }
       }
       if (batch.length === 1) {
         // The only member cannot cover its fee: it stays QUEUED, but smaller
@@ -738,7 +1073,7 @@ async function buildBucketBatch (w, accountIndex, payouts, { unlockedAtPlan, fil
     if (poolIndex >= 0) fillPool.splice(poolIndex, 1)
   }
 
-  // Phase 2: the bucket drained without a transaction (every planned member
+  // Phase 2: the chunk drained without a transaction (every planned member
   // overflows its fee). Continue largest-first validation of still-unassigned
   // whole payouts on this account — at most one attempt per row.
   if (!tx && fillPool.length > 0) {
@@ -756,14 +1091,21 @@ async function buildBucketBatch (w, accountIndex, payouts, { unlockedAtPlan, fil
         removeFromPool(candidate)
         break // the largest affordable candidate becomes the base; phase 3 fills
       } catch (err) {
+        if (isTransactionSizeError(err)) {
+          sizeSkipped.push(candidate)
+          fragmented.push(candidate)
+          logWarn({ accountIndex, payoutId: candidate.id, reason: 'transaction-size' },
+            'sendPayouts: unassigned payout build requires a smaller transaction — payout stays QUEUED')
+          continue
+        }
         if (isRetryableTxBuildError(err)) {
-          const dump = await dumpBuildFailureState(w, accountIndex, unlockedAtPlan)
+          const dump = await dumpBuildFailureState(w, accountIndex, unlockedBeforeBuild)
           logWarn({ accountIndex, payoutId: candidate.id, dump, errorClass: errorLabel(err) },
             'sendPayouts: unassigned payout build failed pre-relay (retryable) — bucket stays QUEUED, resumable')
           // Counted once via retryableSkipped (never also in dropped).
           retryableSkipped = [candidate]
           retryableBuildFailure = true
-          return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure }
+          return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure, splitRequired, sizeSkipped, fragmented }
         }
         if (isBalanceError(err)) {
           // Cannot cover its own fee: stays QUEUED; never revisited.
@@ -782,14 +1124,15 @@ async function buildBucketBatch (w, accountIndex, payouts, { unlockedAtPlan, fil
   // Phase 3: true-fee filling. Snapshot the pool: splicing an accepted candidate
   // out of the live array must never shift the next candidate behind the
   // iterator. ONE attempt per previously unassigned row; rejected rows are
-  // never revisited; accepted fills are consumed so no bucket can reuse them.
+  // never revisited; accepted fills are consumed so no chunk can reuse them.
   if (tx) {
     for (const candidate of [...fillPool]) {
+      if (batch.length >= MAX_PAYOUTS_PER_TX) break
       if (candidate == null || attemptedFillIds.has(candidate.id)) continue
       const fee = typeof tx.getFee === 'function' ? BigInt(await tx.getFee()) : 0n
       const spend = batch.reduce((acc, p) => acc + p.piconeros, 0n) + fee
-      const residual = unlockedAtPlan == null ? null : BigInt(unlockedAtPlan) - spend
-      if (residual == null || residual < candidate.piconeros) continue // may fit another bucket later
+      const residual = unlockedBeforeBuild == null ? null : BigInt(unlockedBeforeBuild) - spend
+      if (residual == null || residual < candidate.piconeros) continue // may fit another chunk later
       attemptedFillIds.add(candidate.id)
       let nextTx
       try {
@@ -799,13 +1142,19 @@ async function buildBucketBatch (w, accountIndex, payouts, { unlockedAtPlan, fil
           relay: false
         })
       } catch (err) {
+        if (isTransactionSizeError(err)) {
+          sizeSkipped.push(candidate)
+          logWarn({ accountIndex, payoutId: candidate.id, reason: 'transaction-size' },
+            'sendPayouts: true-fee fill requires a smaller transaction — payout stays QUEUED, base bucket kept')
+          continue
+        }
         if (isRetryableTxBuildError(err)) {
-          const dump = await dumpBuildFailureState(w, accountIndex, unlockedAtPlan)
+          const dump = await dumpBuildFailureState(w, accountIndex, unlockedBeforeBuild)
           logWarn({ accountIndex, payoutCount: batch.length + 1, dump, errorClass: errorLabel(err) },
-            'sendPayouts: account batch fill failed pre-relay (retryable) — whole bucket stays QUEUED, resumable')
+            'sendPayouts: current chunk fill failed pre-relay (retryable) — this chunk stays QUEUED; the unstarted remainder was not attempted, resumable')
           retryableSkipped = [...batch, candidate]
           retryableBuildFailure = true
-          return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure }
+          return { tx: null, batch: [], dropped, failed, filled, retryableSkipped, retryableBuildFailure, splitRequired, sizeSkipped, fragmented }
         }
         if (isBalanceError(err)) {
           logWarn({ accountIndex, payoutId: candidate.id, piconeros: candidate.piconeros.toString() },
@@ -827,16 +1176,16 @@ async function buildBucketBatch (w, accountIndex, payouts, { unlockedAtPlan, fil
     }
   }
 
-  return { tx, batch, dropped, failed, filled, retryableSkipped, retryableBuildFailure }
+  return { tx, batch, dropped, failed, filled, retryableSkipped, retryableBuildFailure, splitRequired, sizeSkipped, fragmented }
 }
 
 // Build + journal + relay a batch tx from ONE account. The built tx is
 // journaled (Task 6 boundary) BEFORE any relay; a journal failure means nothing
-// is relayed and the bucket stays QUEUED. Returns the split so sendPayouts can
-// tally: a payout is never split across txs — it is sent whole or skipped whole.
+// is relayed and the whole chunk stays QUEUED. Returns the split so sendPayouts
+// can tally: a payout is never split across txs — it is sent whole or skipped whole.
 async function relayBucketTx (w, models, accountIndex, payouts, planInfo = {}) {
   if (payouts.length === 0) {
-    return { txHash: null, sent: [], skipped: [], failed: 0, unpersisted: 0, accountingUnpersisted: 0, dropped: [], retryableSkipped: [], filled: [], retryableBuildFailure: false }
+    return { txHash: null, sent: [], skipped: [], failed: 0, unpersisted: 0, accountingUnpersisted: 0, dropped: [], retryableSkipped: [], filled: [], retryableBuildFailure: false, splitRequired: [], sizeSkipped: [], fragmented: [], haltAccount: false, accountUncertain: false }
   }
   const scope = planInfo.scope || walletScope()
   // payout-build: create-then-relay batch construction (incl. true-fee fill
@@ -857,14 +1206,19 @@ async function relayBucketTx (w, models, accountIndex, payouts, planInfo = {}) {
     return {
       txHash: null,
       sent: [],
-      skipped: build.dropped.concat(build.retryableSkipped),
+      skipped: build.dropped.concat(build.retryableSkipped, build.splitRequired, build.sizeSkipped),
       failed: build.failed.length,
       unpersisted: 0,
       accountingUnpersisted: 0,
       dropped: build.dropped,
       retryableSkipped: build.retryableSkipped,
       filled: build.filled,
-      retryableBuildFailure: build.retryableBuildFailure
+      retryableBuildFailure: build.retryableBuildFailure,
+      splitRequired: build.splitRequired,
+      sizeSkipped: build.sizeSkipped,
+      fragmented: build.fragmented,
+      haltAccount: build.retryableBuildFailure,
+      accountUncertain: false
     }
   }
 
@@ -899,7 +1253,23 @@ async function relayBucketTx (w, models, accountIndex, payouts, planInfo = {}) {
     // barrier never opened) and a later drive re-resolves from the DB.
     logError({ accountIndex, payoutCount: batch.length, errorClass: errorLabel(err) },
       'sendPayouts: CRITICAL — payout pair read failed; dispatch withheld, bucket stays QUEUED (nothing relayed)')
-    return { txHash: null, sent: [], skipped: build.dropped.concat(batch), failed: build.failed.length, unpersisted: 0, accountingUnpersisted: 0, dropped: build.dropped, retryableSkipped: build.retryableSkipped, filled: build.filled, retryableBuildFailure: false }
+    return {
+      txHash: null,
+      sent: [],
+      skipped: build.dropped.concat(batch, build.splitRequired, build.sizeSkipped),
+      failed: build.failed.length,
+      unpersisted: 0,
+      accountingUnpersisted: 0,
+      dropped: build.dropped,
+      retryableSkipped: build.retryableSkipped,
+      filled: build.filled,
+      retryableBuildFailure: false,
+      splitRequired: build.splitRequired,
+      sizeSkipped: build.sizeSkipped,
+      fragmented: build.fragmented,
+      haltAccount: true,
+      accountUncertain: true
+    }
   }
 
   let relay
@@ -919,31 +1289,159 @@ async function relayBucketTx (w, models, accountIndex, payouts, planInfo = {}) {
     // recipients FAILED.
     logError({ accountIndex, payoutCount: batch.length, errorClass: errorLabel(err) },
       'sendPayouts: CRITICAL — payout pair/attempt claim failed; dispatch withheld, bucket stays QUEUED')
-    return { txHash: null, sent: [], skipped: build.dropped.concat(batch), failed: build.failed.length, unpersisted: 0, accountingUnpersisted: 1, dropped: build.dropped, retryableSkipped: build.retryableSkipped, filled: build.filled, retryableBuildFailure: false }
+    return {
+      txHash: null,
+      sent: [],
+      skipped: build.dropped.concat(batch, build.splitRequired, build.sizeSkipped),
+      failed: build.failed.length,
+      unpersisted: 0,
+      accountingUnpersisted: 1,
+      dropped: build.dropped,
+      retryableSkipped: build.retryableSkipped,
+      filled: build.filled,
+      retryableBuildFailure: false,
+      splitRequired: build.splitRequired,
+      sizeSkipped: build.sizeSkipped,
+      fragmented: build.fragmented,
+      haltAccount: true,
+      accountUncertain: true
+    }
   }
   if (!relay.relayed) {
     // Possibly broadcast: recipients stay QUEUED and journal reconciliation
     // excludes them until a fresh confirmed verification settles the attempt (never FAILED,
     // never blindly re-relayed).
     logError({ accountIndex, txHash }, 'sendPayouts: relay outcome uncertain — bucket stays QUEUED until a fresh confirmed verification resolves the journal')
-    return { txHash: null, sent: [], skipped: build.dropped.concat(batch), failed: build.failed.length, unpersisted: 0, accountingUnpersisted: 1, dropped: build.dropped, retryableSkipped: build.retryableSkipped, filled: build.filled, retryableBuildFailure: false }
+    return {
+      txHash: null,
+      sent: [],
+      skipped: build.dropped.concat(batch, build.splitRequired, build.sizeSkipped),
+      failed: build.failed.length,
+      unpersisted: 0,
+      accountingUnpersisted: 1,
+      dropped: build.dropped,
+      retryableSkipped: build.retryableSkipped,
+      filled: build.filled,
+      retryableBuildFailure: false,
+      splitRequired: build.splitRequired,
+      sizeSkipped: build.sizeSkipped,
+      fragmented: build.fragmented,
+      haltAccount: true,
+      accountUncertain: true
+    }
   }
 
   // Proven relay: ALWAYS persist the recipient principal, even when the
   // journal fee state could not be persisted (accountingUnpersisted below keeps
   // the run resumable; the money moved either way).
   const unpersisted = await persistSentPayouts(batch, relay.txHash, models)
+  const accountingUnpersisted = relay.accountingUnpersisted || 0
+  const unresolved = unpersisted > 0 || accountingUnpersisted > 0
   return {
     txHash: relay.txHash,
     sent: batch,
-    skipped: build.dropped,
+    skipped: build.dropped.concat(build.splitRequired, build.sizeSkipped),
     failed: build.failed.length,
     unpersisted,
-    accountingUnpersisted: relay.accountingUnpersisted || 0,
+    accountingUnpersisted,
     dropped: build.dropped,
     retryableSkipped: build.retryableSkipped,
     filled: build.filled,
-    retryableBuildFailure: false
+    retryableBuildFailure: false,
+    splitRequired: build.splitRequired,
+    sizeSkipped: build.sizeSkipped,
+    fragmented: build.fragmented,
+    haltAccount: unresolved,
+    accountUncertain: unresolved
+  }
+}
+
+function uniqueRowList () {
+  return { rows: [], ids: new Set() }
+}
+
+function addUniqueRows (target, rows) {
+  for (const row of rows) {
+    if (target.ids.has(row.id)) continue
+    target.ids.add(row.id)
+    target.rows.push(row)
+  }
+}
+
+// Relay ONE account's whole bucket as sequential bounded chunks, largest-first.
+// Each child build reads a FRESH unlocked balance: a prior child may already
+// have spent from this account, so the plan-time snapshot is never reused.
+// A size-rejected multi-row child is bisected and processed before the next
+// planned chunk; its per-member terminal outcomes replace the parent's
+// provisional skipped membership (parent split members are never counted).
+// True-fee fills are offered only once no planned chunk remains, so a fill can
+// never consume capacity reserved for a later planned chunk member. Any halt
+// or unresolved accounting stops the account immediately: a later chunk is
+// never built, and every not-yet-attempted member stays QUEUED.
+async function relayAccountChunks (w, models, accountIndex, payouts, planInfo = {}) {
+  const pending = chunkPayouts(payouts)
+  const sent = uniqueRowList()
+  const skipped = uniqueRowList()
+  const dropped = uniqueRowList()
+  const retryableSkipped = uniqueRowList()
+  const filled = uniqueRowList()
+  const sizeSkipped = uniqueRowList()
+  const fragmented = uniqueRowList()
+  let failed = 0
+  let unpersisted = 0
+  let accountingUnpersisted = 0
+  let retryableBuildFailure = false
+  let haltAccount = false
+  let accountUncertain = false
+
+  while (pending.length > 0) {
+    const members = pending.shift()
+    const unlockedBeforeBuild = BigInt(await w.getUnlockedBalance(accountIndex))
+    const fillPool = pending.length === 0 ? planInfo.fillPool : []
+    const r = await relayBucketTx(w, models, accountIndex, members, {
+      ...planInfo,
+      fillPool,
+      unlockedBeforeBuild
+    })
+    const splitIds = new Set(r.splitRequired.map(p => p.id))
+
+    addUniqueRows(sent, r.sent)
+    addUniqueRows(dropped, r.dropped)
+    addUniqueRows(retryableSkipped, r.retryableSkipped)
+    addUniqueRows(filled, r.filled)
+    addUniqueRows(sizeSkipped, r.sizeSkipped)
+    addUniqueRows(fragmented, r.fragmented)
+    for (const row of r.skipped) {
+      if (!splitIds.has(row.id)) addUniqueRows(skipped, [row])
+    }
+    failed += r.failed
+    unpersisted += r.unpersisted
+    accountingUnpersisted += r.accountingUnpersisted
+    if (r.retryableBuildFailure) retryableBuildFailure = true
+    if (r.haltAccount) haltAccount = true
+    if (r.accountUncertain) accountUncertain = true
+
+    if (r.splitRequired.length > 0) pending.unshift(...bisectPayouts(r.splitRequired))
+    if (r.haltAccount) {
+      for (const row of pending.flat()) addUniqueRows(skipped, [row])
+      break
+    }
+  }
+
+  return {
+    sent: sent.rows,
+    skipped: skipped.rows,
+    failed,
+    unpersisted,
+    accountingUnpersisted,
+    dropped: dropped.rows,
+    retryableSkipped: retryableSkipped.rows,
+    filled: filled.rows,
+    retryableBuildFailure,
+    sizeSkipped: sizeSkipped.rows,
+    fragmented: fragmented.rows,
+    haltAccount,
+    accountUncertain
   }
 }
 
@@ -989,45 +1487,169 @@ export function planAccountSends (payouts, unlockedByAccount, feeReserve = 0n) {
   return skipped.length === 0 ? buckets : null
 }
 
-// Sweep every funded fee-pool account (1-5) into the primary address through
-// the SAME journaled boundary as payouts: build each sweep with relay:false,
+// Sweep funded signer accounts into the primary address through the SAME
+// journaled boundary as payouts: build each sweep with relay:false,
 // prepare/journal it as a zero-principal CONSOLIDATION self transfer, then
 // relay the same object. The DB ledger is unaffected (the transparency
 // resolver derives balances from the DB, never on-chain sent-side data).
+// Default callers keep the historical behavior: fee accounts 1-5, no targeted
+// uniqueness/affordability gate beyond the existing dust floor. The explicit
+// size-recovery path may pass account 0, a distributionId, and
+// minimumRecoveryPiconeros; for that path every proposed hash and the SUMMED
+// real fees are validated before ANY constituent is prepared or relayed, and
+// the first preparation/claim/relay/accounting failure stops the cycle.
 // Every returned hash must be unique — a duplicate set means the wallet cannot
 // be trusted to journal each sweep once, so that account is refused (nothing
 // relayed). Returns the number of unresolved accounting items (an uncertain
-// relay or a proven relay whose journal state could not be persisted) so the
-// caller's summary can never silently COMPLETE over a possible unrecorded
-// spend. Errors are alerted CRITICAL but never thrown — the caller ends the run
-// FAILED-resumable either way.
-async function consolidateFeeAccounts (w, models, scope, { reason } = {}) {
+// relay or a proven relay whose journal state could not be persisted) and the
+// accounts whose sweep was actually invoked, so the caller's legacy recovery
+// can never repeat them in this drive and its summary can never silently
+// COMPLETE over a possible unrecorded spend. Errors are alerted CRITICAL but
+// never thrown — the caller ends the run FAILED-resumable either way.
+async function consolidateFeeAccounts (w, models, scope, {
+  reason,
+  accountIndices,
+  distributionId = null,
+  minimumRecoveryPiconeros = null,
+  sweepEachSubaddress
+} = {}) {
   let accountingFailures = 0
   const seenHashes = new Set()
-  for (const idx of SIGNER_ACCOUNTS) {
-    if (idx === 0) continue
+  const attempted = new Set()
+  const targeted = distributionId != null || minimumRecoveryPiconeros != null
+  const stageFields = stage => (targeted ? { stage } : {})
+  const requested = accountIndices == null
+    ? SIGNER_ACCOUNTS.filter(idx => idx !== 0)
+    : [...new Set(accountIndices)].filter(idx => SIGNER_ACCOUNTS.includes(idx))
+
+  for (const idx of requested) {
     try {
       // Always the FRESH post-payout unlocked balance.
       const bal = BigInt(await w.getUnlockedBalance(idx))
-      if (bal < CONSOLIDATION_MIN_PICONEROS) continue
-      const txs = await w.sweepUnlocked({ accountIndex: idx, address: scope.walletAddress, relay: false })
+      if (bal < CONSOLIDATION_MIN_PICONEROS) {
+        if (targeted) {
+          logWarn({
+            accountIndex: idx,
+            distributionId,
+            reason,
+            ...stageFields('dust'),
+            unlockedPiconeros: bal.toString(),
+            dustFloorPiconeros: CONSOLIDATION_MIN_PICONEROS.toString()
+          }, 'sendPayouts: fragmented recovery is below the dust floor — no sweep was built; payouts stay QUEUED')
+          alertFragmentedRecovery({
+            stage: 'dust',
+            accountIndex: idx,
+            distributionId,
+            detail: `the fresh unlocked source balance (${bal.toString()} piconeros) is below the consolidation dust floor (${CONSOLIDATION_MIN_PICONEROS.toString()} piconeros), so no sweep transaction was built.`
+          })
+        }
+        continue
+      }
+      const sweepRequest = { accountIndex: idx, address: scope.walletAddress, relay: false }
+      if (sweepEachSubaddress !== undefined) sweepRequest.sweepEachSubaddress = sweepEachSubaddress
+      // Record before invoking the sweep: a failed build must not be repeated
+      // by the legacy branch in the same drive.
+      attempted.add(idx)
+      const txs = await w.sweepUnlocked(sweepRequest)
       const list = txs || []
-      if (list.length === 0) continue
+      if (list.length === 0) {
+        if (targeted) {
+          logWarn({ accountIndex: idx, distributionId, reason, ...stageFields('empty') },
+            'sendPayouts: fragmented recovery produced no sweep transactions — not a successful recovery, payouts stay QUEUED')
+          alertFragmentedRecovery({
+            stage: 'empty',
+            accountIndex: idx,
+            distributionId,
+            detail: 'the consolidation sweep returned no transactions, which is not a successful recovery.'
+          })
+        }
+        continue
+      }
       const hashes = list.map(tx => toTxHash(tx.getHash()))
       if (hashes.some(h => !h) || new Set(hashes).size !== hashes.length || hashes.some(h => seenHashes.has(h))) {
-        logError({ accountIndex: idx, reason }, 'sendPayouts: CRITICAL — consolidation returned duplicate/invalid transaction hashes; refusing to relay')
+        logError({ accountIndex: idx, distributionId, reason, ...stageFields('hash-invalid') },
+          'sendPayouts: CRITICAL — consolidation returned duplicate/invalid transaction hashes; refusing to relay')
+        if (targeted) {
+          alertFragmentedRecovery({
+            stage: 'hash-invalid',
+            accountIndex: idx,
+            distributionId,
+            critical: true,
+            detail: 'the consolidation sweep returned an invalid or duplicate transaction hash set, so no constituent was prepared or relayed.'
+          })
+          break
+        }
         alert('critical', 'rewards fee-account consolidation failed',
           `consolidation sweep of rewards wallet account ${idx} returned non-unique transaction hashes; refusing to relay`,
           { dedupeKey: `rewards-consolidate-${idx}` })
         continue
       }
       for (const hash of hashes) seenHashes.add(hash)
+
+      // Targeted usefulness gate: read the REAL fees and refuse the WHOLE set
+      // before preparing anything when the sweep would not leave at least one
+      // blocked whole payout plus its fee headroom. No journal/fee fact is
+      // invented for a refused set.
+      if (minimumRecoveryPiconeros != null) {
+        let fees
+        try {
+          fees = await Promise.all(list.map(async tx => BigInt(await tx.getFee())))
+        } catch (err) {
+          logError({ accountIndex: idx, distributionId, reason, ...stageFields('fee-read'), errorClass: errorLabel(err) },
+            'sendPayouts: fragmented recovery fee read failed — withholding the sweep')
+          alertFragmentedRecovery({
+            stage: 'fee-read',
+            accountIndex: idx,
+            distributionId,
+            critical: true,
+            detail: 'the consolidation fee could not be read, so no transaction was prepared or relayed.'
+          })
+          if (targeted) break
+          continue
+        }
+        if (fees.some(fee => fee < 0n)) {
+          logError({ accountIndex: idx, distributionId, reason, ...stageFields('invalid-fee') },
+            'sendPayouts: CRITICAL — consolidation returned an invalid fee; refusing to relay')
+          alertFragmentedRecovery({
+            stage: 'invalid-fee',
+            accountIndex: idx,
+            distributionId,
+            critical: true,
+            detail: 'the consolidation reported an invalid fee, so no transaction was prepared or relayed.'
+          })
+          if (targeted) break
+          continue
+        }
+        const totalFee = fees.reduce((sum, fee) => sum + fee, 0n)
+        if (bal - totalFee < minimumRecoveryPiconeros) {
+          logWarn({
+            accountIndex: idx,
+            distributionId,
+            reason,
+            ...stageFields('unaffordable'),
+            unlockedPiconeros: bal.toString(),
+            totalFeePiconeros: totalFee.toString(),
+            minimumRecoveryPiconeros: minimumRecoveryPiconeros.toString()
+          }, 'sendPayouts: fragmented recovery unaffordable — fees leave no whole payout plus headroom; payouts stay QUEUED')
+          alertFragmentedRecovery({
+            stage: 'unaffordable',
+            accountIndex: idx,
+            distributionId,
+            detail: `${totalFee.toString()} piconeros of sweep fees would leave less than ${minimumRecoveryPiconeros.toString()} piconeros for a whole payout, so no transaction was prepared or relayed.`
+          })
+          if (targeted) break
+          continue
+        }
+      }
+
+      let cycleFailed = false
+      let relayedCount = 0
       for (const tx of list) {
         const txHash = toTxHash(tx.getHash())
         let journal
         try {
           journal = await prepareDispatchResolved({
-            context: { accountIndex: idx, txHash, reason },
+            context: { accountIndex: idx, distributionId, txHash, reason, ...stageFields('preparation') },
             message: 'sendPayouts: CRITICAL — consolidation pair preparation failed',
             prepare: () => prepareWalletTransaction({
               models,
@@ -1036,18 +1658,32 @@ async function consolidateFeeAccounts (w, models, scope, { reason } = {}) {
               tx,
               kind: 'CONSOLIDATION',
               accountIndex: idx,
+              distributionId,
               principalPiconeros: 0n,
               metadata: { selfTransfer: true, destination: scope.walletAddress },
               keyProvider: paymentProofKeys()
             })
           })
         } catch (err) {
-          // The pair outcome is unresolved after a fresh read: this dispatch
-          // stays withheld — nothing was broadcast (the relay barrier never
-          // opened) and the next drive re-resolves from the DB.
-          logError({ accountIndex: idx, txHash, reason, errorClass: errorLabel(err) }, 'sendPayouts: CRITICAL — consolidation pair read failed; dispatch withheld, nothing relayed')
+          // The pair outcome is unresolved after a fresh read: THIS constituent
+          // stays withheld — it was not broadcast (the relay barrier never
+          // opened) and the next drive re-resolves it from the DB. An earlier
+          // constituent in the same cycle may already have relayed.
+          logError({ accountIndex: idx, distributionId, txHash, reason, ...stageFields('preparation'), errorClass: errorLabel(err) }, 'sendPayouts: CRITICAL — consolidation pair read failed; this constituent was not relayed')
+          if (targeted) {
+            alertFragmentedRecovery({
+              stage: 'preparation',
+              accountIndex: idx,
+              distributionId,
+              uncertain: true,
+              detail: 'the consolidation pair could not be confirmed for journaling, so this constituent was not relayed.'
+            })
+            accountingFailures += 1
+            cycleFailed = true
+            break
+          }
           alert('critical', 'rewards fee-account consolidation failed',
-            `consolidation sweep of rewards wallet account ${idx} could not be journaled; refusing to relay`,
+            `consolidation sweep of rewards wallet account ${idx} could not be journaled; refusing to relay this constituent`,
             { dedupeKey: `rewards-consolidate-${idx}` })
           continue
         }
@@ -1056,25 +1692,84 @@ async function consolidateFeeAccounts (w, models, scope, { reason } = {}) {
           relay = await relayWalletTransaction({ models, wallet: w, journal, tx, keyProvider: paymentProofKeys() })
         } catch (err) {
           accountingFailures += 1
-          logError({ accountIndex: idx, txHash, reason, errorClass: errorLabel(err) }, 'sendPayouts: CRITICAL — consolidation pair/attempt claim failed; accounting remains unresolved')
+          logError({ accountIndex: idx, distributionId, txHash, reason, ...stageFields('claim'), errorClass: errorLabel(err) }, 'sendPayouts: CRITICAL — consolidation pair/attempt claim failed; accounting remains unresolved')
+          if (targeted) {
+            alertFragmentedRecovery({
+              stage: 'claim',
+              accountIndex: idx,
+              distributionId,
+              uncertain: true,
+              detail: 'the consolidation attempt claim failed before this dispatch was relayed; the journal may hold an unresolved attempt.'
+            })
+            cycleFailed = true
+            break
+          }
           continue
         }
         if (relay.relayed) {
-          logInfo({ accountIndex: idx, txHash: relay.txHash, reason }, 'sendPayouts: consolidated fee account to primary')
+          relayedCount += 1
+          logInfo({ accountIndex: idx, distributionId, txHash: relay.txHash, reason }, 'sendPayouts: consolidated fee account to primary')
         } else {
           accountingFailures += 1
-          logError({ accountIndex: idx, txHash, reason }, 'sendPayouts: CRITICAL — consolidation relay outcome uncertain; accounting remains unresolved')
+          logError({ accountIndex: idx, distributionId, txHash, reason, ...stageFields('relay-uncertain') }, 'sendPayouts: CRITICAL — consolidation relay outcome uncertain; accounting remains unresolved')
+          if (targeted) {
+            alertFragmentedRecovery({
+              stage: 'relay-uncertain',
+              accountIndex: idx,
+              distributionId,
+              uncertain: true,
+              detail: 'the consolidation relay outcome is uncertain; the transaction may have been broadcast.'
+            })
+            cycleFailed = true
+            break
+          }
         }
-        accountingFailures += relay.accountingUnpersisted || 0
+        const journalFailures = relay.accountingUnpersisted || 0
+        accountingFailures += journalFailures
+        if (journalFailures > 0 && targeted) {
+          logError({ accountIndex: idx, distributionId, txHash, reason, ...stageFields('journal-state') },
+            'sendPayouts: CRITICAL — consolidation relayed but its journal state remains unpersisted')
+          alertFragmentedRecovery({
+            stage: 'journal-state',
+            accountIndex: idx,
+            distributionId,
+            uncertain: true,
+            detail: 'the consolidation relayed but its journal state could not be persisted.'
+          })
+          cycleFailed = true
+          break
+        }
+      }
+      if (targeted && !cycleFailed && relayedCount > 0) {
+        logInfo({
+          accountIndex: idx,
+          distributionId,
+          reason,
+          ...stageFields('relayed'),
+          transactionCount: relayedCount
+        }, 'sendPayouts: fragmented inputs consolidated — resume with scripts/requeue-failed-payouts.js after the wallet reports unlocked outputs')
+        alert('warn', 'rewards fragmented-inputs recovery relayed',
+          `distribution ${distributionId} source account ${idx}: ${relayedCount} consolidation transaction(s) relayed. Rewards stay QUEUED until the new outputs actually unlock; then resume with scripts/requeue-failed-payouts.js.`,
+          { dedupeKey: `rewards-size-recovery-${idx}-${distributionId}` })
       }
     } catch (err) {
-      logError({ accountIndex: idx, reason, errorClass: errorLabel(err) }, 'sendPayouts: CRITICAL — fee-account consolidation sweep failed')
+      logError({ accountIndex: idx, distributionId, reason, ...stageFields('sweep-failed'), errorClass: errorLabel(err) }, 'sendPayouts: CRITICAL — fee-account consolidation sweep failed')
+      if (targeted) {
+        alertFragmentedRecovery({
+          stage: 'sweep-failed',
+          accountIndex: idx,
+          distributionId,
+          critical: true,
+          detail: 'the consolidation sweep could not be built, so no transaction was prepared or relayed.'
+        })
+        break
+      }
       alert('critical', 'rewards fee-account consolidation failed',
         `consolidation sweep of rewards wallet account ${idx} failed (diagnostic withheld; see the worker log errorClass); distribution stays resumable-FAILED`,
         { dedupeKey: `rewards-consolidate-${idx}` })
     }
   }
-  return { accountingFailures }
+  return { accountingFailures, attemptedAccounts: [...attempted] }
 }
 
 function setBalanceGauge (models, unlocked) {
