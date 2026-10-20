@@ -16,7 +16,7 @@ import { useMemo } from 'react'
 import { CompactLongCountdown } from '@/components/countdown'
 import { payTypeShortName } from '@/lib/pay-in'
 import DonateModal from '@/components/donate-modal'
-import { WEEKLY_CURATOR_CAP_PICONEROS } from '@/lib/rewardsAccounting'
+import { CURATOR_FALLBACK_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 
 const GrowthPieChart = dynamic(() => import('@/components/charts').then(mod => mod.GrowthPieChart), {
   loading: () => <GrowthPieChartSkeleton />
@@ -73,7 +73,7 @@ export default function Rewards ({ ssrData }) {
   }, [dat])
 
   if (!dat) return <PageLoading />
-  const curatorBudget = BigInt(total) < WEEKLY_CURATOR_CAP_PICONEROS ? BigInt(total) : WEEKLY_CURATOR_CAP_PICONEROS
+  const curatorBudget = BigInt(total) < CURATOR_FALLBACK_CAP_PICONEROS ? BigInt(total) : CURATOR_FALLBACK_CAP_PICONEROS
 
   return (
     <Layout footerLinks>

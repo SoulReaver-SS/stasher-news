@@ -6,7 +6,7 @@ import { reconcileWalletTransactions, errorLabel } from '@/api/monero/rewardsTra
 import logger, { logInfo, logError } from '@/lib/logger'
 import { alert } from '@/lib/alert'
 import { moneroDistributionStatus } from '@/lib/metrics'
-import { opsCarry, walletScope, WEEKLY_CURATOR_CAP_PICONEROS } from '@/lib/rewardsAccounting'
+import { opsCarry, walletScope, CURATOR_FALLBACK_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 import { readRewardsInflow } from '@/api/monero/rewardsInflow'
 import { readRewardsWalletLedger } from '@/api/monero/rewardsLedger'
 import { withRewardsPhase } from './rewardsPhase'
@@ -18,8 +18,8 @@ import { withRewardsPhase } from './rewardsPhase'
 //      posting/territory fees) for the period;
 //   2. applies the PlatformFeeConfig allocation split to get the rewards earmark;
 //   3. adds the prior period's rolledOverPiconeros to form the pool;
-//   4. calls computeCuratorShares (Task 7) to apportion up to 0.6 XMR to the
-//      curators (tippers) of the period's top content;
+//   4. calls computeCuratorShares (Task 7) to apportion up to the 0.2 XMR
+//      fallback cap to the curators (tippers) of the period's top content;
 //   5. writes one RewardDistribution row + one QUEUED RewardPayout per curator
 //      who has a registered receiving address. Curators with no address are
 //      excluded — their share joins the rollover.
@@ -207,8 +207,9 @@ async function distribute (models) {
     const rolledOver = toBigInt(lastDistribution?.rolledOverPiconeros)
     const poolPiconeros = rewardsInflow + rolledOver
     // Keep the FULL pool in the ledger and protected from ops sweeps. Only the
-    // curator budget is capped; referrals still use the full pool's remainder.
-    const curatorBudget = poolPiconeros < WEEKLY_CURATOR_CAP_PICONEROS ? poolPiconeros : WEEKLY_CURATOR_CAP_PICONEROS
+    // curator budget is capped at the fallback cap; referrals still use the
+    // full pool's remainder.
+    const curatorBudget = poolPiconeros < CURATOR_FALLBACK_CAP_PICONEROS ? poolPiconeros : CURATOR_FALLBACK_CAP_PICONEROS
 
     // Ops earmark rollover: the prior period's unswept ops carried in, LESS the
     // network costs incurred after that snapshot's checkpoint (and with a

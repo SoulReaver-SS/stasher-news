@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto'
 import { PrismaClient } from '@prisma/client'
 import { runDistributionOnce } from '@/worker/rewardsDistributor'
 import { getNextRewardsPool } from '@/lib/rewardsPool'
+import { CURATOR_FALLBACK_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 
 // Real allocation/SQL/ledger integration, fake signer only. Never run these
 // multiweek fixtures against a shared dev pool or a real rewards wallet.
@@ -24,7 +25,7 @@ jest.mock('../../lib/logger', () => ({
 }))
 
 const XMR = 1_000_000_000_000n
-const CAP = 600_000_000_000n // 0.6 XMR weekly curator cap
+const CAP = CURATOR_FALLBACK_CAP_PICONEROS // 0.2 XMR weekly fallback cap
 const DAY = 24 * 60 * 60 * 1000
 const START = new Date('2026-10-19T00:00:00Z')
 
@@ -197,7 +198,7 @@ const START = new Date('2026-10-19T00:00:00Z')
 
   test.each([
     ['empty', 0n, 0n, 0n],
-    ['below cap', 500_000_000_000n, 500_000_000_000n, 0n],
+    ['below cap', CAP / 2n, CAP / 2n, 0n],
     ['at cap', CAP, CAP, 0n],
     ['one piconero above cap', CAP + 1n, CAP, 1n],
     ['five XMR', 5n * XMR, CAP, 5n * XMR - CAP]
@@ -211,21 +212,22 @@ const START = new Date('2026-10-19T00:00:00Z')
     await expectConserved(distribution)
   })
 
-  test('five XMR funds eight full capped weeks plus one partial week with no new inflow', async () => {
-    await seedInflow(5n * XMR)
+  test('eight full capped weeks plus one partial ninth week with no new inflow', async () => {
+    const pool = 8n * CAP + CAP / 3n
+    await seedInflow(pool)
     for (let week = 0; week < 9; week++) {
       if (week > 0) {
         jest.setSystemTime(new Date(START.getTime() + week * 7 * DAY))
         await seedCuration()
       }
       const distribution = await run()
-      expect(distribution.poolPiconeros).toBe(5n * XMR - BigInt(week) * CAP)
+      expect(distribution.poolPiconeros).toBe(pool - BigInt(week) * CAP)
       if (week < 8) {
         expect(distribution.distributedPiconeros).toBe(CAP)
-        expect(distribution.rolledOverPiconeros).toBe(5n * XMR - BigInt(week + 1) * CAP)
+        expect(distribution.rolledOverPiconeros).toBe(pool - BigInt(week + 1) * CAP)
       } else {
-        // final week: the remaining 0.2 XMR is below the cap and pays in full
-        expect(distribution.distributedPiconeros).toBe(5n * XMR - 8n * CAP)
+        // final week: the remaining pool is below the cap and pays in full
+        expect(distribution.distributedPiconeros).toBe(pool - 8n * CAP)
         expect(distribution.rolledOverPiconeros).toBe(0n)
       }
       await expectConserved(distribution)
@@ -270,7 +272,7 @@ const START = new Date('2026-10-19T00:00:00Z')
 
   test.each([
     ['additional referrals', 5n * XMR, CAP / 10n, 5n * XMR - CAP - CAP / 10n],
-    ['limited by remaining pool', CAP + 50_000_000_000n, 50_000_000_000n, 0n],
+    ['limited by remaining pool', CAP + CAP / 20n, CAP / 20n, 0n],
     ['no remaining pool', CAP, 0n, 0n]
   ])('%s: referrals use the full pool remainder, not the curator cap remainder', async (_name, pool, referral, rollover) => {
     const referrerId = await attachReferrer()
@@ -368,9 +370,10 @@ const START = new Date('2026-10-19T00:00:00Z')
 
     expect(next.id).not.toBe(previous.id)
     expect(next.periodStart).toEqual(previous.periodEnd)
-    expect(next.poolPiconeros).toBe(4_400_000_000_000n)
-    expect(next.distributedPiconeros).toBe(600_000_000_000n)
-    expect(next.rolledOverPiconeros).toBe(3_800_000_000_000n)
+    const priorRollover = 5n * XMR - CAP
+    expect(next.poolPiconeros).toBe(priorRollover)
+    expect(next.distributedPiconeros).toBe(CAP)
+    expect(next.rolledOverPiconeros).toBe(priorRollover - CAP)
     await expectConserved(next)
   })
 
@@ -574,7 +577,7 @@ const START = new Date('2026-10-19T00:00:00Z')
     expect(next.periodStart).toEqual(previous.periodEnd)
     expect(next.poolPiconeros).toBe(5n * XMR)
     expect(next.distributedPiconeros).toBe(CAP)
-    expect(next.rolledOverPiconeros).toBe(4_400_000_000_000n)
+    expect(next.rolledOverPiconeros).toBe(5n * XMR - CAP)
     expect(await db.rewardDistribution.count()).toBe(2)
     await expectConserved(next)
   })

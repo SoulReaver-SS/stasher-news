@@ -28,6 +28,7 @@ import * as util from 'node:util'
 import { runDistributionOnce, finalizeDistribution, recoverStaleDistributions, requeueFailedPayouts, warnUndeliveredDistributions } from '@/worker/rewardsDistributor'
 import { applyTipDetected } from '@/api/monero/ranking'
 import { getNextRewardsPool } from '@/lib/rewardsPool'
+import { CURATOR_FALLBACK_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 import { USER_ID } from '@/lib/constants'
 
 // lib/alert is mocked so operator pages are assertable without a network side
@@ -800,9 +801,9 @@ test('a pool above the weekly curator cap still allocates at most the cap to cur
     where: { distributionId: result.id, type: { in: ['TIP_POST', 'TIP_COMMENT'] } },
     _sum: { piconeros: true }
   })
-  expect(result.poolPiconeros).toBeGreaterThan(600_000_000_000n)
+  expect(result.poolPiconeros).toBeGreaterThan(CURATOR_FALLBACK_CAP_PICONEROS)
   expect(curatorEarns._sum.piconeros).toBeGreaterThan(0n)
-  expect(curatorEarns._sum.piconeros).toBeLessThanOrEqual(600_000_000_000n)
+  expect(curatorEarns._sum.piconeros).toBeLessThanOrEqual(CURATOR_FALLBACK_CAP_PICONEROS)
 })
 
 test('opsInflowPiconeros is the exact complement of the rewards earmark (totalInflow - rewardsInflow)', async () => {

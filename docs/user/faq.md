@@ -68,11 +68,11 @@ To earn XMR via [tips](#tips) from fellow stashers peer-to-peer, you need to [at
 
 **2. Weekly rewards**
 
-Stashers can also earn XMR via weekly rewards. Stasher News distributes a share of the revenue it collects from posting and comment fees, turf fees, paid boosts and tips to wallet-less authors — plus all downvotes and donations — back to the stashers who curated the best content of the week: the tippers of the top-ranked posts and comments. Distribution happens every Monday at 00:00 UTC, and payouts are sent on-chain to your attached wallet. Curator payouts are capped at 0.6 XMR per week across all curators, not per person. Any unused pool funds roll over for future weeks. You can see the full pool and the next distribution time on the [rewards page](/rewards).
+Stashers can also earn XMR via weekly rewards. Stasher News distributes a share of the revenue it collects from posting and comment fees, turf fees, paid boosts and tips to wallet-less authors — plus all downvotes and donations — back to the stashers who curated the best content of the week: the tippers of the top-ranked posts and comments. Distribution happens every Monday at 00:00 UTC, and payouts are sent on-chain to your attached wallet. Curator payouts are capped at 0.2 XMR per week across all curators, not per person. Any unused pool funds roll over for future weeks. You can see the full pool and the next distribution time on the [rewards page](/rewards).
 
 **3. Referrals**
 
-Another way to earn XMR is via [referrals](/referrals/month). If a stasher signs up through one of your referral links, you will earn 10% of their weekly curator rewards in perpetuity, subject to remaining pool funds. Referral payouts are additional to curator payouts and may push the total weekly distribution above 0.6 XMR. A referral link is any link that ends with /r/\<your name\>. Your posts, comments and profile are also implicit referral links. They don't need to have the /r/\<your name\> suffix.
+Another way to earn XMR is via [referrals](/referrals/month). If a stasher signs up through one of your referral links, you will earn 10% of their weekly curator rewards in perpetuity, subject to remaining pool funds. Referral payouts are additional to curator payouts and may push the total weekly distribution above 0.2 XMR. A referral link is any link that ends with /r/\<your name\>. Your posts, comments and profile are also implicit referral links. They don't need to have the /r/\<your name\> suffix.
 
 To make referring stashers easy, clicking on `...` next to a post or comment and selecting 'copy link' will copy it as a referral link by default. You can disable this in your [settings](/settings).
 
@@ -313,7 +313,7 @@ You can earn XMR from the weekly rewards pool by tipping content that ends up pe
 
 ### Can I donate XMR to Stasher News?
 
-Yes. Every week, Stasher News distributes a share of the revenue it collects from posting and comment fees, turf fees, paid boosts and tips to wallet-less authors — plus all downvotes and donations — back to the stashers who made the best contributions. Curator payouts total up to 0.6 XMR per week; referral payouts may be additional when the pool has funds left. All unused funds roll over to future weeks. Payouts depend on eligibility and minimum amounts, so the cap is not a guaranteed payout. Network fees are paid separately by platform operations, whose weekly sweep to cold storage is not capped by this limit.
+Yes. Every week, Stasher News distributes a share of the revenue it collects from posting and comment fees, turf fees, paid boosts and tips to wallet-less authors — plus all downvotes and donations — back to the stashers who made the best contributions. Curator payouts total up to 0.2 XMR per week; referral payouts may be additional when the pool has funds left. All unused funds roll over to future weeks. Payouts depend on eligibility and minimum amounts, so the cap is not a guaranteed payout. Network fees are paid separately by platform operations, whose weekly sweep to cold storage is not capped by this limit.
 
 To donate XMR directly to the Stasher News rewards pool, or to see the full pool and next Monday's curator budget, click [here](/rewards). Funds left after curator and referral payouts remain in the pool for future distributions. When you donate, you choose the split: 100% to the curator rewards pool, 100% to platform operations, or anywhere between (default 100% rewards).
 

@@ -8,7 +8,7 @@ import { useQuery } from '@apollo/client/react'
 import { useData } from '@/components/use-data'
 import { SSR, FAST_POLL_INTERVAL_MS } from '@/lib/constants'
 import { piconerosToXmr } from '@/lib/format'
-import { WEEKLY_CURATOR_CAP_PICONEROS } from '@/lib/rewardsAccounting'
+import { CURATOR_FALLBACK_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 
 const REWARDS_WALLET = gql`
   query rewardsWalletInfo {
@@ -203,7 +203,7 @@ export default function Transparency ({ ssrData }) {
               this week's accrual — awaiting its sweep to the ops wallet. They are
               literal allocations, not a pro-rata slice of the balance; a negative
               ops figure is unfunded debt, not free cash. Weekly curator payouts are
-              capped at {piconerosToXmr(WEEKLY_CURATOR_CAP_PICONEROS)}; referral payouts may be
+              capped at {piconerosToXmr(CURATOR_FALLBACK_CAP_PICONEROS)}; referral payouts may be
               additional, limited by the remaining pool. All unused rewards roll over.
               The ops sweep has no weekly amount cap; network fees are paid by ops.
             </small>
