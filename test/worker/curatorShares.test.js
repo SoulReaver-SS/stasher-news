@@ -17,12 +17,45 @@
 //   docker exec -u apprunner app npx jest test/worker/curatorShares.test.js
 
 import { PrismaClient } from '@prisma/client'
-import { computeCuratorShares, effectiveTrustWeightFloor } from '@/worker/curatorShares'
+import { computeCuratorShares, effectiveTrustWeightFloor, sanitizeExcludedCuratorIds } from '@/worker/curatorShares'
 import { USER_ID } from '@/lib/constants'
+import { logError } from '@/lib/logger'
+
+jest.mock(`${process.cwd()}/lib/logger`, () => ({ logError: jest.fn() }))
 
 const prisma = new PrismaClient()
 
 const ADDR = '7' + '4'.repeat(94) // 95-char Monero address placeholder
+
+// Every deterministic item title this suite seeds. The interruption-residue
+// purge below deletes by these titles, so a killed run cannot leave fixtures
+// that collide with the next run's seeding.
+const TEST_POST_TITLES = [
+  'top post',
+  'mid post',
+  'low post',
+  'normal handicap control post',
+  'staff handicapped post',
+  'trust weighted post one',
+  'trust weighted post two',
+  'founder excluded post',
+  'founder excluded control post',
+  'founder excluded topn post',
+  'founder excluded topn control one',
+  'founder excluded only post',
+  'configured excluded post',
+  'configured excluded control post',
+  'configured excluded topn post',
+  'configured excluded topn control post',
+  'configured excluded only post',
+  'configured excluded empty post',
+  'configured excluded empty control post',
+  'configured excluded junk post',
+  'configured excluded junk control post',
+  'configured excluded comment root',
+  'configured excluded comment target',
+  'configured excluded comment control'
+]
 
 // Tracks every row created across tests so afterAll can tear them down in
 // FK-safe order: ObservedTip -> Item -> MoneroAccount -> users.
@@ -51,7 +84,7 @@ async function purgePriorResidue () {
   const tipperIds = [...new Set(priorTips.map(t => t.tipperId).filter(Boolean))]
   const testPostIds = [...new Set(priorTips.map(t => t.postId).filter(Boolean))]
   const priorAuthorIds = (await prisma.item.findMany({
-    where: { title: { in: ['top post', 'mid post', 'low post', 'normal handicap control post', 'staff handicapped post', 'trust weighted post one', 'trust weighted post two', 'founder excluded post', 'founder excluded control post', 'founder excluded topn post', 'founder excluded topn control one', 'founder excluded only post'] } },
+    where: { title: { in: TEST_POST_TITLES } },
     select: { userId: true }
   })).map(i => i.userId)
   const testUserIds = [...new Set([...tipperIds, ...priorAuthorIds])].filter(id => id !== HANDICAP_USER_ID && id !== USER_ID.stasher)
@@ -62,9 +95,7 @@ async function purgePriorResidue () {
     await prisma.itemUserAgg.deleteMany({ where: { itemId: id } })
     await prisma.item.deleteMany({ where: { id } })
   }
-  await prisma.item.deleteMany({
-    where: { title: { in: ['top post', 'mid post', 'low post', 'normal handicap control post', 'staff handicapped post', 'trust weighted post one', 'trust weighted post two', 'founder excluded post', 'founder excluded control post', 'founder excluded topn post', 'founder excluded topn control one', 'founder excluded only post'] } }
-  })
+  await prisma.item.deleteMany({ where: { title: { in: TEST_POST_TITLES } } })
   await prisma.$executeRaw`DELETE FROM "MoneroAccount" WHERE address ~ '^74{94}[0-9]+$'`
   if (testUserIds.length) await prisma.userSubTrust.deleteMany({ where: { userId: { in: testUserIds } } })
   if (testUserIds.length) await prisma.user.deleteMany({ where: { id: { in: testUserIds } } })
@@ -124,6 +155,19 @@ async function createRootPostAt (userId, title, weightedVotes, createdAt) {
     RETURNING id::int AS id`
   const id = rows[0].id
   await prisma.$executeRaw`UPDATE "Item" SET path = ${String(id)}::ltree WHERE id = ${id}::int`
+  created.items.push(id)
+  return id
+}
+
+// Comment fixture with an explicit weight/created_at. item_proportions treats
+// it as a separate post/comment attribution partition; path is rootId.id.
+async function createCommentAt (userId, rootId, title, weightedVotes, createdAt) {
+  const rows = await prisma.$queryRaw`
+    INSERT INTO "Item" ("userId", "parentId", "rootId", title, "weightedVotes", "created_at")
+    VALUES (${userId}::int, ${rootId}::int, ${rootId}::int, ${title}, ${weightedVotes}::float, ${createdAt})
+    RETURNING id::int AS id`
+  const id = rows[0].id
+  await prisma.$executeRaw`UPDATE "Item" SET path = ${`${rootId}.${id}`}::ltree WHERE id = ${id}::int`
   created.items.push(id)
   return id
 }
@@ -460,6 +504,242 @@ test('a period with only stasher curator tips rolls the whole pool over', async 
   expect(shares).toEqual([])
   expect(distributedPiconeros).toBe(0n)
   expect(rolledOverPiconeros).toBe(POOL)
+})
+
+// --- Configurable curator exclusion: same path as the founder exclusion ---
+
+function serializeShares (result) {
+  return JSON.stringify(result, (_, value) => typeof value === 'bigint' ? String(value) : value)
+}
+
+async function seedExclusionPair ({
+  excludedId,
+  base,
+  titles,
+  excludedWeight = 10,
+  controlWeight = 10,
+  excludedPiconeros = 1_000_000_000n,
+  controlPiconeros = 1_000_000_000n
+}) {
+  const controlId = await createUser()
+  const account = await seedAccount()
+  const excludedPost = await createRootPostAt(excludedId, titles[0], excludedWeight, new Date(base))
+  const controlPost = await createRootPostAt(controlId, titles[1], controlWeight, new Date(base + 1000))
+  const confirmedAt = new Date(base + 2000)
+  await seedTip({
+    postId: excludedPost,
+    tipperId: excludedId,
+    piconeros: excludedPiconeros,
+    confirmedAt,
+    recipientAccountId: account.id
+  })
+  await seedTip({
+    postId: controlPost,
+    tipperId: controlId,
+    piconeros: controlPiconeros,
+    confirmedAt: new Date(confirmedAt.getTime() + 1000),
+    recipientAccountId: account.id
+  })
+  return { controlId }
+}
+
+test('a configured excluded curator earns no post or comment share', async () => {
+  const excluded = await createUser()
+  const base = Date.now() + 360 * FOUNDER_EXCLUSION_DAY
+  const { controlId } = await seedExclusionPair({
+    excludedId: excluded,
+    base,
+    titles: ['configured excluded post', 'configured excluded control post']
+  })
+
+  const { shares } = await computeCuratorShares(
+    new Date(base - 1000), new Date(base + FOUNDER_EXCLUSION_DAY), POOL,
+    { minPayout: 0n, topN: 100, excludedCuratorIds: [excluded] }, prisma)
+
+  expect(shares.map(s => s.curatorId)).not.toContain(excluded)
+  expect(shares.map(s => s.curatorId)).toContain(controlId)
+})
+
+test('a configured excluded curator does not consume a topN slot or reward rank', async () => {
+  const excluded = await createUser()
+  const base = Date.now() + 450 * FOUNDER_EXCLUSION_DAY
+  const { controlId } = await seedExclusionPair({
+    excludedId: excluded,
+    base,
+    titles: ['configured excluded topn post', 'configured excluded topn control post'],
+    excludedWeight: 100,
+    controlWeight: 10,
+    excludedPiconeros: 10_000_000_000_000n,
+    controlPiconeros: 10_000_000_000n
+  })
+
+  const { shares } = await computeCuratorShares(
+    new Date(base - 1000), new Date(base + FOUNDER_EXCLUSION_DAY), POOL,
+    { minPayout: 0n, topN: 1, excludedCuratorIds: [excluded] }, prisma)
+
+  expect(shares).toHaveLength(1)
+  expect(shares[0].curatorId).toBe(controlId)
+  expect(shares[0].earns[0].rank).toBe(1)
+})
+
+test('a configured excluded curator earns no comment share and does not consume comment rank', async () => {
+  const excluded = await createUser()
+  const control = await createUser()
+  const author = await createUser()
+  const account = await seedAccount()
+  const base = Date.now() + 810 * FOUNDER_EXCLUSION_DAY
+  const root = await createRootPostAt(author, 'configured excluded comment root', 10, new Date(base))
+  const excludedComment = await createCommentAt(excluded, root, 'configured excluded comment target', 100, new Date(base + 1000))
+  const controlComment = await createCommentAt(control, root, 'configured excluded comment control', 10, new Date(base + 2000))
+  const confirmedAt = new Date(base + 3000)
+  await seedTip({
+    postId: excludedComment,
+    tipperId: excluded,
+    piconeros: 10_000_000_000_000n,
+    confirmedAt,
+    recipientAccountId: account.id
+  })
+  await seedTip({
+    postId: controlComment,
+    tipperId: control,
+    piconeros: 10_000_000_000n,
+    confirmedAt: new Date(confirmedAt.getTime() + 1000),
+    recipientAccountId: account.id
+  })
+
+  const { shares } = await computeCuratorShares(
+    new Date(base - 1000), new Date(base + FOUNDER_EXCLUSION_DAY), POOL,
+    { minPayout: 0n, topN: 100, excludedCuratorIds: [excluded] }, prisma)
+
+  expect(shares.map(s => s.curatorId)).not.toContain(excluded)
+  expect(shares).toHaveLength(1)
+  expect(shares[0].curatorId).toBe(control)
+  expect(shares[0].earns).toHaveLength(1)
+  expect(shares[0].earns[0].type).toBe('TIP_COMMENT')
+  expect(shares[0].earns[0].rank).toBe(1)
+  // Independent oracle: the only surviving curator owns the whole pool. (The
+  // EACH_ZAP_PORTION split is a pre-normalization weight; with no surviving
+  // post-partition curators to normalize against, the roll-up renormalizes the
+  // sole comment share to 1.)
+  expect(shares[0].sharePiconeros).toBe(POOL)
+  expect(shares[0].earns[0].piconeros).toBe(shares[0].sharePiconeros)
+})
+
+test('a period with only a configured excluded curator\'s tips rolls the whole pool over', async () => {
+  const excluded = await createUser()
+  const account = await seedAccount()
+  const base = Date.now() + 540 * FOUNDER_EXCLUSION_DAY
+  const post = await createRootPostAt(excluded, 'configured excluded only post', 10, new Date(base))
+  await seedTip({
+    postId: post,
+    tipperId: excluded,
+    piconeros: 1_000_000_000n,
+    confirmedAt: new Date(base + 1000),
+    recipientAccountId: account.id
+  })
+
+  const { shares, distributedPiconeros, rolledOverPiconeros } = await computeCuratorShares(
+    new Date(base - 1000), new Date(base + FOUNDER_EXCLUSION_DAY), POOL,
+    { minPayout: 0n, topN: 100, excludedCuratorIds: [excluded] }, prisma)
+
+  expect(shares).toEqual([])
+  expect(distributedPiconeros).toBe(0n)
+  expect(rolledOverPiconeros).toBe(POOL)
+})
+
+test('empty or NULL exclusion config preserves founder-only behavior bit-for-bit', async () => {
+  await ensureFounderUser()
+  const controlId = await createUser()
+  const account = await seedAccount()
+  const base = Date.now() + 630 * FOUNDER_EXCLUSION_DAY
+  const founderPost = await createRootPostAt(USER_ID.stasher, 'configured excluded empty post', 10, new Date(base))
+  const controlPost = await createRootPostAt(controlId, 'configured excluded empty control post', 10, new Date(base + 1000))
+  const confirmedAt = new Date(base + 2000)
+  await seedTip({
+    postId: founderPost,
+    tipperId: USER_ID.stasher,
+    piconeros: 1_000_000_000n,
+    confirmedAt,
+    recipientAccountId: account.id
+  })
+  await seedTip({
+    postId: controlPost,
+    tipperId: controlId,
+    piconeros: 1_000_000_000n,
+    confirmedAt: new Date(confirmedAt.getTime() + 1000),
+    recipientAccountId: account.id
+  })
+
+  const periodStart = new Date(base - 1000)
+  const periodEnd = new Date(base + FOUNDER_EXCLUSION_DAY)
+  const params = { minPayout: 0n, topN: 100 }
+  const omitted = await computeCuratorShares(periodStart, periodEnd, POOL, params, prisma)
+  const empty = await computeCuratorShares(periodStart, periodEnd, POOL, { ...params, excludedCuratorIds: [] }, prisma)
+  const nullConfig = await computeCuratorShares(periodStart, periodEnd, POOL, { ...params, excludedCuratorIds: null }, prisma)
+
+  for (const result of [omitted, empty, nullConfig]) {
+    expect(result.shares.map(s => s.curatorId)).not.toContain(USER_ID.stasher)
+    expect(result.shares.map(s => s.curatorId)).toContain(controlId)
+    // Independent oracle: after the founder is removed, the control curator is
+    // the only survivor in either partition, so the normalized roll-up gives
+    // that account the whole pool.
+    expect(result.shares).toHaveLength(1)
+    expect(result.shares[0].curatorId).toBe(controlId)
+    expect(result.shares[0].sharePiconeros).toBe(POOL)
+  }
+  expect(serializeShares(empty)).toBe(serializeShares(omitted))
+  expect(serializeShares(nullConfig)).toBe(serializeShares(omitted))
+})
+
+test('duplicate, unknown, and malformed configured ids never invent new semantics', async () => {
+  const excluded = await createUser()
+  const base = Date.now() + 720 * FOUNDER_EXCLUSION_DAY
+  await seedExclusionPair({
+    excludedId: excluded,
+    base,
+    titles: ['configured excluded junk post', 'configured excluded junk control post']
+  })
+
+  const periodStart = new Date(base - 1000)
+  const periodEnd = new Date(base + FOUNDER_EXCLUSION_DAY)
+  const params = { minPayout: 0n, topN: 100 }
+  const single = await computeCuratorShares(periodStart, periodEnd, POOL,
+    { ...params, excludedCuratorIds: [excluded] }, prisma)
+  const duplicate = await computeCuratorShares(periodStart, periodEnd, POOL,
+    { ...params, excludedCuratorIds: [excluded, excluded] }, prisma)
+  const unknown = await computeCuratorShares(periodStart, periodEnd, POOL,
+    { ...params, excludedCuratorIds: [excluded, 999_999_999] }, prisma)
+
+  logError.mockClear()
+  const malformed = await computeCuratorShares(periodStart, periodEnd, POOL,
+    { ...params, excludedCuratorIds: [excluded, 'junk', 1.5, null, {}, 2 ** 40] }, prisma)
+
+  expect(single.shares).toHaveLength(1)
+  expect(single.shares[0].sharePiconeros).toBe(POOL)
+  expect(serializeShares(duplicate)).toBe(serializeShares(single))
+  expect(serializeShares(unknown)).toBe(serializeShares(single))
+  expect(serializeShares(malformed)).toBe(serializeShares(single))
+  expect(logError).toHaveBeenCalledWith(
+    expect.objectContaining({ invalidCount: 5 }),
+    expect.stringContaining('distributionExcludedCuratorIds'))
+})
+
+test('sanitizeExcludedCuratorIds keeps valid ids, dedupes, and ignores malformed config', () => {
+  expect(sanitizeExcludedCuratorIds([42, 42, 7])).toEqual([42, 7])
+  expect(sanitizeExcludedCuratorIds(null)).toEqual([])
+  expect(sanitizeExcludedCuratorIds(undefined)).toEqual([])
+
+  logError.mockClear()
+  expect(sanitizeExcludedCuratorIds('not-an-array')).toEqual([])
+  expect(logError).toHaveBeenCalledWith(
+    expect.objectContaining({ valueType: 'string' }),
+    expect.stringContaining('distributionExcludedCuratorIds'))
+
+  logError.mockClear()
+  expect(sanitizeExcludedCuratorIds([1.5, '2', null, {}, 9])).toEqual([9])
+  expect(logError).toHaveBeenCalledWith(
+    expect.objectContaining({ invalidCount: 4 }),
+    expect.stringContaining('distributionExcludedCuratorIds'))
 })
 
 // --- #6: trust-weight floor helpers (pure, no DB) ---

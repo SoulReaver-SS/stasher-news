@@ -24,10 +24,11 @@ import { META_SUB, USER_ID } from '@/lib/constants'
 // and the per-user total_proportion roll-up.
 //
 // One StasherNews-specific exception: the founder account `stasher` is not a
-// curator-reward recipient at all. Its tips still participate in the earlier
-// tip-ordering and trust stages, but it is removed from the final post/comment
-// attribution before normalization and ranking, so it never earns a share or
-// consumes a topN slot.
+// curator-reward recipient at all, and operators may exclude additional accounts
+// through PlatformFeeConfig.distributionExcludedCuratorIds. Their tips still
+// participate in the earlier tip-ordering and trust stages, but they are removed
+// from the final post/comment attribution before normalization and ranking, so
+// they never earn a share or consume a topN slot.
 //
 // This module is PURE: it computes shares and returns them. It touches no wallet,
 // creates no rows, and wires no job (Task 8's rewardsDistributor calls this and
@@ -70,6 +71,41 @@ const HANDICAP_ZAP_MULT = 0.5
 // normalization windows, so stasher's tips can still affect early-tipper
 // ordering and item-level proportions but stasher itself never earns.
 const CURATOR_EXCLUDED_ID = USER_ID.stasher
+
+// Operator-managed exclusions (PlatformFeeConfig.distributionExcludedCuratorIds)
+// are merged with the permanent founder exclusion. Only genuine positive
+// PostgreSQL int4 ids are accepted; anything else is ignored so malformed config
+// can never unexpectedly change payouts. A non-array value is ignored as a
+// whole, while invalid entries inside an array are skipped (valid entries still
+// apply).
+const MAX_POSTGRES_INT = 2_147_483_647
+
+export function sanitizeExcludedCuratorIds (configured) {
+  if (configured == null) return []
+  if (!Array.isArray(configured)) {
+    logError({ valueType: typeof configured }, 'curatorShares: ignoring malformed distributionExcludedCuratorIds (expected an array of integer user ids)')
+    return []
+  }
+  const ids = []
+  let invalidCount = 0
+  for (const id of configured) {
+    if (!Number.isInteger(id) || id <= 0 || id > MAX_POSTGRES_INT) {
+      invalidCount += 1
+      continue
+    }
+    if (!ids.includes(id)) ids.push(id)
+  }
+  if (invalidCount > 0) {
+    logError({ invalidCount }, 'curatorShares: ignoring invalid distributionExcludedCuratorIds entries')
+  }
+  return ids
+}
+
+// The complete exclusion set for a computation: the founder is ALWAYS present,
+// regardless of operator config. Order is deterministic (founder first).
+export function resolveExcludedCuratorIds (configured) {
+  return [...new Set([CURATOR_EXCLUDED_ID, ...sanitizeExcludedCuratorIds(configured)])]
+}
 
 // --- Curator trust weighting (#6) ---
 
@@ -139,27 +175,30 @@ function apportionEarns (earns, sharePiconeros) {
  * @param {Date} periodStart - inclusive start of the reward window.
  * @param {Date} periodEnd   - exclusive end of the reward window.
  * @param {bigint} poolPiconeros - total piconeros to distribute this period.
- * @param {{ minPayout?: bigint, topN?: number, trustWeightFloor?: number }} [opts]
+ * @param {{ minPayout?: bigint, topN?: number, trustWeightFloor?: number, excludedCuratorIds?: number[] }} [opts]
  *   - minPayout: shares below this are excluded and roll over (NOT redistributed).
  *   - topN: cap on the number of recipients (highest proportion first).
+ *   - excludedCuratorIds: operator-configured accounts that never earn a share.
+ *     The founder is always excluded in addition to this list.
  * @param {object} [models] - Prisma client. A throwaway client is created if
  *   omitted (and disconnected after the query).
  * @returns {Promise<{ shares: Array<{ curatorId: number, sharePiconeros: bigint, earns: Array<{ type: 'TIP_POST'|'TIP_COMMENT', rank: number, piconeros: bigint }> }>, distributedPiconeros: bigint, rolledOverPiconeros: bigint }>}
  *   `share.earns` partitions `sharePiconeros` by content type; its piconeros sum
  *   exactly to `sharePiconeros`. Consumed when writing per-(curator,type) Earn rows.
  */
-export async function computeCuratorShares (periodStart, periodEnd, poolPiconeros, { minPayout = 0n, topN = 100, trustWeightFloor = 1.0 } = {}, models) {
+export async function computeCuratorShares (periodStart, periodEnd, poolPiconeros, { minPayout = 0n, topN = 100, trustWeightFloor = 1.0, excludedCuratorIds = [] } = {}, models) {
   const ownsClient = !models
   const db = ownsClient ? createPrisma() : models
   const floor = sanitizeTrustWeightFloor(trustWeightFloor)
+  const excludedIds = resolveExcludedCuratorIds(excludedCuratorIds)
   try {
-    return await compute(db, periodStart, periodEnd, poolPiconeros, minPayout, topN, floor)
+    return await compute(db, periodStart, periodEnd, poolPiconeros, minPayout, topN, floor, excludedIds)
   } finally {
     if (ownsClient) db.$disconnect().catch(console.error)
   }
 }
 
-async function compute (models, periodStart, periodEnd, poolPiconeros, minPayout, topN, trustWeightFloor) {
+async function compute (models, periodStart, periodEnd, poolPiconeros, minPayout, topN, trustWeightFloor, excludedIds) {
   const handicapIds = await nymsToIds(models, HANDICAP_NYMS)
   // Per-curator raw proportions from the ported CTE. Each row is
   // { curatorId: number, total_proportion: number, earns: string (json_agg text) }.
@@ -274,7 +313,7 @@ async function compute (models, periodStart, periodEnd, poolPiconeros, minPayout
       FROM item_zapper_ratios
       WHERE item_zapper_proportion > 0
         AND ${EACH_ZAP_PORTION} > 0
-        AND "userId" <> ${CURATOR_EXCLUDED_ID}::int
+        AND NOT ("userId" = ANY(${excludedIds}::int[]))
     )
     -- roll every curator's per-type proportions up into one total, keeping the
     -- per-type breakdown (type/rank/typeProportion) for Earn row writing.

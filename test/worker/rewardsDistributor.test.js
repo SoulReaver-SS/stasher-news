@@ -33,7 +33,7 @@ import { USER_ID } from '@/lib/constants'
 // lib/alert is mocked so operator pages are assertable without a network side
 // effect (same pattern as test/worker/reconcilePendingTips.test.js).
 import { alert } from '@/lib/alert'
-import { logError, logWarn } from '@/lib/logger'
+import logger, { logError, logWarn } from '@/lib/logger'
 jest.mock(`${process.cwd()}/lib/alert`, () => ({
   alert: jest.fn()
 }))
@@ -177,6 +177,8 @@ let seededCurators // { c1, c2, c3 } — c3 has NO registered payout address
 let genuineRewardsShare // rewards share of genuine (non-fixture) inflow in the period (beforeAll)
 let genuineOpsShare // ops share of genuine (non-fixture) inflow in the period (beforeAll)
 let priorTrustFloor = null
+let priorDistributionExcludedCuratorIds = []
+let priorDistributionTopN = null
 let priorRewardsAddress
 let priorNetworkEnv
 
@@ -465,6 +467,8 @@ beforeAll(async () => {
   // runs against the shared dev DB and must leave no trace (AGENTS norm).
   const priorConfigRow = await prisma.platformFeeConfig.findUnique({ where: { id: 1 } })
   priorTrustFloor = priorConfigRow?.curatorTrustWeightFloor ?? null
+  priorDistributionExcludedCuratorIds = priorConfigRow?.distributionExcludedCuratorIds ?? []
+  priorDistributionTopN = priorConfigRow?.distributionTopN ?? null
 
   // Ensure the PlatformFeeConfig singleton exists with schema defaults
   // (downvoteRewardsPct=100, postingFeeRewardsPct=70, territoryFeeRewardsPct=30,
@@ -472,7 +476,13 @@ beforeAll(async () => {
   // curatorTrustWeightFloor is PINNED to 1.0 for this suite: only c1 has a
   // seeded UserSubTrust row, so any other floor would discount c2/c3 and break
   // the exact-pool assertions regardless of operator config.
-  await prisma.platformFeeConfig.upsert({ where: { id: 1 }, update: { curatorTrustWeightFloor: 1.0 }, create: { id: 1 } })
+  // distributionExcludedCuratorIds is pinned empty for the same reason: the
+  // suite's exact-pool assertions describe the default (founder-only) exclusion.
+  await prisma.platformFeeConfig.upsert({
+    where: { id: 1 },
+    update: { curatorTrustWeightFloor: 1.0, distributionExcludedCuratorIds: [] },
+    create: { id: 1 }
+  })
 
   // Clear any RESULT distribution left over from a prior run whose periodEnd
   // falls inside the coming week (otherwise runDistributionOnce's idempotency
@@ -712,13 +722,17 @@ afterAll(async () => {
   await prisma.moneroAccount.deleteMany({ where: { id: { in: created.accounts } } })
   for (const id of created.users) await prisma.user.deleteMany({ where: { id } })
 
-  // Restore the operator's pre-suite floor (leave-no-trace on the shared dev
-  // DB). If this suite's pin CREATED the singleton row, leave it with schema
-  // defaults — semantically identical to the pre-suite world. A killed run
-  // skips this restore (documented residue, same class as fixture residue).
+  // Restore the operator's pre-suite floor and exclusion list (leave-no-trace
+  // on the shared dev DB). If this suite's pin CREATED the singleton row, leave
+  // it with schema defaults — semantically identical to the pre-suite world. A
+  // killed run skips this restore (documented residue, same class as fixture
+  // residue).
   await prisma.platformFeeConfig.upsert({
     where: { id: 1 },
-    update: { curatorTrustWeightFloor: priorTrustFloor ?? 1.0 },
+    update: {
+      curatorTrustWeightFloor: priorTrustFloor ?? 1.0,
+      distributionExcludedCuratorIds: priorDistributionExcludedCuratorIds
+    },
     create: { id: 1 }
   })
 
@@ -1630,6 +1644,138 @@ test('stasher receives neither a curator payout nor a referral payout', async ()
   const allEarns = await prisma.earn.findMany({ where: { distributionId: dist.id } })
   const total = allEarns.reduce((acc, e) => acc + e.piconeros, 0n)
   expect(total).toBe(dist.distributedPiconeros)
+})
+
+// Remove the current week's distribution (Earn -> payout -> distribution,
+// FK-safe) so the next runDistributionOnce writes a fresh allocation for the
+// same week instead of returning the idempotency guard's existing row.
+async function clearCurrentWeekDistribution () {
+  const current = await prisma.rewardDistribution.findFirst({
+    where: { periodEnd: { gte: new Date(Date.now() - 7 * DAY) } },
+    orderBy: { periodEnd: 'desc' }
+  })
+  if (!current) return
+  await prisma.earn.deleteMany({ where: { distributionId: current.id } })
+  await prisma.rewardPayout.deleteMany({ where: { distributionId: current.id } })
+  await prisma.rewardDistribution.deleteMany({ where: { id: current.id } })
+}
+
+test('configured exclusions remove payouts and promote the next curator; a runtime removal restores them', async () => {
+  await clearCurrentWeekDistribution()
+
+  const excluded = await createUser()
+  const control = await createUser()
+  await createPayoutAccount(excluded)
+  await createPayoutAccount(control)
+  const author = await createUser()
+  const recipientAccount = await createRecipientAccount()
+  // 5e6 outranks every earlier test post (<=4e6), so topN=1 isolates this
+  // post's two curators from the suite's accumulated fixtures.
+  const post = await createRootPost(author, 5_000_000, new Date(Date.now() - DAY))
+  const at = new Date(Date.now() - DAY + 1000)
+  await seedTip({ postId: post, tipperId: excluded, piconeros: 2_000_000_000_000n, confirmedAt: at, recipientAccountId: recipientAccount.id })
+  await seedTip({ postId: post, tipperId: control, piconeros: 2_000_000_000_000n, confirmedAt: new Date(at.getTime() + 60000), recipientAccountId: recipientAccount.id })
+
+  await prisma.platformFeeConfig.update({ where: { id: 1 }, data: { distributionTopN: 1 } })
+  try {
+    // Operator add, exactly as documented in the runbook.
+    await prisma.$executeRaw`
+      UPDATE "PlatformFeeConfig" SET "distributionExcludedCuratorIds" = (
+        SELECT array_agg(DISTINCT v)
+        FROM unnest(COALESCE("distributionExcludedCuratorIds", '{}') || ARRAY[${excluded}::int]) AS v)
+      WHERE id = 1`
+
+    logger.info.mockClear()
+    const excludedRun = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
+    created.distributions.push(excludedRun.id)
+
+    expect(excludedRun.payouts.some(p => p.curatorId === excluded)).toBe(false)
+    expect(await prisma.earn.count({ where: { userId: excluded, distributionId: excludedRun.id } })).toBe(0)
+    const controlPayout = excludedRun.payouts.find(p => p.curatorId === control)
+    expect(controlPayout).toBeDefined()
+    expect(controlPayout.state).toBe('SENT')
+    // The excluded account consumes no slot: the next-ranked curator receives
+    // the whole (topN=1) allocation and the ledger still reconciles.
+    expect(excludedRun.distributedPiconeros).toBe(controlPayout.piconeros)
+    expect(excludedRun.distributedPiconeros + excludedRun.rolledOverPiconeros).toBe(excludedRun.poolPiconeros)
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ excludedCurators: 2 }), // founder + configured account
+      'rewardsDistributor: distribution complete')
+
+    // Operator removal, exactly as documented; the NEXT run must see it.
+    await clearCurrentWeekDistribution()
+    await prisma.$executeRaw`
+      UPDATE "PlatformFeeConfig"
+      SET "distributionExcludedCuratorIds" = array_remove(COALESCE("distributionExcludedCuratorIds", '{}'), ${excluded}::int)
+      WHERE id = 1`
+
+    const restoredRun = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
+    created.distributions.push(restoredRun.id)
+    const restoredPayout = restoredRun.payouts.find(p => p.curatorId === excluded)
+    expect(restoredPayout).toBeDefined()
+    expect(restoredPayout.state).toBe('SENT')
+    expect(await prisma.earn.count({ where: { userId: excluded, distributionId: restoredRun.id } })).toBeGreaterThan(0)
+  } finally {
+    await prisma.platformFeeConfig.update({
+      where: { id: 1 },
+      data: { distributionExcludedCuratorIds: [], distributionTopN: priorDistributionTopN ?? 10 }
+    })
+  }
+})
+
+test('configured exclusions block referral commissions as both referrer and source', async () => {
+  await clearCurrentWeekDistribution()
+
+  const excluded = await createUser()
+  const excludedReferrer = await createUser()
+  const paidCurator = await createUser()
+  await prisma.user.update({ where: { id: excluded }, data: { referrerId: excludedReferrer } })
+  await prisma.user.update({ where: { id: paidCurator }, data: { referrerId: excluded } })
+  await createPayoutAccount(excluded)
+  await createPayoutAccount(excludedReferrer)
+  await createPayoutAccount(paidCurator)
+  const author = await createUser()
+  const recipientAccount = await createRecipientAccount()
+  // 6e6 outranks the prior exclusion test's 5e6 post; topN=1 keeps the
+  // referral accounting exact (only this post's surviving curator is paid).
+  const post = await createRootPost(author, 6_000_000, new Date(Date.now() - DAY))
+  const at = new Date(Date.now() - DAY + 1000)
+  await seedTip({ postId: post, tipperId: excluded, piconeros: 2_000_000_000_000n, confirmedAt: at, recipientAccountId: recipientAccount.id })
+  await seedTip({ postId: post, tipperId: paidCurator, piconeros: 2_000_000_000_000n, confirmedAt: new Date(at.getTime() + 60000), recipientAccountId: recipientAccount.id })
+
+  await prisma.platformFeeConfig.update({
+    where: { id: 1 },
+    data: { distributionTopN: 1, distributionExcludedCuratorIds: [excluded] }
+  })
+  try {
+    const dist = await runDistributionOnce({ models: prisma, sendPayouts: fakeSigner, scheduleOpsSweep: false })
+    created.distributions.push(dist.id)
+
+    // Excluded as a curator: no payout, no Earn, and no 10% commission for its
+    // own referrer (the excluded account never appears in `shares`).
+    expect(dist.payouts.some(p => p.curatorId === excluded)).toBe(false)
+    expect(await prisma.earn.count({ where: { userId: excluded, distributionId: dist.id } })).toBe(0)
+    expect(dist.payouts.some(p => p.curatorId === excludedReferrer)).toBe(false)
+    expect(await prisma.earn.count({ where: { userId: excludedReferrer, distributionId: dist.id } })).toBe(0)
+
+    // Excluded as a referrer: the surviving curator is paid, but the 10%
+    // commission its excluded referrer would receive is reserved, not paid or
+    // redirected. The reserved amount therefore remains in rollover.
+    const paidPayout = dist.payouts.find(p => p.curatorId === paidCurator)
+    expect(paidPayout).toBeDefined()
+    expect(dist.payouts).toHaveLength(1)
+    expect(dist.distributedPiconeros).toBe(paidPayout.piconeros)
+    expect(dist.rolledOverPiconeros).toBe(dist.poolPiconeros - paidPayout.piconeros)
+    expect(dist.distributedPiconeros + dist.rolledOverPiconeros).toBe(dist.poolPiconeros)
+    expect(await prisma.earn.count({
+      where: { userId: excluded, type: 'FOREVER_REFERRAL', distributionId: dist.id }
+    })).toBe(0)
+  } finally {
+    await prisma.platformFeeConfig.update({
+      where: { id: 1 },
+      data: { distributionExcludedCuratorIds: [], distributionTopN: priorDistributionTopN ?? 10 }
+    })
+  }
 })
 
 test('a prior-week allocation ending just before Monday does not block this week\'s allocation', async () => {

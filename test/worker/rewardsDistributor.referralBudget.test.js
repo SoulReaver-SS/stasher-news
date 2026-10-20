@@ -62,6 +62,35 @@ test('an addressless non-excluded referrer still does not consume budget', async
   expect(remainingBudget).toBe(5n)
 })
 
+test('a configured excluded referrer reserves its capped commission instead of paying it', async () => {
+  const referralByReferrer = new Map([
+    [42, { piconeros: 10n }],
+    [43, { piconeros: 10n }]
+  ])
+
+  const { rows, remainingBudget } = await allocateReferralPayouts(
+    modelsWithAccounts([42, 43]), referralByReferrer, 15n, [42, 42])
+
+  // The excluded referrer's 10 is reserved (not paid, not redirected); the
+  // later referrer receives only the remaining 5 and the whole budget closes.
+  expect(rows).toEqual([{ curatorId: 43, recipientAddress: 'addr-43', piconeros: 5n }])
+  expect(remainingBudget).toBe(0n)
+})
+
+test('the configured exclusion list supplements, never replaces, the founder exclusion', async () => {
+  const referralByReferrer = new Map([
+    [USER_ID.stasher, { piconeros: 10n }],
+    [42, { piconeros: 10n }],
+    [43, { piconeros: 10n }]
+  ])
+
+  const { rows, remainingBudget } = await allocateReferralPayouts(
+    modelsWithAccounts([USER_ID.stasher, 42, 43]), referralByReferrer, 25n, [42])
+
+  expect(rows).toEqual([{ curatorId: 43, recipientAddress: 'addr-43', piconeros: 5n }])
+  expect(remainingBudget).toBe(0n)
+})
+
 test('an exhausted referral budget pays nobody', async () => {
   const referralByReferrer = new Map([[42, { piconeros: 10n }]])
 

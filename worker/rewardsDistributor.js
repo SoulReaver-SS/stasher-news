@@ -1,13 +1,12 @@
 import { Prisma } from '@prisma/client'
 import createPrisma from '@/lib/create-prisma'
-import { computeCuratorShares, effectiveTrustWeightFloor } from './curatorShares'
+import { computeCuratorShares, effectiveTrustWeightFloor, resolveExcludedCuratorIds } from './curatorShares'
 import { sendPayouts as defaultSendPayouts, getRewardsWallet } from '@/api/monero/rewards'
 import { reconcileWalletTransactions, errorLabel } from '@/api/monero/rewardsTransactions'
 import logger, { logInfo, logError } from '@/lib/logger'
 import { alert } from '@/lib/alert'
 import { moneroDistributionStatus } from '@/lib/metrics'
 import { opsCarry, walletScope, WEEKLY_CURATOR_CAP_PICONEROS } from '@/lib/rewardsAccounting'
-import { USER_ID } from '@/lib/constants'
 import { readRewardsInflow } from '@/api/monero/rewardsInflow'
 import { readRewardsWalletLedger } from '@/api/monero/rewardsLedger'
 import { withRewardsPhase } from './rewardsPhase'
@@ -46,17 +45,19 @@ const DISTRIBUTION_STATUS_GAUGE = { PENDING: 0, SENDING: 1, COMPLETE: 2, FAILED:
 
 // Allocate the capped referral budget in insertion order. A referrer without a
 // receiving account is skipped without consuming budget (legacy behavior).
-// The excluded founder account is different: its otherwise-payable, capped
-// commission is RESERVED and not paid, so a later referrer can never receive
-// the excluded money. The caller's distributed/rolled-over split then leaves
-// that reserved amount in rolledOverPiconeros.
-export async function allocateReferralPayouts (models, referralByReferrer, referralBudget) {
+// Excluded accounts (the founder, plus any operator-configured curator
+// exclusions) are different: their otherwise-payable, capped commission is
+// RESERVED and not paid, so a later referrer can never receive the excluded
+// money. The caller's distributed/rolled-over split then leaves that reserved
+// amount in rolledOverPiconeros.
+export async function allocateReferralPayouts (models, referralByReferrer, referralBudget, excludedCuratorIds = []) {
+  const excludedIds = new Set(resolveExcludedCuratorIds(excludedCuratorIds))
   const rows = []
   let remainingBudget = referralBudget
   for (const [referrerId, entry] of referralByReferrer) {
     if (remainingBudget <= 0n) break
     const piconeros = entry.piconeros < remainingBudget ? entry.piconeros : remainingBudget
-    if (referrerId === USER_ID.stasher) {
+    if (excludedIds.has(referrerId)) {
       remainingBudget -= piconeros
       continue
     }
@@ -179,6 +180,10 @@ async function distribute (models) {
 
     // --- Allocation config (platform singleton row, id=1) ---
     const config = await tx.platformFeeConfig.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } })
+    // Read at distribution time: an operator's SQL edit takes effect on the
+    // next weekly run (no worker restart). The founder is always included.
+    const excludedCuratorIds = resolveExcludedCuratorIds(config.distributionExcludedCuratorIds)
+    const excludedCuratorIdSet = new Set(excludedCuratorIds)
 
     // --- Inflow through the ONE shared reader (all CONFIRMED eligible, the
     // fee sources require walletReceipt=true, exact mixed-rollover reward
@@ -242,7 +247,12 @@ async function distribute (models) {
     // writes below — fully consistent at no extra cost. ---
     const { shares } = await computeCuratorShares(
       periodStart, periodEnd, curatorBudget,
-      { minPayout: toBigInt(config.distributionMinPayoutPiconeros), topN: config.distributionTopN, trustWeightFloor },
+      {
+        minPayout: toBigInt(config.distributionMinPayoutPiconeros),
+        topN: config.distributionTopN,
+        trustWeightFloor,
+        excludedCuratorIds
+      },
       tx)
 
     // --- Address filter + payout rows ---
@@ -270,9 +280,9 @@ async function distribute (models) {
     // curators). The total of curator + referral payouts is capped at the pool so
     // rolledOverPiconeros never goes negative.
     //
-    // The founder account stasher is excluded from referral payouts too — as a
-    // recipient (someone else's referrer) and as a source (its own curator share,
-    // already absent from `shares`). Its 10% cut is not redirected to another
+    // Excluded accounts are blocked from referral payouts too — as recipients
+    // (someone else's referrer) and as sources (their curator share is already
+    // absent from `shares`). Their 10% cut is not redirected to another
     // recipient; it simply remains part of the distribution's rollover.
     const curatorTotal = payoutRows.reduce((acc, p) => acc + p.piconeros, 0n)
     const referralBudget = poolPiconeros - curatorTotal
@@ -280,9 +290,9 @@ async function distribute (models) {
     const referralByReferrer = new Map() // referrerId -> { piconeros }
     for (const share of shares) {
       if (share.sharePiconeros <= 0n) continue
-      // Defensive: stasher is already absent from computeCuratorShares, but an
-      // excluded curator must never generate a referral commission either.
-      if (share.curatorId === USER_ID.stasher) continue
+      // Defensive: excluded accounts are already absent from computeCuratorShares,
+      // but one must never generate a referral commission either.
+      if (excludedCuratorIdSet.has(share.curatorId)) continue
       // R04: referral payouts are earned on PAID curator shares only. A
       // wallet-less curator's share rolls over — 10% of money that was never
       // paid must not leak to their referrer.
@@ -306,7 +316,7 @@ async function distribute (models) {
     // contributes BOTH row kinds (same curatorId) — without the tag, the curator
     // loop re-emits the referrer's TIP_* earns and the referral loop emits a
     // FOREVER_REFERRAL row for the referrer's own curator share.
-    const { rows: referralPayouts } = await allocateReferralPayouts(tx, referralByReferrer, referralBudget)
+    const { rows: referralPayouts } = await allocateReferralPayouts(tx, referralByReferrer, referralBudget, excludedCuratorIds)
     const referralPayoutRows = new Set(referralPayouts)
     payoutRows.push(...referralPayouts)
 
@@ -393,7 +403,9 @@ async function distribute (models) {
       distributed: distributedPiconeros.toString(),
       rolledOver: finalRolledOverPiconeros.toString(),
       opsAvailable: opsAvailable.toString(),
-      payouts: payoutRows.length
+      payouts: payoutRows.length,
+      // Founder + operator-configured exclusions active for this run.
+      excludedCurators: excludedCuratorIds.length
     }, 'rewardsDistributor: distribution complete')
 
     return await tx.rewardDistribution.findUnique({

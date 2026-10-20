@@ -2271,6 +2271,12 @@ model PlatformFeeConfig {
   // trust-walk heartbeat (HealthSnapshot.trustCompletedAt) or an empty trust
   // table forces 1.0 (fail-safe, see worker/rewardsDistributor.js).
   curatorTrustWeightFloor            Float  @default(1.0)
+  // Operator-managed account exclusions from the weekly curator distribution
+  // (and its referral commissions). The founder account is always excluded in
+  // addition to this list. Empty (default) = founder-only behavior. Entries not
+  // resolving to a positive integer are ignored with a log line. Read at
+  // distribution time, so a SQL edit takes effect on the next weekly run.
+  distributionExcludedCuratorIds Int[] @default([])
 }
 
 // Singleton (id=1) cache of the monerod chain tip, written by the
