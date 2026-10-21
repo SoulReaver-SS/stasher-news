@@ -8,6 +8,7 @@ import { useQuery } from '@apollo/client/react'
 import { useData } from '@/components/use-data'
 import { SSR, FAST_POLL_INTERVAL_MS } from '@/lib/constants'
 import { piconerosToXmr } from '@/lib/format'
+import { copyDrawdownWeeks, formatMultiple } from '@/lib/curatorBudgetCopy'
 import { CURATOR_FALLBACK_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 
 const REWARDS_WALLET = gql`
@@ -43,6 +44,12 @@ const REWARDS_WALLET = gql`
         walletlessTipRewardsPct
       }
     }
+    curatorBudget {
+      mode
+      fallbackBudgetPiconeros
+      targetMultBps
+      drawdownWeeks
+    }
     rewardDistributions(limit: 10) {
       id
       periodStart
@@ -60,6 +67,23 @@ const REWARDS_WALLET = gql`
       correctedPendingOpsPiconeros
       opsSweepTxHash
       opsSweepState
+      rawTipPiconeros
+      trustedTipPiconeros
+      tipperCount
+      breakerTripped
+      breakerRawTPiconeros
+      makeupPiconeros
+      incomePiconeros
+      tipT4Piconeros
+      incomeF4Piconeros
+      reservePiconeros
+      spendLimitPiconeros
+      multBps
+      dynamicBudgetPiconeros
+      dynamicBudgetMode
+      curatorBudgetMode
+      appliedCuratorBudgetPiconeros
+      eligibleTipStages
       payouts {
         id
         curatorId
@@ -88,6 +112,40 @@ function explorerTxUrl (network) {
 function toBigInt (v) {
   return typeof v === 'bigint' ? v : BigInt(v)
 }
+
+function xmrOrDash (value) {
+  return value == null ? '—' : piconerosToXmr(toBigInt(value))
+}
+
+// The distribution table renders a missing multiple as a dash.
+function formatMultipleOrDash (multBps) {
+  return formatMultiple(multBps) ?? '—'
+}
+
+export { DEFAULT_DRAWDOWN_WEEKS } from '@/lib/curatorBudgetCopy'
+
+// The per-run spending limit. Backfilled history (and pre-feature rows) never
+// recorded budget fields — show that plainly instead of inventing a figure.
+export function spendLimitLabel (spendLimitPiconeros, hasRecordedBudget) {
+  if (!hasRecordedBudget) return 'not recorded'
+  return xmrOrDash(spendLimitPiconeros)
+}
+
+function stageXmr (stages, key) {
+  const value = stages?.[key]
+  return value == null ? null : piconerosToXmr(toBigInt(value))
+}
+
+const DISTRIBUTION_STAGE_ROWS = [
+  ['raw', 'Raw tips'],
+  ['eligible', 'Eligible tips'],
+  ['afterExclusions', 'After exclusions'],
+  ['ranked', 'Ranked'],
+  ['handicapped', 'Founder handicap'],
+  ['trusted', 'Trust weighted'],
+  ['capped', 'Per-tipper cap'],
+  ['final', 'Final T']
+]
 
 function opsSweepLabel (state) {
   switch (state) {
@@ -130,6 +188,9 @@ export default function Transparency ({ ssrData }) {
   const w = dat.rewardsWalletInfo
   const pi = w.inflowBreakdown
   const dists = dat.rewardDistributions || []
+  const budget = dat.curatorBudget
+  const isDynamicBudget = budget?.mode === 'ACTIVE'
+  const targetMultiple = budget?.targetMultBps == null ? '1.5×' : formatMultipleOrDash(budget.targetMultBps)
 
   return (
     <Layout footerLinks>
@@ -202,14 +263,36 @@ export default function Transparency ({ ssrData }) {
               the last distribution (after proven sweeps and real network fees) plus
               this week's accrual — awaiting its sweep to the ops wallet. They are
               literal allocations, not a pro-rata slice of the balance; a negative
-              ops figure is unfunded debt, not free cash. Weekly curator payouts are
-              capped at {piconerosToXmr(CURATOR_FALLBACK_CAP_PICONEROS)}; referral payouts may be
-              additional, limited by the remaining pool. All unused rewards roll over.
-              The ops sweep has no weekly amount cap; network fees are paid by ops.
+              ops figure is unfunded debt, not free cash.{' '}
+              {isDynamicBudget
+                ? (
+                  <>
+                    Weekly curator payouts follow the dynamic budget: about {targetMultiple} recent
+                    eligible curator tips; when the reserve runs low, spending is limited to the
+                    pool's income plus 1/{copyDrawdownWeeks(budget)} of its reserve each week, so
+                    payouts slide gradually toward income instead of stopping; referral payouts
+                    may be additional, limited by the remaining pool.
+                    All unused rewards roll over.
+                  </>
+                  )
+                : (
+                  <>
+                    Weekly curator payouts are capped at {piconerosToXmr(CURATOR_FALLBACK_CAP_PICONEROS)};
+                    referral payouts may be additional, limited by the remaining pool.
+                    All unused rewards roll over.
+                  </>
+                  )}
+              {' '}The ops sweep has no weekly amount cap; network fees are paid by ops.
             </small>
           </p>
           <div className='d-flex flex-wrap justify-content-between border-bottom border-top py-3 my-2'>
-            <Stat label='Rewards allocation' value={piconerosToXmr(toBigInt(w.nextPoolPiconeros))} sub='full pool — weekly curator cap applies; excess rolls over' />
+            <Stat
+              label='Rewards allocation'
+              value={piconerosToXmr(toBigInt(w.nextPoolPiconeros))}
+              sub={isDynamicBudget
+                ? 'full pool — weekly dynamic curator budget applies; excess rolls over'
+                : 'full pool — weekly curator cap applies; excess rolls over'}
+            />
             <Stat label='Ops allocation' value={piconerosToXmr(toBigInt(w.pendingSweepPiconeros))} sub='unswept from the last distribution + accruing this week' />
           </div>
 
@@ -240,7 +323,7 @@ export default function Transparency ({ ssrData }) {
               Recent weekly curator distributions. Each payout is a real on-chain
               Monero transaction from the rewards wallet — verify any tx hash on
               the explorer. Curator handles are shown as nyms; sub-threshold
-              shares and funds above the weekly curator cap roll over (less any
+              shares and {isDynamicBudget ? 'unused dynamic budget' : 'funds above the weekly curator cap'} roll over (less any
               additional referral payouts). The ops allocation is swept to
               the ops wallet when the hot wallet has enough unlocked change; when
               it doesn't (recent incoming outputs are still locked), the sweep is
@@ -260,62 +343,133 @@ export default function Transparency ({ ssrData }) {
               )
             : (
               <div className='border-bottom border-top py-3 my-2'>
-                {dists.map((d, di) => (
-                  <div key={d.id} className={di < dists.length - 1 ? 'mb-4 pb-3 border-bottom' : ''}>
-                    <div className='d-flex flex-wrap justify-content-between'>
-                      <Stat
-                        label={`Distribution #${d.id} — ${d.status}`}
-                        value={`${d.payoutCount} payout${d.payoutCount === 1 ? '' : 's'}`}
-                        sub={`${new Date(d.periodStart).toLocaleDateString()} → ${new Date(d.periodEnd).toLocaleDateString()}`}
-                      />
-                      <Stat label='Pool' value={piconerosToXmr(toBigInt(d.poolPiconeros))} />
-                      <Stat label='Distributed' value={piconerosToXmr(toBigInt(d.distributedPiconeros))} />
-                      <Stat label='Rolled over' value={piconerosToXmr(toBigInt(d.rolledOverPiconeros))} />
-                    </div>
-                    <div className='d-flex flex-wrap justify-content-between align-items-start ms-2 mt-1'>
-                      <Stat label='Ops inflow' value={piconerosToXmr(toBigInt(d.opsInflowPiconeros))} sub="this period's ops share" />
-                      <Stat label='Ops swept' value={piconerosToXmr(toBigInt(d.opsSweptPiconeros))} sub={`ops sweep: ${opsSweepLabel(d.opsSweepState)}`} />
-                      <Stat label='Fees accounted' value={piconerosToXmr(toBigInt(d.opsNetworkFeesAccountedPiconeros))} sub='hot-wallet fees inside this snapshot' />
-                      <Stat
-                        label='Pending ops (adjusted)'
-                        value={piconerosToXmr(toBigInt(d.correctedPendingOpsPiconeros))}
-                        sub={toBigInt(d.correctedPendingOpsPiconeros) < 0n
-                          ? "unfunded — fees and sweeps exceed this period's ops earmark"
-                          : d.opsSweepState === 'SKIPPED_LOCKED'
-                            ? 'deferred — locked change, lands next period'
-                            : 'after proven sweeps and network fees'}
-                      />
-                    </div>
-                    {d.opsSweepTxHash && (
-                      <div className='ms-2 mt-1'>
-                        {d.opsSweepTxHash.split(',').map((h, i) => (
-                          <a key={h} href={`${explorerTxUrl(w.network)}${h}`} target='_blank' rel='noreferrer' className='d-block'>
-                            <small className='text-monospace text-break text-decoration-none'>
-                              {i === 0 ? 'ops sweep' : 'sweep'} tx: {h.slice(0, 24)}…
-                            </small>
-                          </a>
-                        ))}
+                {dists.map((d, di) => {
+                  const stages = d.eligibleTipStages
+                  const backfilled = stages?.backfilled === true
+                  // Backfill never writes budget fields, so a recorded spending
+                  // limit marks a live run. multBps alone cannot gate this: a
+                  // T4 = 0 run legitimately records a NULL (0÷0) effective
+                  // multiple next to a real limit.
+                  const hasRecordedBudget = !backfilled && d.spendLimitPiconeros != null
+                  const makeup = d.makeupPiconeros == null ? 0n : toBigInt(d.makeupPiconeros)
+                  return (
+                    <div key={d.id} className={di < dists.length - 1 ? 'mb-4 pb-3 border-bottom' : ''}>
+                      <div className='d-flex flex-wrap justify-content-between'>
+                        <Stat
+                          label={`Distribution #${d.id} — ${d.status}`}
+                          value={`${d.payoutCount} payout${d.payoutCount === 1 ? '' : 's'}`}
+                          sub={`${new Date(d.periodStart).toLocaleDateString()} → ${new Date(d.periodEnd).toLocaleDateString()}`}
+                        />
+                        <Stat label='Pool' value={piconerosToXmr(toBigInt(d.poolPiconeros))} />
+                        <Stat label='Distributed' value={piconerosToXmr(toBigInt(d.distributedPiconeros))} />
+                        <Stat label='Rolled over' value={piconerosToXmr(toBigInt(d.rolledOverPiconeros))} />
                       </div>
-                    )}
-                    {di === 0 && d.payouts.length > 0 && (
-                      <div className='ms-2 mt-2'>
-                        <small className='text-muted fw-bold d-block mb-1'>Payouts (latest distribution):</small>
-                        {d.payouts.map(p => (
-                          <div key={p.id} className='d-flex flex-column mb-1'>
-                            <span className='text-monospace'>
-                              {p.curatorNym || `user #${p.curatorId}`} — {p.amountXmr} XMR — {p.state}
-                            </span>
-                            {p.txHash && (
-                              <a href={`${explorerTxUrl(w.network)}${p.txHash}`} target='_blank' rel='noreferrer'>
-                                <small className='text-monospace text-break text-decoration-none'>{p.txHash.slice(0, 24)}…</small>
-                              </a>
-                            )}
+                      {d.trustedTipPiconeros != null && (
+                        <>
+                          <div className='d-flex flex-wrap justify-content-between align-items-start ms-2 mt-1'>
+                            <Stat label='Raw tips' value={xmrOrDash(d.rawTipPiconeros)} sub='before eligibility filters' />
+                            <Stat
+                              label='Eligible T (final)'
+                              value={xmrOrDash(d.trustedTipPiconeros)}
+                              sub={backfilled ? 'backfilled from recorded history' : 'after exclusions, caps and breaker'}
+                            />
+                            <Stat label='Tippers' value={d.tipperCount ?? '—'} />
+                            <Stat label='T4' value={xmrOrDash(d.tipT4Piconeros)} sub='four-week average eligible tips' />
+                            <Stat label='I4' value={xmrOrDash(d.incomeF4Piconeros)} sub='four-week median pool income' />
+                            <Stat
+                              label='Spend limit'
+                              value={spendLimitLabel(d.spendLimitPiconeros, hasRecordedBudget)}
+                              sub={hasRecordedBudget ? `reserve ${xmrOrDash(d.reservePiconeros)} at this run` : 'not recorded'}
+                            />
+                            <Stat label='m' value={formatMultipleOrDash(d.multBps)} sub='this run' />
+                            <Stat label='Dynamic budget' value={xmrOrDash(d.dynamicBudgetPiconeros)} />
+                            <Stat label='Applied budget' value={xmrOrDash(d.appliedCuratorBudgetPiconeros)} sub={d.curatorBudgetMode ?? '—'} />
+                            <Stat label='Mode' value={d.curatorBudgetMode ?? '—'} sub={d.dynamicBudgetMode ?? undefined} />
                           </div>
-                        ))}
+                          {(d.breakerTripped || makeup > 0n) && (
+                            <div className='ms-2 mt-1'>
+                              {d.breakerTripped && (
+                                <small className='text-warning d-block'>
+                                  breaker tripped (raw {xmrOrDash(d.breakerRawTPiconeros)}, capped {xmrOrDash(d.trustedTipPiconeros)})
+                                </small>
+                              )}
+                              {makeup > 0n && (
+                                <small className='text-muted d-block'>
+                                  {d.curatorBudgetMode === 'ACTIVE'
+                                    ? `make-up included in this run's dynamic target: +${piconerosToXmr(makeup)} (the target is bounded by the pool and paid shares; not a record of delivery)`
+                                    : `hypothetical make-up not applied in ${d.curatorBudgetMode ?? 'LEGACY'} mode: +${piconerosToXmr(makeup)}`}
+                                </small>
+                              )}
+                            </div>
+                          )}
+                          {stages && (
+                            <details className='ms-2 mt-1'>
+                              <summary><small className='text-muted'>Eligible-T stage breakdown</small></summary>
+                              <div className='d-flex flex-wrap justify-content-between align-items-start mt-1'>
+                                {DISTRIBUTION_STAGE_ROWS.map(([key, label]) => {
+                                  const value = stageXmr(stages, key)
+                                  return value == null ? null : <Stat key={key} label={label} value={value} />
+                                })}
+                              </div>
+                              <small className='text-muted d-block'>
+                                Totals only; no individual tipper identities are published.
+                                {backfilled ? ' Backfilled from recorded history at release.' : ''}
+                              </small>
+                              {stages.staleTrustFallback === true && (
+                                <small className='text-muted d-block'>Stale trust: the previous recorded T was reused.</small>
+                              )}
+                              {stages.breakerArmed === true && stages.breakerThreshold != null && (
+                                <small className='text-muted d-block'>Breaker threshold {stageXmr(stages, 'breakerThreshold')}.</small>
+                              )}
+                            </details>
+                          )}
+                        </>
+                      )}
+                      <div className='d-flex flex-wrap justify-content-between align-items-start ms-2 mt-1'>
+                        <Stat label='Ops inflow' value={piconerosToXmr(toBigInt(d.opsInflowPiconeros))} sub="this period's ops share" />
+                        <Stat label='Ops swept' value={piconerosToXmr(toBigInt(d.opsSweptPiconeros))} sub={`ops sweep: ${opsSweepLabel(d.opsSweepState)}`} />
+                        <Stat label='Fees accounted' value={piconerosToXmr(toBigInt(d.opsNetworkFeesAccountedPiconeros))} sub='hot-wallet fees inside this snapshot' />
+                        <Stat
+                          label='Pending ops (adjusted)'
+                          value={piconerosToXmr(toBigInt(d.correctedPendingOpsPiconeros))}
+                          sub={toBigInt(d.correctedPendingOpsPiconeros) < 0n
+                            ? "unfunded — fees and sweeps exceed this period's ops earmark"
+                            : d.opsSweepState === 'SKIPPED_LOCKED'
+                              ? 'deferred — locked change, lands next period'
+                              : 'after proven sweeps and network fees'}
+                        />
                       </div>
-                    )}
-                  </div>
-                ))}
+                      {d.opsSweepTxHash && (
+                        <div className='ms-2 mt-1'>
+                          {d.opsSweepTxHash.split(',').map((h, i) => (
+                            <a key={h} href={`${explorerTxUrl(w.network)}${h}`} target='_blank' rel='noreferrer' className='d-block'>
+                              <small className='text-monospace text-break text-decoration-none'>
+                                {i === 0 ? 'ops sweep' : 'sweep'} tx: {h.slice(0, 24)}…
+                              </small>
+                            </a>
+                          ))}
+                        </div>
+                      )}
+                      {di === 0 && d.payouts.length > 0 && (
+                        <div className='ms-2 mt-2'>
+                          <small className='text-muted fw-bold d-block mb-1'>Payouts (latest distribution):</small>
+                          {d.payouts.map(p => (
+                            <div key={p.id} className='d-flex flex-column mb-1'>
+                              <span className='text-monospace'>
+                                {p.curatorNym || `user #${p.curatorId}`} — {p.amountXmr} XMR — {p.state}
+                              </span>
+                              {p.txHash && (
+                                <a href={`${explorerTxUrl(w.network)}${p.txHash}`} target='_blank' rel='noreferrer'>
+                                  <small className='text-monospace text-break text-decoration-none'>{p.txHash.slice(0, 24)}…</small>
+                                </a>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
               )}
 

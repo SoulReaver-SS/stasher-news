@@ -1,6 +1,7 @@
 import Card from 'react-bootstrap/Card'
 import Alert from 'react-bootstrap/Alert'
 import Button from 'react-bootstrap/Button'
+import Link from 'next/link'
 import { Form, Input, SubmitButton, CopyButton } from '@/components/form'
 import { gql } from '@apollo/client'
 import { useMutation, useQuery } from '@apollo/client/react'
@@ -189,7 +190,9 @@ function WalletWizard () {
   )
 }
 
-function WalletGuideCard () {
+// Exported for the copy-pinning test (test/components/wallet-guide.test.js),
+// same pattern as the rewards page's CuratorBudgetCopy.
+export function WalletGuideCard () {
   return (
     <Card className='mb-3'>
       <Card.Body>
@@ -202,6 +205,12 @@ function WalletGuideCard () {
           <Button variant='outline-info' size='sm' href='https://cakewallet.com' target='_blank' rel='noopener noreferrer'>cake wallet</Button>
           <Button variant='outline-info' size='sm' href='https://monerujo.io' target='_blank' rel='noopener noreferrer'>monerujo</Button>
           <Button variant='outline-info' size='sm' href='https://featherwallet.org' target='_blank' rel='noopener noreferrer'>feather wallet</Button>
+        </div>
+        <div className='mt-3'>
+          <div className='text-muted small mb-1'>New to Monero?</div>
+          <Link href='/items/339260' className='small'>
+            start with this user-written guide to Monero wallets
+          </Link>
         </div>
       </Card.Body>
     </Card>

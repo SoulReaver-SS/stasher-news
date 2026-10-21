@@ -3,6 +3,7 @@ import { piconerosToXmrDecimal } from '../monero/uri'
 import { readRewardsInflow } from '../monero/rewardsInflow'
 import { readRewardsWalletLedger } from '../monero/rewardsLedger'
 import { isCurrentAccountingFingerprint } from '@/lib/rewardsAuditFingerprint'
+import { sanitizeEligibleTipStages } from '@/lib/curatorBudgetStages'
 import { readNextRewardsPool } from '@/lib/rewardsPool'
 import { opsCarry, walletScope } from '@/lib/rewardsAccounting'
 import { GqlInputError } from '@/lib/error'
@@ -181,6 +182,9 @@ export default {
         }
         return distributions.map(d => ({
           ...d,
+          // Whitelist the public tip stages: totals and flags only. Never
+          // forward arbitrary JSON keys (config exclusion IDs stay private).
+          eligibleTipStages: sanitizeEligibleTipStages(d.eligibleTipStages),
           opsNetworkFeesAccountedPiconeros: d.opsNetworkFeesAccountedPiconeros ?? 0n,
           // opsCarry computes opsAvailable - proven swept - (horizon -
           // accounted); passing the bounded horizon keeps the shared formula.
