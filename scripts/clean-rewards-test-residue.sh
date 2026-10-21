@@ -29,7 +29,8 @@
 #     ObservedBounty rows on test users' items / test accounts ('uf-*'
 #     txHashes, 'obtest*' paymentIds)
 #   * users with NULL name (created by the tests via INSERT ... DEFAULT VALUES)
-#     and their remaining PayIns/Items
+#     and the eligibleTipVolume `etv-` fixture users, plus their remaining
+#     PayIns/Items
 # REAL rows are never matched by these patterns (verified against the dev DB).
 # If a real distribution ever runs (cron, Monday 00:00 UTC), its payouts carry
 # real tx hashes and its Earn references named users, so it is NOT deleted.
@@ -39,8 +40,10 @@ docker exec -i db psql -U sn -d stackernews <<'SQL'
 \set ON_ERROR_STOP on
 BEGIN;
 
--- Test users: empty-name (the tests insert users with DEFAULT VALUES).
-CREATE TEMP TABLE _tu AS SELECT id FROM users WHERE name IS NULL;
+-- Test users: empty-name (the tests insert users with DEFAULT VALUES) and the
+-- eligibleTipVolume suite's `etv-` fixture users.
+CREATE TEMP TABLE _tu AS
+  SELECT id FROM users WHERE name IS NULL OR name LIKE 'etv-%';
 
 -- PayIns referenced by the rdfee fixtures (capture before deleting the fees).
 CREATE TEMP TABLE _fee_payins AS
@@ -52,11 +55,11 @@ CREATE TEMP TABLE _fee_payins AS
 -- recipient-account ownership is the reliable test signal. Real accounts are
 -- owned by named users and are never matched here. The cs/cf prefixes cover
 -- the curatorShares and confirmFinalizer live-DB fixtures ('cs'/'cf' + digits
--- — impossible in real 64-char hex tx hashes).
+-- — impossible in real 64-char hex tx hashes); etv- covers eligibleTipVolume.
 CREATE TEMP TABLE _tip_accounts AS
   SELECT DISTINCT "recipientAccountId" AS id FROM "ObservedTip"
   WHERE "txHash" LIKE 'rdtip%' OR "txHash" LIKE 'dist-test-tip-%'
-    OR "txHash" LIKE 'cs%' OR "txHash" LIKE 'cf%'
+    OR "txHash" LIKE 'cs%' OR "txHash" LIKE 'cf%' OR "txHash" LIKE 'etv-%'
   UNION
   SELECT DISTINCT t."recipientAccountId" FROM "ObservedTip" t
   JOIN "MoneroAccount" a ON a.id = t."recipientAccountId"
@@ -101,7 +104,7 @@ DELETE FROM "RewardDistribution" WHERE id IN (SELECT id FROM _test_dists);
 DELETE FROM "FeeObservation" WHERE "txHash" LIKE 'rdfee%';
 DELETE FROM "ObservedTip"
 WHERE "txHash" LIKE 'rdtip%' OR "txHash" LIKE 'dist-test-tip-%'
-   OR "txHash" LIKE 'cs%' OR "txHash" LIKE 'cf%'
+   OR "txHash" LIKE 'cs%' OR "txHash" LIKE 'cf%' OR "txHash" LIKE 'etv-%'
    OR "recipientAccountId" IN (SELECT id FROM _tip_accounts);
 DELETE FROM "ObservedDownvote" WHERE "txHash" LIKE 'rddv%' OR "txHash" LIKE 'dist-test-downvote-%';
 
@@ -122,7 +125,7 @@ CREATE TEMP TABLE _test_bounties AS
   SELECT id FROM "BountyPayment"
   WHERE "winnerUserId" IN (SELECT id FROM _tu)
      OR "itemId" IN (SELECT i.id FROM "Item" i
-                     JOIN users u ON u.id = i."userId" WHERE u.name IS NULL)
+                     JOIN users u ON u.id = i."userId" WHERE u.id IN (SELECT id FROM _tu))
      OR "txHash" LIKE 'btest%';
 
 SELECT 'test bounty payouts' AS t, count(*) FROM _test_bounties;
@@ -139,7 +142,7 @@ DELETE FROM "BountyPayment" WHERE id IN (SELECT id FROM _test_bounties);
 
 DELETE FROM "ObservedBounty"
 WHERE "postId" IN (SELECT i.id FROM "Item" i
-                   JOIN users u ON u.id = i."userId" WHERE u.name IS NULL)
+                   JOIN users u ON u.id = i."userId" WHERE u.id IN (SELECT id FROM _tu))
    OR "recipientAccountId" IN (SELECT id FROM _tip_accounts)
    OR "txHash" LIKE 'uf-%'
    OR "paymentId" LIKE 'obtest%';

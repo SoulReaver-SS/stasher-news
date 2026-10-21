@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client'
 import createPrisma from '@/lib/create-prisma'
 import { nymsToIds, HANDICAP_NYMS } from '@/lib/founderNyms'
 import { logError } from '@/lib/logger'
@@ -63,7 +64,31 @@ const ZAP_THRESHOLD_PICONEROS = 100_000_000n
 // deliberately NOT handicapped (never reaches curator attribution anyway).
 // The founder account `stasher` is excluded outright below, so its handicap
 // entry is inert; the multiplier still applies to the remaining accounts.
-const HANDICAP_ZAP_MULT = 0.5
+export const HANDICAP_ZAP_MULT = 0.5
+
+// --- Shared SQL fragments (spec §4: T must share turf/trust/founder SQL with
+// computeCuratorShares, not copy it) ---
+//
+// The identifier arguments are Prisma.raw values, i.e. SQL identifiers chosen
+// by code below — NEVER user input or configuration. `Prisma.raw` embeds the
+// text verbatim, so passing a string here would be a SQL-injection hole; only
+// module-owned constants and query aliases are ever passed.
+export function itemTurfSql (itemRef, rootRef) {
+  return Prisma.sql`COALESCE(${rootRef}."subNames"[1], ${itemRef}."subNames"[1], ${META_SUB}::CITEXT)`
+}
+
+export function zapTrustSql (itemRef, ustRef) {
+  return Prisma.sql`COALESCE(CASE WHEN ${itemRef}."parentId" IS NULL THEN ${ustRef}."zapPostTrust" ELSE ${ustRef}."zapCommentTrust" END, 0)`
+}
+
+export function trustMultiplierSql (floor, zapTrustExpr) {
+  return Prisma.sql`(${floor}::DOUBLE PRECISION + (1.0 - ${floor}::DOUBLE PRECISION) * ${zapTrustExpr})`
+}
+
+// Founder ids are resolved at runtime by nym, never by serial id.
+export function resolveHandicapIds (models) {
+  return nymsToIds(models, HANDICAP_NYMS)
+}
 
 // The founder account is not eligible for weekly curator rewards. Use the
 // migration-guaranteed id (not the mutable display name). This filter runs in
@@ -199,7 +224,12 @@ export async function computeCuratorShares (periodStart, periodEnd, poolPiconero
 }
 
 async function compute (models, periodStart, periodEnd, poolPiconeros, minPayout, topN, trustWeightFloor, excludedIds) {
-  const handicapIds = await nymsToIds(models, HANDICAP_NYMS)
+  const handicapIds = await resolveHandicapIds(models)
+  const itemRef = Prisma.raw('"Item"')
+  const rootRef = Prisma.raw('root')
+  const islandItemRef = Prisma.raw('item_proportions')
+  const ustRef = Prisma.raw('ust')
+  const zapTrustRef = Prisma.raw('zap_trust')
   // Per-curator raw proportions from the ported CTE. Each row is
   // { curatorId: number, total_proportion: number, earns: string (json_agg text) }.
   const prospects = await models.$queryRaw`
@@ -218,7 +248,7 @@ async function compute (models, periodStart, periodEnd, poolPiconeros, minPayout
           -- 2026-09-14). Turf resolution mirrors api/monero/ranking.js:92
           -- (root subNames win for comments; turf-less items are META_SUB).
           SELECT "Item".*,
-            COALESCE(root."subNames"[1], "Item"."subNames"[1], ${META_SUB}::CITEXT) AS turf,
+            ${itemTurfSql(itemRef, rootRef)} AS turf,
             NTILE(100) OVER (PARTITION BY "Item"."parentId" IS NULL ORDER BY ("Item"."weightedVotes" - "Item"."weightedDownVotes") DESC) AS percentile,
             ROW_NUMBER() OVER (PARTITION BY "Item"."parentId" IS NULL ORDER BY ("Item"."weightedVotes" - "Item"."weightedDownVotes") DESC) AS rank
           FROM "Item"
@@ -247,8 +277,7 @@ async function compute (models, periodStart, periodEnd, poolPiconeros, minPayout
           item_proportions.turf,
           "ObservedTip"."piconeros" AS zapped_piconeros,
           "ObservedTip"."confirmedAt" AS acted_at,
-          COALESCE(CASE WHEN item_proportions."parentId" IS NULL
-            THEN ust."zapPostTrust" ELSE ust."zapCommentTrust" END, 0) AS zap_trust,
+          ${zapTrustSql(islandItemRef, ustRef)} AS zap_trust,
           ROW_NUMBER() OVER (PARTITION BY item_proportions.id ORDER BY "ObservedTip"."confirmedAt" ASC)
             - ROW_NUMBER() OVER (PARTITION BY item_proportions.id, "ObservedTip"."tipperId" ORDER BY "ObservedTip"."confirmedAt" ASC) AS island
         FROM item_proportions
@@ -289,7 +318,7 @@ async function compute (models, periodStart, periodEnd, poolPiconeros, minPayout
       item_zapper_ratios AS (
         SELECT "userId",
           sum((2 * early_multiplier + 1) * zapped_proportion * proportion
-              * (${trustWeightFloor}::DOUBLE PRECISION + (1.0 - ${trustWeightFloor}::DOUBLE PRECISION) * zap_trust))
+              * ${trustMultiplierSql(trustWeightFloor, zapTrustRef)})
             * CASE WHEN "userId" = ANY(${handicapIds}::int[]) THEN ${HANDICAP_ZAP_MULT} ELSE 1 END AS item_zapper_proportion,
           "parentId" IS NULL AS "isPost"
         FROM (
