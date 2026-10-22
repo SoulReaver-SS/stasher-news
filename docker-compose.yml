@@ -153,7 +153,7 @@ services:
       - domains-network
   imgproxy:
     container_name: imgproxy
-    image: darthsim/imgproxy:v3.23.0
+    image: darthsim/imgproxy:v4.0.19
     profiles:
       - images
     healthcheck:
