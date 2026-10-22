@@ -9,7 +9,7 @@
 // so these tests exercise the REAL request/response behaviour without touching
 // the network.
 //
-// Run via the node:22.21.1 helper container:
+// Run via the node:22.23.4 helper container:
 //   docker exec sn-prisma npx jest test/api/monero/daemonClient.test.js
 
 const http = require('node:http')

@@ -14,7 +14,7 @@
 // decrypts it in-process via decryptViewKey (Task 2). We build a real
 // envelope here so the decrypt path is exercised end-to-end.
 //
-// Run via the node:22.21.1 helper container:
+// Run via the node:22.23.4 helper container:
 //   docker exec sn-prisma npx jest test/api/monero/lwsClient.test.js
 
 const LWS_MODULE = require.resolve('../../../api/monero/lwsClient')

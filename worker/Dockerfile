@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22.21.1-bullseye
+FROM node:22.23.4-bookworm
 
 ENV NODE_ENV=development
 
@@ -10,13 +10,14 @@ RUN groupadd -fg "$GID" apprunner
 RUN useradd -om -u "$UID" -g "$GID" apprunner
 
 # pg_dump for the nightly encrypted-backup job (worker/dbBackup.js). Must match
-# the db major version (postgres:16) — bullseye's default postgresql-client is
-# v13, which aborts against a v16 server with "server version mismatch", so pull
-# v16 from the PGDG archive. The live apt repo no longer publishes bullseye.
+# the db major version (postgres:16) — bookworm's default postgresql-client is
+# v15, which aborts against a v16 server with "server version mismatch", so pull
+# v16 from the live PGDG repo (bullseye went EOL 2026-08-31 and node stopped
+# publishing bullseye images, which forced this base move).
 # curl/wget ship in the base image.
 RUN curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
       | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
- && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt-archive.postgresql.org/pub/repos/apt bullseye-pgdg main" \
+ && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
       > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends postgresql-client-16 \

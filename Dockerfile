@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22.21.1-bullseye
+FROM node:22.23.4-bookworm
 
 ENV NODE_ENV=development
 
@@ -12,11 +12,12 @@ RUN useradd -om -u "$UID" -g "$GID" apprunner
 WORKDIR /app
 
 # pg_dump/psql for scripts/deploy-migrate.sh (pre-migration snapshot + rollback).
-# Bullseye's default client is v13. That security deb 404s, and v13 mismatches
-# postgres 16. Pull v16 from the PGDG archive. The live apt repo dropped bullseye.
+# Bookworm's default client is v15, which mismatches postgres 16. Pull v16 from
+# the live PGDG repo (bullseye went EOL 2026-08-31 and node stopped publishing
+# bullseye images, which forced this base move).
 RUN curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
       | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
- && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt-archive.postgresql.org/pub/repos/apt bullseye-pgdg main" \
+ && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
       > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends postgresql-client-16 \

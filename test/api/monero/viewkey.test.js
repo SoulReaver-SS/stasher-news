@@ -6,7 +6,7 @@
 // the DEK is wrapped by a master-key-derived KEK (HKDF-SHA256, dekVersion
 // mixed into the derivation). Pure crypto — no DB, no network.
 //
-// Run via the node:22.21.1 helper container:
+// Run via the node:22.23.4 helper container:
 //   docker exec sn-prisma npx jest test/api/monero/viewkey.test.js
 
 const MODULE_PATH = require.resolve('../../../api/monero/viewkey')

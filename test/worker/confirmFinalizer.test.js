@@ -16,7 +16,7 @@
 // runConfirmFinalizerOnce). Everything else is real DB behaviour against a
 // live, migrated database.
 //
-// Run via the node:22.21.1 helper container:
+// Run via the node:22.23.4 helper container:
 //   docker exec sn-prisma npx jest test/worker/confirmFinalizer.test.js
 
 import { PrismaClient } from '@prisma/client'
