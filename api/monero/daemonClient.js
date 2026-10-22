@@ -25,11 +25,10 @@ import http from 'node:http'
 
 const DEFAULT_TIMEOUT_MS = 15000
 
-// monerod's restricted RPC rejects /get_transactions requests carrying more
-// than 100 hashes: HTTP 200, `status: "Too many transactions requested in
-// restricted mode"`, and NO `txs` array (verified v0.18.5.1 and re-verified
-// v0.18.5.3). Batch at 50 —
-// comfortably under the cap, and decode_as_json responses stay smaller.
+// monerod's restricted RPC rejects /get_transactions above 100 hashes (HTTP
+// 200 error, no txs array). Batch at 50: half the cap, smaller responses.
+// v0.18.5.4 re-probe: >100 did not reproduce with synthetic hashes; the
+// non-OK-throw contract is unchanged.
 export const MAX_TX_HASHES_PER_REQUEST = 50
 
 // An `extra` blob counts as evidence only when its encoding is VALID before any
