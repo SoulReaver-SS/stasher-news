@@ -9,11 +9,12 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "express": "^4.20.0",
+    "express": "^4.22.3",
     "ipaddr.js": "^2.2.0",
     "magic-bytes.js": "^1.12.1",
+    "proxy-addr": "^2.0.8",
     "puppeteer-core": "^25.9.0",
-    "undici": "^6.19.0"
+    "undici": "^6.29.1"
   },
   "type": "module"
 }
