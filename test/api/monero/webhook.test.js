@@ -426,7 +426,7 @@ test('self-send (spent output from the recipient own wallet) -> EXCLUDED with re
   // from the recipient's own primary subaddress
   const monero = mockMonero({
     getAddressTxs: jest.fn().mockResolvedValue({
-      transactions: [{ hash: 'deadbeef', height: 2172600, payment_id: 'abc123', piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] }]
+      transactions: [{ hash: 'deadbeef', height: 2172600, payment_id: 'abc123', piconeros: 1000000000n, fee: 0n, spent_outputs: [{ amount: '1000000000', sender: { maj_i: 0, min_i: 0 } }] }]
     })
   })
   const res = mockRes()
@@ -449,7 +449,10 @@ test('self-send (spent output from the recipient own wallet) -> EXCLUDED with re
   }))
 })
 
-test('a normal tip does NOT call getAddressTxs for the self-send scan when tipper is known and external... scan runs but excludes nothing', async () => {
+test.each([
+  ['foreign-index candidate', { spent_outputs: [{ sender: { maj_i: 4, min_i: 2 } }] }],
+  ['own-index decoy without closure', { fee: 0n, spent_outputs: [{ amount: '500', sender: { maj_i: 0, min_i: 0 } }] }]
+])('%s: detection proceeds without exclusion or abuse signal', async (_, txFields) => {
   const ACCT = { label: 'author', ownerUserId: 99, status: 'ACTIVE', viewKey: { ciphertext: Buffer.alloc(0) }, subaddresses: [] }
   const tip = { id: 3, postId: 10, tipperId: 77, state: 'PENDING', paymentId: 'abc123', piconeros: 0n, webhookEventId: 'evt-3', post: { userId: 99 }, recipientAccount: ACCT }
   const execRaw = jest.fn().mockResolvedValue(1)
@@ -461,7 +464,7 @@ test('a normal tip does NOT call getAddressTxs for the self-send scan when tippe
   })
   const monero = mockMonero({
     getAddressTxs: jest.fn().mockResolvedValue({
-      transactions: [{ hash: 'deadbeef', height: 2172600, payment_id: 'abc123', piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 4, min_i: 2 } }] }]
+      transactions: [{ hash: 'deadbeef', height: 2172600, payment_id: 'abc123', piconeros: 1000000000n, ...txFields }]
     })
   })
   const res = mockRes()
@@ -490,7 +493,7 @@ test('self-send scan passes the account cursor as since_tx_id (no full history)'
   // the tip tx is returned by the INCREMENTAL fetch (id 42 > cursor 41)
   const monero = mockMonero({
     getAddressTxs: jest.fn().mockResolvedValue({
-      transactions: [{ id: 42, hash: 'deadbeef', height: 2172600, payment_id: 'abc123', piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] }]
+      transactions: [{ id: 42, hash: 'deadbeef', height: 2172600, payment_id: 'abc123', piconeros: 1000000000n, fee: 0n, spent_outputs: [{ amount: '1000000000', sender: { maj_i: 0, min_i: 0 } }] }]
     })
   })
   const res = mockRes()
@@ -549,7 +552,7 @@ test('pid missing from the incremental response triggers exactly one full-histor
   })
   const getAddressTxs = jest.fn()
     .mockResolvedValueOnce({ transactions: [{ id: 60, hash: 'other', height: 2172600, payment_id: '999999', piconeros: 1n }] })
-    .mockResolvedValueOnce({ transactions: [{ id: 42, hash: 'deadbeef', height: 2172600, payment_id: 'abc123', piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] }] })
+    .mockResolvedValueOnce({ transactions: [{ id: 42, hash: 'deadbeef', height: 2172600, payment_id: 'abc123', piconeros: 1000000000n, fee: 0n, spent_outputs: [{ amount: '1000000000', sender: { maj_i: 0, min_i: 0 } }] }] })
   const monero = mockMonero({ getAddressTxs })
   const res = mockRes()
   await handleWebhook({
@@ -1569,7 +1572,7 @@ test('N-conf CONFIRMED callback re-runs the self-send check: a wash tip that fai
   })
   const monero = mockMonero({
     getAddressTxs: jest.fn().mockResolvedValue({
-      transactions: [{ id: 60, hash: 'deadbeef', height: 2172600, payment_id: 'wash1', piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] }],
+      transactions: [{ id: 60, hash: 'deadbeef', height: 2172600, payment_id: 'wash1', piconeros: 1000000000n, fee: 0n, spent_outputs: [{ amount: '1000000000', sender: { maj_i: 0, min_i: 0 } }] }],
       blockchain_height: 2172609
     })
   })
@@ -1642,7 +1645,7 @@ test('first mined callback (height arrives on a height-NULL DETECTED row) re-che
   })
   const monero = mockMonero({
     getAddressTxs: jest.fn().mockResolvedValue({
-      transactions: [{ id: 61, hash: 'deadbeef', height: 2172600, payment_id: 'wash2', piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] }]
+      transactions: [{ id: 61, hash: 'deadbeef', height: 2172600, payment_id: 'wash2', piconeros: 1000000000n, fee: 0n, spent_outputs: [{ amount: '1000000000', sender: { maj_i: 0, min_i: 0 } }] }]
     })
   })
   const res = mockRes()
@@ -2208,6 +2211,7 @@ describe('fee: branch (owner-routed turf fees)', () => {
           hash: 'tx-self',
           payment_id: pid,
           piconeros: 1000000000n, // zero change: lws total == the real payment
+          fee: 0n,
           spent_outputs: [{ amount: '1000000000', out_index: 1, sender: { maj_i: 0, min_i: 0 } }],
           height: 100
         }],

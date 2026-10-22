@@ -3,20 +3,13 @@ import { applyTipDetected, reverseTip } from '@/api/monero/ranking'
 import { alert } from '@/lib/alert'
 import { moneroTxNotFoundExclusionsTotal } from '@/lib/metrics'
 
-// Self-tip exclusion helpers (spec §2.2). Pure functions — no I/O.
-//
-// A tip is a SELF-SEND when the incoming tx's spent_outputs (from a
-// get_address_txs scan of the RECIPIENT account) include an output whose
-// subaddress indices exactly match one of that account's OWN addresses:
-// the primary (0,0) or a SubaddressIndex row. lws only decodes indices for
-// outputs it can attribute to the scanned account (key-image matching), but
-// candidates can false-match — hence the exact-match requirement.
-//
-// lws spent_outputs wire shape (verified on dev lws 2026-08-23): subaddress
-// indices arrive ONLY nested under `sender` — {"sender":{"maj_i":0,"min_i":0}} —
-// the subaddress of the scanned account that owned the spent output. There is
-// no flat maj_i/min_i and no `recipient` object on this build;
-// scripts/probe-lws-spent-outputs.js re-verifies the shape on other lws builds.
+// lws spent_outputs are ring-member candidates, including decoys: a view key
+// cannot verify actual spends. Require sum(own candidates) - fee == received
+// before excluding. This is a heuristic, not cryptographic proof; extra
+// candidates or a foreign destination can break closure on a real self-send.
+// Missing/invalid amounts fail open; unclosed own candidates warn for review.
+// Wire shape: sender.{maj_i,min_i}, amount as a decimal string. See the probe
+// script for deployed shape/fee availability; only top-level amounts are parsed.
 
 function ownSubaddressSet (account) {
   const set = new Set(['0,0']) // the primary address is always (0,0)
@@ -26,16 +19,42 @@ function ownSubaddressSet (account) {
   return set
 }
 
-export function isSelfSend (account, tx) {
-  if (!tx || !Array.isArray(tx.spent_outputs)) return false
+// Missing/invalid evidence is unavailable, never implicitly zero.
+function parsePiconeros (v) {
+  if (typeof v === 'bigint') return v >= 0n ? v : null
+  if (typeof v === 'number') return Number.isSafeInteger(v) && v >= 0 ? BigInt(v) : null
+  if (typeof v === 'string' && /^\d+$/.test(v)) return BigInt(v)
+  return null
+}
+
+function ownCandidates (account, tx) {
+  if (!tx || !Array.isArray(tx.spent_outputs)) return []
   const own = ownSubaddressSet(account)
-  for (const so of tx.spent_outputs) {
+  return tx.spent_outputs.filter(so => {
     const maj = so?.sender?.maj_i
     const min = so?.sender?.min_i
-    if (maj == null || min == null) continue
-    if (own.has(`${maj},${min}`)) return true
+    return maj != null && min != null && own.has(`${maj},${min}`)
+  })
+}
+
+// Review signal only: account-owned ring references need not be real spends.
+export function hasOwnSpendCandidates (account, tx) {
+  return ownCandidates(account, tx).length > 0
+}
+
+export function isSelfSend (account, tx) {
+  const candidates = ownCandidates(account, tx)
+  if (candidates.length === 0) return false
+  let sum = 0n
+  for (const so of candidates) {
+    const amount = parsePiconeros(so?.amount)
+    if (amount == null) return false // unavailable evidence is not zero
+    sum += amount
   }
-  return false
+  const fee = parsePiconeros(tx.fee)
+  const received = parsePiconeros(tx.piconeros)
+  if (fee == null || received == null) return false
+  return sum - fee === received
 }
 
 export function shouldExcludeTip ({ tipperId, postUserId, account, tx }) {
@@ -189,10 +208,11 @@ export function chainMismatch (tip, tx) {
 //
 // Exclusion dispositions (spec §2.3, audit 2026-09-11 finding 2):
 //   - DIRECT_SELF_TIP: tipper == author, no scan needed.
-//   - SELF_SEND: spent_outputs from the recipient's own wallet -> claim
+//   - SELF_SEND: own-index candidates close exactly against the tx's received
+//     amount (not the provisional tip amount) -> claim
 //     EXCLUDED from DETECTED (atomic conditional UPDATE, race-safe vs the
 //     CONFIRMED claim), reverse the detection-applied ranking delta via
-//     reverseTip, write the AbuseSignal.
+//     reverseTip, write the AbuseSignal. Unclosed candidates warn, not exclude.
 //   - CHAIN_MISMATCH: a BOUND row whose stored piconeros/txHash disagree with
 //     the chain tx — forged through the pre-verification webhook; same
 //     EXCLUDED + reverseTip + AbuseSignal disposition.
@@ -333,6 +353,12 @@ export async function recheckDetectedTip ({ models, monero, daemon = null, tip, 
   }
 
   if (isSelfSend(account, tx)) return claimExclusion({ models, tip, reason: 'SELF_SEND', confirmations, height, tx })
+  // Decoys and self-sends with foreign outputs can both fail closure: review only.
+  if (hasOwnSpendCandidates(account, tx)) {
+    alert('warn', 'unclosed Monero spend candidates',
+      `tip ${tip.id}: recipient-owned ring candidates do not establish self-send closure; review only`,
+      { dedupeKey: `spend-candidate-unclosed-${tx.hash}` })
+  }
   if (!tip.amountVerifiedAt) return correctAndBind({ models, tip, tx, confirmations, height })
   if (chainMismatch(tip, tx)) return claimExclusion({ models, tip, reason: 'CHAIN_MISMATCH', confirmations, height, tx })
   // Verified-write rule: a bound row still missing its block height gets it

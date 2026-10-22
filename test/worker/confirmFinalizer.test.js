@@ -303,7 +303,7 @@ test('a mature DETECTED wash tip (self-send from the recipient own wallet) is EX
   // account's own primary subaddress (0,0) — a literal self-send.
   const washLws = {
     getAddressTxs: jest.fn().mockResolvedValue({
-      transactions: [{ id: 1, hash: tip.txHash, height: 200, payment_id: tip.paymentId, piconeros: 5_000_000n, spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] }]
+      transactions: [{ id: 1, hash: tip.txHash, height: 200, payment_id: tip.paymentId, piconeros: 5_000_000n, fee: 0n, spent_outputs: [{ amount: '5000000', sender: { maj_i: 0, min_i: 0 } }] }]
     })
   }
 
@@ -333,6 +333,38 @@ test('a mature DETECTED wash tip (self-send from the recipient own wallet) is EX
   const washScans = washLws.getAddressTxs.mock.calls.filter(([scanned]) => scanned.id === account.id)
   expect(washScans).toHaveLength(1)
   expect(washScans[0][1]).toBe(0)
+})
+
+test('a mature DETECTED tip whose ring merely DECOY-references an own output is CONFIRMED and credited', async () => {
+  // Own candidate 1000000 - fee 0 != received 5000000: do not exclude.
+  const authorId = await createUser(); created.users.push(authorId)
+  const tipperId = await createUser(); created.users.push(tipperId)
+  const postId = await createRoot(authorId, 'decoy-target'); created.items.push(postId)
+  const account = await seedAccountWithViewKey()
+  const tip = await seedTip({ postId, piconeros: 5_000_000n, height: 200, recipientAccountId: account.id })
+  await prisma.observedTip.update({ where: { id: tip.id }, data: { tipperId, rankPiconeros: 3_500_000n } })
+  await prisma.itemUserAgg.create({ data: { userId: tipperId, itemId: postId, tipPiconeros: 5_000_000n } })
+  await prisma.item.update({ where: { id: postId }, data: { upvotes: 1, piconeros: 5_000_000n, tipRankPiconeros: 3_500_000n, weightedVotes: 1.0 } })
+
+  const decoyLws = {
+    getAddressTxs: jest.fn().mockResolvedValue({
+      transactions: [{ id: 1, hash: tip.txHash, height: 200, payment_id: tip.paymentId, piconeros: 5_000_000n, fee: 0n, spent_outputs: [{ amount: '1000000', sender: { maj_i: 0, min_i: 0 } }] }]
+    })
+  }
+
+  await runConfirmFinalizerOnce({ models: prisma, daemonClient: mockClient(209), lwsClient: decoyLws })
+
+  const after = await readTip(tip.id)
+  expect(after.state).toBe('CONFIRMED')
+  expect(after.exclusionReason).toBe(null)
+  // the author was credited at confirmation
+  expect((await readUser(authorId)).stackedPiconeros).toBe(5_000_000n)
+  // the detection-applied ranking effects were never reversed
+  const item = await prisma.item.findUnique({ where: { id: postId } })
+  expect(item.upvotes).toBe(1)
+  expect(item.piconeros).toBe(5_000_000n)
+  // no abuse signal for a decoy reference
+  expect(await prisma.abuseSignal.findUnique({ where: { tipId: tip.id } })).toBe(null)
 })
 
 test('a mature DETECTED tip whose stored amount disagrees with the chain is EXCLUDED (CHAIN_MISMATCH), reversed, and never credited', async () => {

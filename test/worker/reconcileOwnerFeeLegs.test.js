@@ -246,7 +246,8 @@ test('SELF-PAYMENT BAN: a self-spend tx is never replayed (no receipt write, no 
           height: 500,
           payment_id: 'a1b2c3d4e5f6a7b8',
           piconeros: 8211672641492n,
-          spent_outputs: [{ amount: '8211616401492', out_index: 1, sender: { maj_i: 0, min_i: 0 } }]
+          fee: 400000000n,
+          spent_outputs: [{ amount: '8211616401492', out_index: 1, sender: { maj_i: 0, min_i: 0 } }, { amount: '456240000', out_index: 0, sender: { maj_i: 0, min_i: 0 } }]
         }
       ],
       blockchain_height: 510
@@ -272,7 +273,8 @@ test('SELF-PAYMENT BAN: a self-spend tx EXCLUDES its height-NULL provisional row
           height: 500,
           payment_id: 'a1b2c3d4e5f6a7b8',
           piconeros: 8211672641492n,
-          spent_outputs: [{ amount: '8211616401492', out_index: 1, sender: { maj_i: 0, min_i: 0 } }]
+          fee: 400000000n,
+          spent_outputs: [{ amount: '8211616401492', out_index: 1, sender: { maj_i: 0, min_i: 0 } }, { amount: '456240000', out_index: 0, sender: { maj_i: 0, min_i: 0 } }]
         }
       ],
       blockchain_height: 510
@@ -292,9 +294,9 @@ test('SELF-PAYMENT BAN: a self-spend tx EXCLUDES its height-NULL provisional row
 
 test('misattributed foreign spent_outputs (lws scan-pass bug) do NOT trip the ban — tx replays normally', async () => {
   // Review follow-up: lws attributes FOREIGN wallets' spends to a scanned
-  // account (observed 2026-08-10). The ban uses the same EXACT (maj,min)
-  // sender match as the webhook, so a foreign-index sender is NOT a
-  // self-send: the genuine fee receipt replays instead of being stranded
+  // account (observed 2026-08-10). Foreign-index candidates are not
+  // account-owned, so they neither sum into nor satisfy the ban's closure
+  // test: the genuine fee receipt replays instead of being stranded
   // behind an unreclaimable EXCLUDED row (which abandonFeeItems would turn
   // into a 24h deletion).
   const pi = payIn({ payInState: 'PAID' })
@@ -308,6 +310,31 @@ test('misattributed foreign spent_outputs (lws scan-pass bug) do NOT trip the ba
           payment_id: 'a1b2c3d4e5f6a7b8',
           piconeros: 1500000000000n,
           spent_outputs: [{ amount: '1500000000000', out_index: 0, sender: { maj_i: 4, min_i: 2 } }] // foreign indices
+        }
+      ],
+      blockchain_height: 510
+    }))
+  }
+  const out = await runReconcileOwnerFeeLegsOnce({ models, monero })
+  expect(applySubFeeReceipt).toHaveBeenCalledTimes(1)
+  expect(models.$executeRaw).not.toHaveBeenCalled() // no EXCLUDED write
+  expect(out).toEqual({ legs: 1, replayed: 1, flipped: 1, pidFallback: 0 })
+})
+
+test('an own-index DECOY without closure does not strand the fee behind the ban — tx replays normally', async () => {
+  // Own candidate 999999999 - fee 0 != received 1000000000: replay the fee.
+  const pi = payIn({ payInState: 'PAID' })
+  const models = makeModels({ maps: [leg()], payIns: [pi], accounts: [account()] })
+  const monero = {
+    getAddressTxs: jest.fn(async () => ({
+      transactions: [
+        {
+          hash: 'deadbeef',
+          height: 500,
+          payment_id: 'a1b2c3d4e5f6a7b8',
+          piconeros: 1000000000n,
+          fee: 0n,
+          spent_outputs: [{ amount: '999999999', out_index: 1, sender: { maj_i: 0, min_i: 0 } }]
         }
       ],
       blockchain_height: 510
@@ -425,7 +452,7 @@ test.each([ISSUED_PID.toUpperCase(), null])('handles normalized or absent served
 })
 
 test('self-send cleanup uses the issued PID after raw discovery', async () => {
-  const fx = feeCase([feeEvidence({ row: { spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] } })])
+  const fx = feeCase([feeEvidence({ row: { fee: 0n, spent_outputs: [{ amount: '1000000000', sender: { maj_i: 0, min_i: 0 } }] } })])
   await runReconcileOwnerFeeLegsOnce({ models: fx.models, monero: fx.monero, daemonClient: fx.daemon })
   expect(applySubFeeReceipt).not.toHaveBeenCalled()
   expect(fx.models.$executeRaw).toHaveBeenCalledTimes(1)

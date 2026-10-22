@@ -378,12 +378,15 @@ test('recovers a PENDING direct self-tip as EXCLUDED (no apply, AbuseSignal writ
   expect(signalData).toMatchObject({ kind: 'SELF_TIP_EXCLUDED', subjectUserId: 5, actorUserId: 5, tipId: 10n, postId: 42 })
 })
 
-test('recovers a PENDING self-send (anon tip from the author registered wallet) as EXCLUDED', async () => {
+test.each([
+  ['closing self-send', '1000000000', true],
+  ['own-index decoy without closure', '999999999', false]
+])('%s: pending recovery excludes only on closure', async (_, candidateAmount, excluded) => {
   const t = tip({ id: 11n, tipperId: null, post: { userId: 5 } })
   const account = { id: 7, address: 'ADDR', status: 'ACTIVE', viewKey: {}, subaddresses: [] }
   const lws = {
     getAddressTxs: async () => ({
-      transactions: [{ hash: 'deadbeef', height: 100, payment_id: 'AABBCCDD11223344', piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] }],
+      transactions: [{ hash: 'deadbeef', height: 100, payment_id: 'AABBCCDD11223344', piconeros: 1000000000n, fee: 0n, spent_outputs: [{ amount: candidateAmount, sender: { maj_i: 0, min_i: 0 } }] }],
       blockchain_height: 110
     })
   }
@@ -402,9 +405,14 @@ test('recovers a PENDING self-send (anon tip from the author registered wallet) 
     }
   }
   const out = await runReconcilePendingTipsOnce({ models, lwsClient: lws, apply: async () => { applied = true } })
-  expect(out.excluded).toBe(1)
-  expect(applied).toBe(false)
-  expect(signalData).toMatchObject({ kind: 'SELF_SEND_EXCLUDED', subName: 'stasher' })
+  expect(out.recovered).toBe(excluded ? 0 : 1)
+  expect(out.excluded).toBe(excluded ? 1 : 0)
+  expect(applied).toBe(!excluded)
+  if (excluded) {
+    expect(signalData).toMatchObject({ kind: 'SELF_SEND_EXCLUDED', subName: 'stasher' })
+  } else {
+    expect(signalData).toBe(null)
+  }
 })
 
 test('a normal recovered tip still detects (exclusion check passes it through)', async () => {
@@ -643,7 +651,7 @@ test('fallback recovery goes through the self-send exclusion check (spent_output
   const lws = {
     getAddressTxs: async () => ({
       // self-send: a spent output owned by the recipient's own primary (0,0)
-      transactions: [{ hash: '780e241fe18f0543', height: 3216991, payment_id: servedPid, piconeros: 1000000000n, spent_outputs: [{ sender: { maj_i: 0, min_i: 0 } }] }],
+      transactions: [{ hash: '780e241fe18f0543', height: 3216991, payment_id: servedPid, piconeros: 1000000000n, fee: 0n, spent_outputs: [{ amount: '1000000000', sender: { maj_i: 0, min_i: 0 } }] }],
       blockchain_height: 3217000
     })
   }

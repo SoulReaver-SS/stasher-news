@@ -759,12 +759,9 @@ export async function handleWebhook (req, res, models = prisma, monero = lwsClie
       allowProvisional: true
     })
     if (!verdict) return
-    // SELF-PAYMENT BAN (2026-09-19 incident): when the payer shares the owner
-    // account, lws fires a payment event for the CHANGE output too — that
-    // callback claimed 1.05608 XMR for a 0.0002 payment and flipped the item
-    // FEE_PAID. `isSelfSend` uses the exact (maj,min) sender match. Refuse, and
-    // exclude any provisional receipt a 0-conf callback may have seeded so the
-    // display can never show the change as received.
+    // Self-payment change inflated a fee callback in the 2026-09-19 incident.
+    // Require the shared closure gate, not ring-candidate presence, before
+    // refusing and excluding any provisional receipt seeded at 0-conf.
     if (verdict.tx && isSelfSend(ownerAccount, verdict.tx)) {
       await models.$executeRaw`
         UPDATE "ObservedSubFee" SET state = 'EXCLUDED'::"ObservedState"
@@ -842,8 +839,9 @@ export async function handleWebhook (req, res, models = prisma, monero = lwsClie
       allowProvisional: true
     })
     if (!verdict) return
-    // Same self-payment ban as the live-fee path: a change-inflated self-send
-    // must not seed a ledger receipt either.
+    // Same self-payment ban as the live-fee path (exact monetary closure on
+    // account-owned inputs): a change-inflated self-send must not seed a
+    // ledger receipt either.
     if (verdict.tx && isSelfSend(ownerAccount, verdict.tx)) {
       alert('warn', 'owner-fee self-payment refused',
         `abandoned fee leg ${paymentId} tx ${verdict.tx.hash}: payer shares the owner account (change-inflated); no receipt recorded`,

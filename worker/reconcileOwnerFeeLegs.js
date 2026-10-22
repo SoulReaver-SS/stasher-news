@@ -43,19 +43,10 @@ import { alert } from '@/lib/alert'
 // or null when the self-send ban refused the receipt.
 async function replayOwnerReceipt ({ models, account, leg, tx }) {
   const paymentId = leg.paymentId
-  // SELF-PAYMENT BAN (2026-09-19 incident): when the payer shares the owner
-  // account, lws's per-tx total_received folds in the sender's change
-  // (inputs - fee) and is NOT the leg amount — no amount from a self-send is
-  // credible here, so the tx is never replayed. Same EXACT (maj,min) sender
-  // match as the webhook's isSelfSend (review follow-up: the old coarse
-  // `spent_outputs.length > 0` test treated lws's documented misattributed
-  // foreign spends (observed 2026-08-10) as self-sends, stranding a genuine
-  // fee behind an unreclaimable EXCLUDED row; the exact match only refuses
-  // true own-subaddress senders). The cleanup targets the row by the ISSUED
-  // pid plus its tx hash — a raw-path row's served pid is the scrambled one,
-  // so matching on tx.payment_id could never reach the provisional receipt.
-  // The webhook's isSelfSend refusal is the primary and keeps such rows from
-  // ever gaining a height (the applier's CAS is state-gated to DETECTED).
+  // Self-payments can inflate receipts with change (2026-09-19). Use the
+  // shared closure gate, not candidate presence: lws includes decoy references.
+  // Match cleanup by ISSUED pid + hash; raw-discovery rows can have scrambled
+  // served PIDs. Only provisional receipts are excluded, as in the webhook.
   if (isSelfSend(account, tx)) {
     const excluded = await models.$executeRaw`
       UPDATE "ObservedSubFee" SET state = 'EXCLUDED'::"ObservedState"
