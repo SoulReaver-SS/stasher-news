@@ -205,6 +205,11 @@ function parseAddressTxs (raw) {
 /**
  * Build an lws client.
  *
+ * `options.addressTxsMode` is a LOCAL contract statement, never derived from
+ * remote JSON: 'full' means /get_address_txs returns complete history in one
+ * response (pinned v1.0.4), so callers may skip the second full-history fetch;
+ * 'unknown' (default) keeps that fallback. Revisit when changing the backend.
+ *
  * @param {object} [options]
  * @param {string} [options.walletUrl]   MONERO_LWS_URL (wallet REST base).
  * @param {string} [options.adminUrl]    MONERO_LWS_ADMIN_URL (admin REST base).
@@ -214,9 +219,14 @@ function parseAddressTxs (raw) {
  * @param {number} [options.maxRetries]  MONERO_LWS_MAX_RETRIES (transient retries; default 3).
  * @param {number} [options.backoffBaseMs] Base for exponential backoff (default 500).
  * @param {function} [options.transport] Injected transport (DI for tests).
- * @returns {object} `{ getAddressTxs, getAddressInfo, upsertSubaddrs, addAccount, modifyAccountStatus, addWebhook, deleteWebhook, deleteAddressWebhooks, listWebhooks, listAccounts }`
+ * @param {'full'|'unknown'} [options.addressTxsMode] Local snapshot-contract statement (default 'unknown').
+ * @returns {object} `{ getAddressTxs, getAddressInfo, upsertSubaddrs, addAccount, modifyAccountStatus, addWebhook, deleteWebhook, deleteAddressWebhooks, listWebhooks, listAccounts, addressTxsMode }`
  */
 export function createLwsClient (options = {}) {
+  const addressTxsMode = options.addressTxsMode ?? 'unknown'
+  if (addressTxsMode !== 'full' && addressTxsMode !== 'unknown') {
+    throw new TypeError(`Invalid addressTxsMode: ${addressTxsMode}`)
+  }
   const walletUrl = (options.walletUrl ?? readEnv('MONERO_LWS_URL', DEFAULT_WALLET_URL)).replace(/\/$/, '')
   const adminUrl = (options.adminUrl ?? readEnv('MONERO_LWS_ADMIN_URL', DEFAULT_ADMIN_URL)).replace(/\/$/, '')
   const adminAuth = options.adminAuth ?? readEnv('MONERO_LWS_ADMIN_AUTH', '')
@@ -399,11 +409,13 @@ export function createLwsClient (options = {}) {
     addWebhook,
     deleteWebhook,
     deleteAddressWebhooks,
-    listWebhooks
+    listWebhooks,
+    // Read-only: the local snapshot contract statement (see options doc).
+    get addressTxsMode () { return addressTxsMode }
   }
 }
 
-// Singleton: constructed once at module load from env config. The web/GraphQL
-// layer receives this via the Apollo context (`monero` key, see api/ssrApollo.js);
-// the worker imports it directly.
-export const lwsClient = createLwsClient()
+// Singleton: constructed once at module load from env config. The web layer
+// receives it via Apollo context; the worker imports it directly. 'full'
+// records the pinned v1.0.4 contract — revisit on a backend change.
+export const lwsClient = createLwsClient({ addressTxsMode: 'full' })

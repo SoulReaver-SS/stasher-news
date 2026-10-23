@@ -182,6 +182,26 @@ describe('getAddressTxs', () => {
 
 // ---- response metadata gate -------------------------------------------------
 
+describe('addressTxsMode adapter contract', () => {
+  test('snapshot contract is selected locally, never from remote JSON', async () => {
+    const t = recordingTransport(() => jsonRes(200, {
+      addressTxsMode: 'full', transactions: []
+    }))
+    const unknown = makeClient(t)
+    await unknown.getAddressTxs(makeAccount(1, ADDR, VIEWKEY_HEX))
+    expect(unknown.addressTxsMode).toBe('unknown')
+    expect(makeClient(t, { addressTxsMode: 'full' }).addressTxsMode).toBe('full')
+    expect(() => makeClient(t, { addressTxsMode: 'incremental' })).toThrow()
+  })
+
+  test('the property is enumerable but read-only', () => {
+    const client = makeClient(recordingTransport(() => jsonRes(200, {})))
+    expect(Object.propertyIsEnumerable.call(client, 'addressTxsMode')).toBe(true)
+    expect(() => { client.addressTxsMode = 'full' }).toThrow()
+    expect(client.addressTxsMode).toBe('unknown')
+  })
+})
+
 describe('getAddressTxs response metadata gate', () => {
   test('a valid response parses; omitted height stays null and candidates survive', async () => {
     const t = recordingTransport(() => jsonRes(200, {

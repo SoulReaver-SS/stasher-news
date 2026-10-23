@@ -678,4 +678,76 @@ describe('hash-first tx resolution (lookupTipTxMeta)', () => {
     expect(out.tx).toBeNull()
     expect(out.collision).toBe(true)
   })
+
+  test('collision signal accumulates across incremental fallback responses', async () => {
+    const dust = { id: 1, hash: 'aa'.repeat(32), payment_id: 'deadbeefdeadbeef', piconeros: 1n }
+    const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) } }
+    const cursorAccount = { ...account, lastTxId: 50n }
+    const monero = {
+      getAddressTxs: jest.fn()
+        .mockResolvedValueOnce({ transactions: [], blockchain_height: 100 })
+        .mockResolvedValueOnce({ transactions: [dust], blockchain_height: 100 })
+    }
+    const out = await lookupTipTxMeta(models, monero, cursorAccount, 'deadbeefdeadbeef', { txHash: 'cc'.repeat(32) })
+    expect(out.tx).toBeNull()
+    expect(out.collision).toBe(true)
+  })
+
+  test('PID matching is case-insensitive in both lookup styles', async () => {
+    const tx = { id: 1, hash: 'aa'.repeat(32), payment_id: 'DEADBEEFDEADBEEF', piconeros: 1n }
+    const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) } }
+    const byPid = await lookupTipTxMeta(models, moneroWith([tx]), account, 'deadbeefdeadbeef')
+    expect(byPid.tx).toBe(tx)
+    const byHash = await lookupTipTxMeta(models, moneroWith([tx]), account, 'deadbeefdeadbeef', { txHash: 'AA'.repeat(32) })
+    expect(byHash.tx).toBe(tx)
+  })
+})
+
+describe('full-snapshot adapter reuse (addressTxsMode full vs unknown)', () => {
+  function accountWithCursor (cursor) {
+    return { id: 1, label: 'author', lastTxId: cursor, address: 'A', status: 'ACTIVE', viewKey: {}, subaddresses: [] }
+  }
+
+  test('full mode: a lookup miss makes ONE request and no cursor write', async () => {
+    const author = accountWithCursor(100n)
+    const monero = {
+      addressTxsMode: 'full',
+      getAddressTxs: jest.fn().mockResolvedValue({ transactions: [], blockchain_height: 100 })
+    }
+    const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } }
+    const out = await lookupTipTxMeta(models, monero, author, 'nopid', { txHash: 'dd'.repeat(32) })
+    expect(out.tx).toBeNull()
+    expect(monero.getAddressTxs).toHaveBeenCalledTimes(1)
+    expect(models.moneroAccount.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('unknown mode: a lookup miss falls back to a second request and can find older rows', async () => {
+    const author = accountWithCursor(100n)
+    // The named hash exists in FULL history but was missed by the (simulated
+    // server-side) incremental window — this is why unknown keeps a fallback.
+    const older = { id: 40, hash: 'dd'.repeat(32), payment_id: 'nopid', piconeros: 1n, height: 50 }
+    const monero = {
+      getAddressTxs: jest.fn()
+        .mockResolvedValueOnce({ transactions: [], blockchain_height: 100 })
+        .mockResolvedValueOnce({ transactions: [older], blockchain_height: 100 })
+    }
+    const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) } }
+    const out = await lookupTipTxMeta(models, monero, author, 'nopid', { txHash: older.hash })
+    expect(out.tx).toBe(older)
+    expect(monero.getAddressTxs).toHaveBeenCalledTimes(2)
+  })
+
+  test('full mode: a same-PID/different-hash miss still surfaces the collision in ONE request', async () => {
+    const dust = { id: 1, hash: 'aa'.repeat(32), payment_id: 'pid', piconeros: 1n }
+    const author = accountWithCursor(100n)
+    const monero = {
+      addressTxsMode: 'full',
+      getAddressTxs: jest.fn().mockResolvedValue({ transactions: [dust], blockchain_height: 100 })
+    }
+    const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } }
+    const out = await lookupTipTxMeta(models, monero, author, 'pid', { txHash: 'cc'.repeat(32) })
+    expect(out.tx).toBeNull()
+    expect(out.collision).toBe(true)
+    expect(monero.getAddressTxs).toHaveBeenCalledTimes(1)
+  })
 })

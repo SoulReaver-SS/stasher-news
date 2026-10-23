@@ -499,7 +499,7 @@ export async function rewardsWalletObserver ({ models, lws = lwsClient, detectRe
     // failure must not wedge ordinary fee/downvote/tip attribution (the
     // 2026-08-10 incident class) — it is alerted and retried next tick.
     try {
-      const recoveryTxs = account.lastTxId == null
+      const recoveryTxs = account.lastTxId == null || lws.addressTxsMode === 'full'
         ? txs // the incremental fetch was already a full scan
         : (((await lws.getAddressTxs(account, 0, null)) || {}).transactions || [])
       await reconcileBountyReceipts({ models, account, transactions: recoveryTxs })

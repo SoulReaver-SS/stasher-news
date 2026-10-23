@@ -258,6 +258,46 @@ describe('other dispatcher branches stay routed through the fresh slice', () => 
     expect(account.lastTxId).toBe(3n)
   })
 
+  test('bounty recovery reuses the fetched transactions on a full adapter (one request per poll)', async () => {
+    const { reconcileBountyReceipts } = require('../../api/monero/bountyReceipts')
+    const { account, models } = buildFixture({ initialCursor: 9n })
+    const txs = [minedFee(10)]
+    const lws = { addressTxsMode: 'full', getAddressTxs: jest.fn(async () => ({ blockchain_height: 101, transactions: txs })) }
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    expect(lws.getAddressTxs).toHaveBeenCalledTimes(1)
+    expect(reconcileBountyReceipts).toHaveBeenCalledWith(expect.objectContaining({ transactions: txs }))
+    expect(account.lastTxId).toBe(10n)
+  })
+
+  test('an unknown adapter still performs the explicit full-history recovery request', async () => {
+    const { reconcileBountyReceipts } = require('../../api/monero/bountyReceipts')
+    const { account, models } = buildFixture({ initialCursor: 9n })
+    const recovery = [{ ...minedFee(2), hash: 'recovery' }]
+    let call = 0
+    const lws = {
+      getAddressTxs: jest.fn(async () => {
+        call += 1
+        return call === 1
+          ? { blockchain_height: 101, transactions: [minedFee(10)] }
+          : { blockchain_height: 101, transactions: recovery }
+      })
+    }
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    expect(lws.getAddressTxs).toHaveBeenCalledTimes(2)
+    expect(reconcileBountyReceipts).toHaveBeenCalledWith(expect.objectContaining({ transactions: recovery }))
+    expect(account.lastTxId).toBe(10n)
+  })
+
+  test('a null cursor uses the initial (already full) response for recovery in either mode', async () => {
+    const { reconcileBountyReceipts } = require('../../api/monero/bountyReceipts')
+    const { models } = buildFixture({ initialCursor: null })
+    const txs = [minedFee(1, 8)]
+    const lws = { getAddressTxs: jest.fn(async () => ({ blockchain_height: 101, transactions: txs })) }
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    expect(lws.getAddressTxs).toHaveBeenCalledTimes(1)
+    expect(reconcileBountyReceipts).toHaveBeenCalledWith(expect.objectContaining({ transactions: txs }))
+  })
+
   test('a bounty recovery failure stays best-effort and never blocks the cursor write', async () => {
     const { reconcileBountyReceipts } = require('../../api/monero/bountyReceipts')
     const { logError } = require('../../lib/logger')

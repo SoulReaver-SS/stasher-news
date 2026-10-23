@@ -115,7 +115,11 @@ export async function lookupTipTxMeta (models, monero, account, paymentId, { txH
   }
   let resp = await monero.getAddressTxs(account, account.lastTxId ?? 0, null)
   let hit = match(resp.transactions)
-  if (!hit.tx && account.lastTxId != null) {
+  // A locally-declared 'full' adapter returns the account's complete history
+  // in one response, so a miss is definitive: no second fetch and no
+  // lookup-only cursor write. Unknown/missing mode keeps the real fallback.
+  const fullSnapshot = monero.addressTxsMode === 'full'
+  if (!hit.tx && !fullSnapshot && account.lastTxId != null) {
     resp = await monero.getAddressTxs(account, 0, null)
     const full = match(resp.transactions)
     hit = { tx: full.tx, collision: hit.collision || full.collision }
@@ -131,10 +135,11 @@ export async function lookupTipTxMeta (models, monero, account, paymentId, { txH
   // items PENDING_FEE until abandonFeeItems deletes them. The observer
   // itself advances the cursor every minute, so verification lookups stay
   // incremental without this write. (Audit 2026-09-11, finding 1.)
-  if (account.label !== 'platform_rewards') {
+  if (account.label !== 'platform_rewards' && !fullSnapshot) {
     // Mined-only candidate progress: lws v1.0.4 mempool IDs are response
     // positions and must never advance a durable watermark (the observer
-    // shares this rule via the same helper).
+    // shares this rule via the same helper). Lookup-only callers on a
+    // full-snapshot adapter never write progress at all — the observer owns it.
     const next = nextLwsCursor(resp.transactions || [], account.lastTxId ?? null)
     if (next !== null && (account.lastTxId == null || next > account.lastTxId)) {
       await models.moneroAccount.updateMany({
