@@ -1736,6 +1736,130 @@ test('0-conf (mempool) callback verifies against the chain and still detects', a
   expect(execRaw).toHaveBeenCalled() // DETECTED claim still runs
 })
 
+test('v1.0.4 0-conf: a realistic pending lws receipt verifies the amount and detects with height NULL and amountVerifiedAt set', async () => {
+  const tip = { id: 1, postId: 10, tipperId: null, state: 'PENDING', paymentId: 'v104pid', piconeros: 0n, webhookEventId: 'evt-v104', post: { userId: 99 }, recipientAccount: scannableAccount() }
+  const execRaw = jest.fn().mockResolvedValue(1)
+  const queryRaw = jest.fn().mockResolvedValue([{ rank_delta: 700000000n }])
+  const models = mockModels({ observedTip: { findFirst: jest.fn().mockResolvedValue(tip) }, execRaw, queryRaw })
+  // v1.0.4 REST CAN return the mempool row: hash, decrypted amount, matching
+  // pid, height omitted, candidate spends present-but-unclosed (ordinary
+  // incoming payment — NOT the closing self-send shape, which would exclude).
+  const monero = mockMonero({
+    getAddressTxs: jest.fn().mockResolvedValue({
+      blockchain_height: 2172600,
+      transactions: [{
+        id: 3,
+        hash: 'deadbeef',
+        payment_id: 'v104pid',
+        piconeros: 1000n,
+        mempool: true,
+        height: null,
+        timestamp: null,
+        fee: 10n,
+        recipient: { maj_i: 0, min_i: 0 },
+        spent_outputs: [{ amount: '999999', sender: { maj_i: 4, min_i: 2 } }] // foreign-only: unclosed
+      }]
+    })
+  })
+  const res = mockRes()
+  await handleWebhook({
+    body: { payment_id: 'v104pid', event: 'tx-confirmation', confirmations: 0, tx_info: { tx_hash: 'deadbeef', amount: 1000 } }
+  }, res, models, monero)
+  expect(res.status).toHaveBeenCalledWith(200)
+  // Inspect the DETECTED claim's writes: verified hash bound, height NULL
+  // (mempool), amountVerifiedAt stamped (lws verdict proves the amount).
+  const sqlOf = call => Array.isArray(call[0]) ? call[0].join('') : call[0].text
+  const claim = execRaw.mock.calls.find(call => sqlOf(call).includes("state = 'DETECTED'") && sqlOf(call).includes("state = 'PENDING'"))
+  expect(claim).toBeDefined()
+  const bound = [...claim].slice(1).flat()
+  expect(bound).toContain('deadbeef')
+  expect(bound).toContain(null) // height stays NULL for a pending receipt
+  expect(bound).toContainEqual(expect.any(Date)) // amountVerifiedAt: lws-stamped
+  // No CONFIRMED credit at detection time.
+  expect(execRaw.mock.calls.map(sqlOf).some(sql => sql.includes("state = 'CONFIRMED'"))).toBe(false)
+})
+
+test('v1.0.4 0-conf: forged callback block/confirmations cannot mature a pending verified receipt', async () => {
+  const tip = { id: 1, postId: 10, tipperId: null, state: 'PENDING', paymentId: 'forgepid', piconeros: 0n, webhookEventId: 'evt-forge', post: { userId: 99 }, recipientAccount: scannableAccount() }
+  const execRaw = jest.fn().mockResolvedValue(1)
+  const queryRaw = jest.fn().mockResolvedValue([{ rank_delta: 700000000n }])
+  const models = mockModels({ observedTip: { findFirst: jest.fn().mockResolvedValue(tip) }, execRaw, queryRaw })
+  const monero = mockMonero({
+    getAddressTxs: jest.fn().mockResolvedValue({
+      blockchain_height: 2172600,
+      transactions: [{ id: 4, hash: 'cafe', payment_id: 'forgepid', piconeros: 1000n, mempool: true, height: null }]
+    })
+  })
+  const res = mockRes()
+  // The callback CLAIMS block 2172600 and 10 confirmations; the verified row is
+  // still mempool (height null). Detection must not write the forged height and
+  // must not flip CONFIRMED.
+  await handleWebhook({
+    body: { payment_id: 'forgepid', event: 'tx-confirmation', confirmations: 10, tx_info: { tx_hash: 'cafe', block: 2172600, amount: 1000 } }
+  }, res, models, monero)
+  expect(res.status).toHaveBeenCalledWith(200)
+  const sqlOf = call => Array.isArray(call[0]) ? call[0].join('') : call[0].text
+  expect(execRaw.mock.calls.map(sqlOf).some(sql => sql.includes("state = 'CONFIRMED'"))).toBe(false)
+  const claim = execRaw.mock.calls.find(call => sqlOf(call).includes("state = 'DETECTED'") && sqlOf(call).includes("state = 'PENDING'"))
+  const bound = [...claim].slice(1).flat()
+  expect(bound).toContain(null) // forged block never written as height
+})
+
+test('v1.0.4 replay: a lost detection claim applies the ranking effect once', async () => {
+  const tip = { id: 1, postId: 10, tipperId: null, state: 'PENDING', paymentId: 'replaypid', piconeros: 0n, webhookEventId: 'evt-replay', post: { userId: 99 }, recipientAccount: scannableAccount() }
+  const claimResults = [1, 0] // first callback wins; the concurrent replay loses
+  const sqlOf = call => Array.isArray(call[0]) ? call[0].join('') : call[0].text
+  const execRaw = jest.fn(async (...call) => {
+    const sql = sqlOf(call)
+    return sql.includes("state = 'DETECTED'") && sql.includes("state = 'PENDING'")
+      ? claimResults.shift() ?? 0
+      : 1
+  })
+  const queryRaw = jest.fn().mockResolvedValue([{ rank_delta: 700000000n }])
+  // Both callbacks read the same PENDING snapshot; the second is the losing
+  // concurrent claim (its guarded UPDATE returns 0 rows).
+  const models = mockModels({ observedTip: { findFirst: jest.fn(async () => tip) }, execRaw, queryRaw })
+  const monero = mockMonero({
+    getAddressTxs: jest.fn().mockResolvedValue({
+      blockchain_height: 2172600,
+      transactions: [{ id: 5, hash: 'beef', payment_id: 'replaypid', piconeros: 1000n, mempool: true, height: null }]
+    })
+  })
+  const body = { payment_id: 'replaypid', event: 'tx-confirmation', confirmations: 0, tx_info: { tx_hash: 'beef', amount: 1000 } }
+  for (const res of [mockRes(), mockRes()]) {
+    await handleWebhook({ body }, res, models, monero)
+    expect(res.status).toHaveBeenCalledWith(200)
+  }
+  const sqls = execRaw.mock.calls.map(sqlOf)
+  expect(sqls.filter(sql => sql.includes("state = 'DETECTED'") && sql.includes("state = 'PENDING'"))).toHaveLength(2)
+  expect(sqls.filter(sql => sql.includes('SET "rankPiconeros"'))).toHaveLength(1)
+  expect(queryRaw).toHaveBeenCalledTimes(1) // applyTipDetected ran once
+  expect(sqls.some(sql => sql.includes("state = 'CONFIRMED'"))).toBe(false)
+})
+
+test('v1.0.4 mined: the N-conf callback on a now-mined lws row runs the existing finalization gates', async () => {
+  const tip = { id: 1, postId: 10, tipperId: null, state: 'DETECTED', paymentId: 'minedpid', piconeros: 1000n, txHash: 'f00d', height: 2172600, webhookEventId: 'evt-mined', amountVerifiedAt: new Date(), post: { userId: 99 }, recipientAccount: scannableAccount() }
+  const userUpdate = jest.fn().mockResolvedValue({})
+  const execRaw = jest.fn().mockResolvedValue(1)
+  const queryRaw = jest.fn().mockResolvedValue([{ rank_delta: 700000000n }])
+  const models = mockModels({ observedTip: { findFirst: jest.fn().mockResolvedValue(tip) }, userUpdate, execRaw, queryRaw })
+  // The receipt is now MINED: height present, maturity satisfied (chain 10 past).
+  const monero = mockMonero({
+    getAddressTxs: jest.fn().mockResolvedValue({
+      blockchain_height: 2172609,
+      transactions: [{ id: 5, hash: 'f00d', payment_id: 'minedpid', piconeros: 1000n, height: 2172600, mempool: false }]
+    })
+  })
+  const res = mockRes()
+  await handleWebhook({
+    body: { payment_id: 'minedpid', event: 'tx-confirmation', confirmations: 10, tx_info: { tx_hash: 'f00d', block: 2172600, amount: 1000 } }
+  }, res, models, monero)
+  expect(res.status).toHaveBeenCalledWith(200)
+  const sqlOf = call => Array.isArray(call[0]) ? call[0].join('') : call[0].text
+  expect(execRaw.mock.calls.map(sqlOf).some(sql => sql.includes("state = 'CONFIRMED'") && sql.includes("state = 'DETECTED'"))).toBe(true)
+  expect(userUpdate).toHaveBeenCalled() // author credit only at maturity
+})
+
 test('0-conf tip with lws miss + daemon pid+ownership match is DETECTED (unbound, no miss check)', async () => {
   const tip = { id: 41, postId: 10, tipperId: null, state: 'PENDING', paymentId: DAEMON_PID, piconeros: 0n, webhookEventId: 'evt-d1', post: { userId: 99 }, recipientAccount: daemonAccount() }
   const execRaw = jest.fn().mockResolvedValue(1)

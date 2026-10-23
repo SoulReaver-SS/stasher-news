@@ -55,11 +55,14 @@ export class ReceiptLookupError extends Error {}
 // branches apply a self-send guard (webhook.js) that refuses to credit such
 // txs; verification stays amount-strict for every other caller.
 // DAEMON FALLBACK (Task 9): when lws cannot see the named hash, monerod
-// (restricted RPC) is consulted for the raw tx. lws's pid attribution is absent
-// on that path, so acceptance requires BOTH cryptographic proofs against the
-// account's real keys: (a) the encrypted pid decrypts to the claimed payment id
-// under the account view key, and (b) an on-chain output is provably owned by
-// the account (P = Hs(8·a·R ‖ varint(i))·G + B). Verdict: { ok: true,
+// (restricted RPC) is consulted for the raw tx. On v1.0.4 a mempool lws hit
+// usually satisfies the lookup directly (amount proof, height still null —
+// amount proof is NOT mining); the fallback remains for genuine misses, where
+// lws's pid attribution is absent on that path. Acceptance requires BOTH
+// cryptographic proofs against the account's real keys: (a) the encrypted pid
+// decrypts to the claimed payment id under the account view key, and (b) an
+// on-chain output is provably owned by the account
+// (P = Hs(8·a·R ‖ varint(i))·G + B). Verdict: { ok: true,
 // level: 'daemon', tx: { hash, height: null } } — a fallback tx is unconfirmed
 // at best, so there is no height to report. Rejections: 'pid_mismatch',
 // 'ownership_mismatch', and 'tx_not_found' (daemon unreachable, hash miss, or

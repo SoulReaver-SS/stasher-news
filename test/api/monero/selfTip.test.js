@@ -110,6 +110,39 @@ describe('isSelfSend — exact-closure requirement (ring decoys are not proof)',
       spent_outputs: [so(0, 0, 123456789012345678901234568900n)] // fee + 1000
     })).toBe(true)
   })
+  test('v1.0.4 mempool rows CAN carry candidate spends: closing own candidates exclude early', () => {
+    // Upstream #251 attaches candidate spends to mempool rows, so the existing
+    // closure heuristic can fire before mining. Pinned as characterization —
+    // candidates remain ring-member candidates, never spend proof.
+    const pending = {
+      piconeros: 1000n,
+      fee: 10n,
+      height: null,
+      mempool: true,
+      spent_outputs: [so(0, 0, 1010)]
+    }
+    expect(isSelfSend(ACCT, pending)).toBe(true)
+  })
+
+  test('v1.0.4 mempool candidates that do NOT close never exclude (no count shortcut)', () => {
+    const pending = {
+      piconeros: 1000n,
+      fee: 10n,
+      height: null,
+      mempool: true,
+      spent_outputs: [so(0, 0, 1011)]
+    }
+    expect(isSelfSend(ACCT, pending)).toBe(false)
+    // Even multiple own candidates must close exactly.
+    const multi = {
+      piconeros: 1000n,
+      fee: 10n,
+      height: null,
+      mempool: true,
+      spent_outputs: [so(0, 0, 600), so(0, 5, 411)]
+    }
+    expect(isSelfSend(ACCT, multi)).toBe(false)
+  })
 })
 
 describe('hasOwnSpendCandidates (review-alert signal, never an exclusion trigger)', () => {

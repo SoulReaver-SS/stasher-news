@@ -242,8 +242,9 @@ export async function handleWebhook (req, res, models = prisma, monero = lwsClie
         // fallback — see lookupTipTx (api/monero/selfTip.js). Hash-first
         // (review finding 5): only the callback's named tx counts as evidence,
         // so a same-pid dust tx can never drive shouldExcludeTip on the wrong
-        // tx. A mempool tx carries no spent_outputs yet, so this 0-conf check
-        // can fail open; recheckDetectedTip re-runs it once the tx is mined.
+        // tx. On lws 0.3 a mempool tx carried no spent_outputs (check failed
+        // open at 0-conf); on v1.0.4 it can — recheckDetectedTip still
+        // re-runs the check once the tx is mined either way.
         const account = tip.recipientAccount
         const tx = await lookupTipTx(models, monero, account, paymentId, { txHash })
         selfSendTx = tx

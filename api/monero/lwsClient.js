@@ -293,6 +293,8 @@ export function createLwsClient (options = {}) {
   /**
    * Primary indexer poll (reorg-safe incremental fetch).
    * `account` is a MoneroAccount row with its viewKey relation included.
+   * The since_* fields are sent for forward compatibility; pinned v1.0.4
+   * ignores them and returns full history (see addressTxsMode).
    * @returns {Promise<{blockchain_height: number, total_received: BigInt, transactions: object[]}>}
    */
   async function getAddressTxs (account, sinceTxId, sinceBlockHash) {

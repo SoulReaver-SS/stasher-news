@@ -263,6 +263,39 @@ describe('getAddressTxs response metadata gate', () => {
   })
 })
 
+describe('v1.0.4 realistic mempool receipt (raw wire shape through the real parser)', () => {
+  // Upstream v1.0.4 rest.test.cpp expects exactly this shape: a mempool row
+  // with omitted height/timestamp, a decrypted account-received amount, and
+  // candidate spends attached BEFORE mining. Pinned here so parser behavior
+  // stays source-realistic, not fixture-invented.
+  test('a primary mempool receipt parses to BigInt amount, null height/timestamp, kept candidates', async () => {
+    const rawTx = {
+      id: 11,
+      hash: 'ab'.repeat(32),
+      mempool: true,
+      payment_id: '0123456789abcdef',
+      total_received: '1000',
+      total_sent: '1010',
+      fee: '10',
+      recipient: { maj_i: 0, min_i: 0 },
+      spent_outputs: [{ amount: '1010', sender: { maj_i: 0, min_i: 0 } }]
+    }
+    const t = recordingTransport(() => jsonRes(200, { blockchain_height: 100, transactions: [rawTx] }))
+    const client = makeClient(t)
+    const out = await client.getAddressTxs(makeAccount(1, ADDR, VIEWKEY_HEX))
+    expect(out.transactions).toHaveLength(1)
+    const tx = out.transactions[0]
+    expect(tx.piconeros).toBe(1000n)
+    expect(tx.height).toBeNull()
+    expect(tx.timestamp).toBeNull()
+    expect(tx.payment_id).toBe('0123456789abcdef')
+    expect(tx.mempool).toBe(true)
+    expect(tx.fee).toBe(10n)
+    expect(tx.spent_outputs).toEqual([{ amount: '1010', sender: { maj_i: 0, min_i: 0 } }])
+    expect(out.blockchain_height).toBe(100)
+  })
+})
+
 // ---- view-key confidentiality ---------------------------------------------
 
 describe('view-key confidentiality', () => {

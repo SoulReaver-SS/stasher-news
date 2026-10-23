@@ -190,6 +190,63 @@ describe('verifyReceiptAmount', () => {
   // covered by the amount tests above.)
 })
 
+describe('v1.0.4 mempool receipt verification (amount proof is not mining)', () => {
+  // A realistic v1.0.4 mempool row: hash + decrypted amount + matching pid,
+  // height null (mempool). Pinned as characterization: the existing
+  // verification path already treats an lws hit as amount proof regardless of
+  // height — these tests keep that behavior from drifting.
+  const pendingReceipt = {
+    id: 11,
+    hash: 'ab'.repeat(32),
+    mempool: true,
+    height: null,
+    timestamp: null,
+    payment_id: '0123456789abcdef',
+    piconeros: 1000n,
+    fee: 10n,
+    recipient: { maj_i: 0, min_i: 0 },
+    spent_outputs: []
+  }
+
+  test('a pending lws receipt with matching hash/pid/amount verifies at the lws level without consulting the daemon', async () => {
+    const daemon = { getTransactions: jest.fn() }
+    await expect(verifyReceiptAmount({
+      models: MODELS,
+      monero: lwsWith([pendingReceipt]),
+      daemon,
+      account: ACTIVE_ACCOUNT,
+      paymentId: '0123456789abcdef',
+      piconeros: 1000n,
+      txHash: 'ab'.repeat(32)
+    })).resolves.toMatchObject({ ok: true, level: 'lws', chainHeight: null })
+    expect(daemon.getTransactions).not.toHaveBeenCalled()
+  })
+
+  test('a pending receipt with a wrong callback amount still rejects (amount_mismatch)', async () => {
+    await expect(verifyReceiptAmount({
+      models: MODELS,
+      monero: lwsWith([pendingReceipt]),
+      daemon: null,
+      account: ACTIVE_ACCOUNT,
+      paymentId: '0123456789abcdef',
+      piconeros: 999n,
+      txHash: 'ab'.repeat(32)
+    })).resolves.toMatchObject({ ok: false, reason: 'amount_mismatch', onChain: 1000n })
+  })
+
+  test('a pending receipt carrying a different pid rejects without recipient-side corroboration (pid_mismatch)', async () => {
+    await expect(verifyReceiptAmount({
+      models: MODELS,
+      monero: lwsWith([pendingReceipt]),
+      daemon: null,
+      account: ACTIVE_ACCOUNT,
+      paymentId: 'ffffffffffffffff',
+      piconeros: 1000n,
+      txHash: 'ab'.repeat(32)
+    })).resolves.toMatchObject({ ok: false, reason: 'pid_mismatch' })
+  })
+})
+
 // ---------------------------------------------------------------------------
 // daemon level (Task 9). A monerod-fallback receipt is accepted ONLY when BOTH
 // hold: the tx extra decrypts to the claimed payment id under the recipient's

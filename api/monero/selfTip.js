@@ -171,10 +171,11 @@ export function chainMismatch (tip, tx) {
   return false
 }
 
-// Confirm-time re-check (the 0-conf gap). At detection the tx is in the
-// mempool and lws get_address_txs carries no spent_outputs for it, so the
-// self-send check fails open — the documented worst case. Once MINED the
-// evidence exists, so this re-check runs at the last gate before CONFIRMED
+// Confirm-time re-check (the 0-conf gap). Under monero-lws 0.3 a mempool tx
+// carried no spent_outputs, so the self-send check failed open at detection;
+// on v1.0.4 REST a pending row CAN carry candidate spends (see the
+// selfTip characterization tests), in which case the check can fire early.
+// Either way this re-check runs at the last gate before CONFIRMED
 // credit (the webhook N-conf callback and the confirmFinalizer maturity pass —
 // the only two claimers of DETECTED -> CONFIRMED) and at the webhook's first
 // callback that carries a block height.
