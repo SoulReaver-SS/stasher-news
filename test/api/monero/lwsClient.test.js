@@ -180,6 +180,69 @@ describe('getAddressTxs', () => {
   })
 })
 
+// ---- response metadata gate -------------------------------------------------
+
+describe('getAddressTxs response metadata gate', () => {
+  test('a valid response parses; omitted height stays null and candidates survive', async () => {
+    const t = recordingTransport(() => jsonRes(200, {
+      blockchain_height: 2265961,
+      transactions: [{
+        id: 1,
+        hash: 'ab',
+        total_received: '5000',
+        total_sent: '1000',
+        fee: '10',
+        height: 2265900,
+        mempool: false,
+        recipient: { maj_i: 0, min_i: 0 },
+        spent_outputs: [{ amount: '1000', sender: { maj_i: 0, min_i: 0 } }]
+      }]
+    }))
+    const client = makeClient(t)
+    const out = await client.getAddressTxs(makeAccount(1, ADDR, VIEWKEY_HEX))
+    const tx = out.transactions[0]
+    expect(tx.piconeros).toBe(5000n)
+    expect(tx.height).toBe(2265900)
+    expect(tx.spent_outputs).toEqual([{ amount: '1000', sender: { maj_i: 0, min_i: 0 } }])
+  })
+
+  test('a mempool row keeps height null alongside real candidate spends', async () => {
+    const t = recordingTransport(() => jsonRes(200, {
+      blockchain_height: 2265961,
+      transactions: [{
+        id: 2,
+        hash: 'cd',
+        total_received: '3000',
+        mempool: true,
+        recipient: { maj_i: 0, min_i: 0 },
+        spent_outputs: [{ amount: '999', sender: { maj_i: 0, min_i: 0 } }]
+      }]
+    }))
+    const client = makeClient(t)
+    const out = await client.getAddressTxs(makeAccount(1, ADDR, VIEWKEY_HEX))
+    expect(out.transactions[0].height).toBeNull()
+    expect(out.transactions[0].spent_outputs).toHaveLength(1)
+  })
+
+  test.each([
+    { id: 3, hash: 'x', height: 100, mempool: true }, // contradictory mining metadata
+    { id: 4, hash: 'x', height: -5 }, // negative height
+    { id: 5, hash: 'x', height: '100' }, // string height
+    { id: 6, hash: 'x', mempool: 'yes' } // non-boolean mempool marker
+  ])('a malformed row rejects the WHOLE response, not just the bad row: %p', badRow => {
+    const t = recordingTransport(() => jsonRes(200, {
+      blockchain_height: 2265961,
+      transactions: [
+        { id: 1, hash: 'good', total_received: '1', height: 100, mempool: false },
+        badRow
+      ]
+    }))
+    const client = makeClient(t)
+    return expect(client.getAddressTxs(makeAccount(1, ADDR, VIEWKEY_HEX)))
+      .rejects.toThrow(TypeError)
+  })
+})
+
 // ---- view-key confidentiality ---------------------------------------------
 
 describe('view-key confidentiality', () => {

@@ -1,6 +1,7 @@
 import https from 'node:https'
 import http from 'node:http'
 import { decryptViewKey } from './viewkey.js'
+import { freshLwsTransactions } from './lwsCursor.js'
 
 // monero-lws REST client (Task 3 / spec §5).
 //
@@ -195,6 +196,9 @@ function parseAddressTxs (raw) {
   const out = { ...raw }
   if (typeof out.total_received === 'string') out.total_received = BigInt(out.total_received)
   out.transactions = Array.isArray(raw.transactions) ? raw.transactions.map(parseTx) : []
+  // Validate before any consumer sees the rows: malformed metadata rejects the
+  // whole response (a null cursor makes this a pure validation pass).
+  freshLwsTransactions(out.transactions, null)
   return out
 }
 

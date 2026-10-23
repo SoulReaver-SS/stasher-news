@@ -81,9 +81,7 @@ describe('mining metadata validation', () => {
 })
 
 describe('cursor argument validation', () => {
-  test.each([
-    undefined, 9, 9n + 1n === 9n ? 0 : '9', -1n, 1.5
-  ])('invalid cursor input rejects: %p', cursor => {
+  test.each([undefined, 9, '9', -1n, 1.5])('invalid cursor input rejects: %p', cursor => {
     expect(() => freshLwsTransactions([], cursor)).toThrow(TypeError)
     expect(() => nextLwsCursor([], cursor)).toThrow(TypeError)
   })

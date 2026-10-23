@@ -165,9 +165,10 @@ describe('resolveItemSubName', () => {
 })
 
 describe('lookupTipTx cursor invariant (audit 2026-09-11 finding 1)', () => {
+  // Mined rows (height present): real durable progress candidates.
   const txs = [
-    { id: 101, hash: 'a', payment_id: 'feeleg', piconeros: 1n },
-    { id: 102, hash: 'b', payment_id: 'dvx', piconeros: 2n }
+    { id: 101, hash: 'a', payment_id: 'feeleg', piconeros: 1n, height: 900 },
+    { id: 102, hash: 'b', payment_id: 'dvx', piconeros: 2n, height: 901 }
   ]
   const monero = { getAddressTxs: jest.fn().mockResolvedValue({ transactions: txs }) }
 
@@ -187,6 +188,44 @@ describe('lookupTipTx cursor invariant (audit 2026-09-11 finding 1)', () => {
       where: { id: 8, OR: [{ lastTxId: null }, { lastTxId: { lt: 102n } }] },
       data: { lastTxId: 102n }
     })
+  })
+
+  test('pending-only rows never advance the cursor (v1.0.4 mempool IDs are positions)', async () => {
+    const author = { id: 8, label: null, lastTxId: 100n }
+    const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } }
+    const pendingMonero = {
+      getAddressTxs: jest.fn().mockResolvedValue({
+        transactions: [{ id: 205, hash: 'p', payment_id: 'dvx', piconeros: 2n, height: null, mempool: true }]
+      })
+    }
+    await lookupTipTx(models, pendingMonero, author, 'dvx')
+    expect(models.moneroAccount.updateMany).not.toHaveBeenCalled()
+  })
+
+  test('mixed rows advance to the mined max only', async () => {
+    const author = { id: 8, label: null, lastTxId: 100n }
+    const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } }
+    const mixedMonero = {
+      getAddressTxs: jest.fn().mockResolvedValue({
+        transactions: [
+          ...txs,
+          { id: 250, hash: 'c', payment_id: null, piconeros: 1n, height: null, mempool: true }
+        ]
+      })
+    }
+    await lookupTipTx(models, mixedMonero, author, 'dvx')
+    expect(models.moneroAccount.updateMany).toHaveBeenCalledWith({
+      where: { id: 8, OR: [{ lastTxId: null }, { lastTxId: { lt: 102n } }] },
+      data: { lastTxId: 102n }
+    })
+  })
+
+  test('a huge BigInt cursor is compared exactly, never through Number', async () => {
+    const huge = 9007199254740993n
+    const author = { id: 8, label: null, lastTxId: huge }
+    const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } }
+    await lookupTipTx(models, monero, author, 'dvx')
+    expect(models.moneroAccount.updateMany).not.toHaveBeenCalled()
   })
 })
 
@@ -382,7 +421,8 @@ describe('recheckDetectedTip', () => {
 
 describe('recheckDetectedTip — zero-conf hardening (fail-closed + two-phase binding)', () => {
   function scannable () {
-    return { id: 1, label: 'author', address: 'A', status: 'ACTIVE', viewKey: {}, lastTxId: 0, subaddresses: [] }
+    // Uninitialized cursor: the mined-only helper accepts null or BigInt.
+    return { id: 1, label: 'author', address: 'A', status: 'ACTIVE', viewKey: {}, lastTxId: null, subaddresses: [] }
   }
   function tipRow (over = {}) {
     return {
@@ -602,7 +642,7 @@ describe('recheckDetectedTip — zero-conf hardening (fail-closed + two-phase bi
 })
 
 describe('hash-first tx resolution (lookupTipTxMeta)', () => {
-  const account = { id: 1, label: 'author', lastTxId: 0, address: 'A', status: 'ACTIVE', viewKey: {}, subaddresses: [] }
+  const account = { id: 1, label: 'author', lastTxId: null, address: 'A', status: 'ACTIVE', viewKey: {}, subaddresses: [] }
 
   function moneroWith (txs, blockchainHeight = 100) {
     return { getAddressTxs: jest.fn().mockResolvedValue({ transactions: txs, blockchain_height: blockchainHeight }) }

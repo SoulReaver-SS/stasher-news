@@ -1,4 +1,5 @@
 import { lwsClient } from '@/api/monero/lwsClient'
+import { freshLwsTransactions, nextLwsCursor } from '@/api/monero/lwsCursor'
 import {
   REWARDS_POSTING_MAJOR,
   FEE_MAJORS
@@ -476,13 +477,16 @@ export async function rewardsWalletObserver ({ models, lws = lwsClient, detectRe
   // next cron tick re-creates the run either way.
   const account = await findRewardsAccount(models)
   if (account) {
+    const previousCursor = account.lastTxId ?? null
     const resp = await lws.getAddressTxs(account, account.lastTxId, account.lastBlockHash)
     if (resp && typeof resp.blockchain_height === 'number') detect(resp.blockchain_height)
     const txs = (resp && resp.transactions) || []
-    // bootstrapping filter: skip confirmed txs already behind the cursor. null
-    // lastTxId = nothing seen yet, so process the whole returned history (this
-    // is what lets a brand-new account's FIRST lws tx, which has id 0, through).
-    const fresh = txs.filter(t => t.height == null || typeof t.id !== 'number' || account.lastTxId == null || BigInt(t.id) > account.lastTxId)
+    // lws v1.0.4 appends mempool rows with response-position IDs; validating
+    // and slicing through the pure helpers BEFORE any attribution aborts the
+    // whole poll on malformed metadata and keeps pending rows replayable
+    // without letting their IDs touch the durable watermark.
+    const fresh = freshLwsTransactions(txs, previousCursor)
+    const next = nextLwsCursor(txs, previousCursor)
     await runRewardsWalletObserverOnce({ models, account, txs: fresh })
 
     // Bounded bounty-receipt recovery (rewards accounting repair §4), BEFORE
@@ -506,18 +510,14 @@ export async function rewardsWalletObserver ({ models, lws = lwsClient, detectRe
         { dedupeKey: 'bounty-receipt-recovery-failed' })
     }
 
-    let maxId = 0
-    for (const t of txs) {
-      if (typeof t.id === 'number' && t.id > maxId) maxId = t.id
-    }
-    if (txs.length > 0) {
-      // Forward-only, mirroring lookupTipTx's guard: two overlapping runs
-      // (slow fetch + fast successor) must never drag the watermark
-      // backwards. A regression is harmless by attribution idempotency, but
-      // the invariant is monotonic advance.
+    // The candidate watermark counts MINED rows only (mempool IDs are
+    // response positions). Persist forward-only after required processing
+    // succeeded and only on an actual advance — a no-op proposal (empty
+    // response, mined rows behind the cursor) writes nothing.
+    if (next !== null && (previousCursor === null || next > previousCursor)) {
       await models.moneroAccount.updateMany({
-        where: { id: account.id, OR: [{ lastTxId: null }, { lastTxId: { lt: BigInt(maxId) } }] },
-        data: { lastTxId: BigInt(maxId) }
+        where: { id: account.id, OR: [{ lastTxId: null }, { lastTxId: { lt: next } }] },
+        data: { lastTxId: next }
       })
     }
   }

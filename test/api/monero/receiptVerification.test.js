@@ -125,7 +125,7 @@ describe('verifyReceiptAmount', () => {
   })
 
   test('a named hash never binds to a different same-pid tx (hash-first)', async () => {
-    const account = { address: 'A', status: 'ACTIVE', viewKey: {}, lastTxId: 0, subaddresses: [], label: 'author', id: 1 }
+    const account = { address: 'A', status: 'ACTIVE', viewKey: {}, lastTxId: null, subaddresses: [], label: 'author', id: 1 }
     const models = { moneroAccount: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) } }
     const dust = { id: 1, hash: 'aa'.repeat(32), payment_id: 'deadbeefdeadbeef', piconeros: 5n }
     const monero = { getAddressTxs: jest.fn().mockResolvedValue({ transactions: [dust], blockchain_height: 50 }) }

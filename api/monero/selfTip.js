@@ -1,5 +1,6 @@
 import { Prisma } from '@prisma/client'
 import { applyTipDetected, reverseTip } from '@/api/monero/ranking'
+import { nextLwsCursor } from '@/api/monero/lwsCursor'
 import { alert } from '@/lib/alert'
 import { moneroTxNotFoundExclusionsTotal } from '@/lib/metrics'
 
@@ -131,12 +132,14 @@ export async function lookupTipTxMeta (models, monero, account, paymentId, { txH
   // itself advances the cursor every minute, so verification lookups stay
   // incremental without this write. (Audit 2026-09-11, finding 1.)
   if (account.label !== 'platform_rewards') {
-    const maxId = (resp.transactions || []).reduce(
-      (m, t) => (typeof t.id === 'number' && t.id > m ? t.id : m), Number(account.lastTxId ?? 0))
-    if (maxId > Number(account.lastTxId ?? 0)) {
+    // Mined-only candidate progress: lws v1.0.4 mempool IDs are response
+    // positions and must never advance a durable watermark (the observer
+    // shares this rule via the same helper).
+    const next = nextLwsCursor(resp.transactions || [], account.lastTxId ?? null)
+    if (next !== null && (account.lastTxId == null || next > account.lastTxId)) {
       await models.moneroAccount.updateMany({
-        where: { id: account.id, OR: [{ lastTxId: null }, { lastTxId: { lt: BigInt(maxId) } }] },
-        data: { lastTxId: BigInt(maxId) }
+        where: { id: account.id, OR: [{ lastTxId: null }, { lastTxId: { lt: next } }] },
+        data: { lastTxId: next }
       }).catch(() => {}) // best-effort: a lost advance only costs one fuller scan
     }
   }
