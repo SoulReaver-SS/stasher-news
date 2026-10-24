@@ -257,16 +257,13 @@ export async function postingFeePrivatesFor (models, user, viewerId) {
 // refused (EXCLUDED) receipts must not read as payment progress. Drives
 // Item.feeReceivedPiconeros (underpayment hint) and itemFeeReentryFunding
 // (top-up remainder).
-export async function feeReceivedPiconerosForPayIn (models, payInId) {
+// `verifiedOnly` restricts the sum to height-bearing receipts — exactly what
+// the integrated-fee gates count (a provisional 0-conf claim is display-only).
+export async function feeReceivedPiconerosForPayIn (models, payInId, { verifiedOnly = false } = {}) {
+  const where = { payInId, state: { in: ['DETECTED', 'CONFIRMED'] }, ...(verifiedOnly ? { height: { not: null } } : {}) }
   const [feeAgg, subFeeAgg] = await Promise.all([
-    models.feeObservation.aggregate({
-      _sum: { piconeros: true },
-      where: { payInId, state: { in: ['DETECTED', 'CONFIRMED'] } }
-    }),
-    models.observedSubFee.aggregate({
-      _sum: { piconeros: true },
-      where: { payInId, state: { in: ['DETECTED', 'CONFIRMED'] } }
-    })
+    models.feeObservation.aggregate({ _sum: { piconeros: true }, where }),
+    models.observedSubFee.aggregate({ _sum: { piconeros: true }, where })
   ])
   return (feeAgg._sum.piconeros ?? 0n) + (subFeeAgg._sum.piconeros ?? 0n)
 }

@@ -116,8 +116,12 @@ export async function runConfirmFinalizerOnce ({ models, daemonClient: client = 
     where: { state: 'DETECTED', height: null },
     take: SCAN_BATCH_SIZE
   })
+  // PID-bound integrated fee receipts are excluded: their height must come
+  // with a verified amount and a gate replay, which only the shared applier
+  // (webhook / observer / reconcileOwnerFeeLegs) performs — a bare height
+  // stamp here would make a provisional callback amount count.
   const nullHeightFees = await models.feeObservation.findMany({
-    where: { state: 'DETECTED', height: null, walletReceipt: true },
+    where: { state: 'DETECTED', height: null, walletReceipt: true, paymentId: null },
     take: SCAN_BATCH_SIZE
   })
   if (nullHeightDownvotes.length || nullHeightFees.length) {
@@ -259,8 +263,9 @@ export async function runConfirmFinalizerOnce ({ models, daemonClient: client = 
   for (const fee of fees) {
     const confirmations = chainHeight - fee.height + 1
     if (confirmations < REQUIRED_CONFIRMATIONS) continue
-    await models.feeObservation.update({
-      where: { id: fee.id },
+    // Conditional: a concurrent refusal/reversal (EXCLUDED/REORGED) wins.
+    await models.feeObservation.updateMany({
+      where: { id: fee.id, state: 'DETECTED' },
       data: { state: 'CONFIRMED', confirmations, confirmedAt: new Date() }
     })
   }

@@ -14,9 +14,22 @@
 // (live database, FK-safe teardown tracked in a `created` object). Run via:
 //   docker exec -u apprunner app npx jest test/engine/payInTerritoryCreate.test.js
 
+import { expectPlatformFeeLeg } from '../../test/helpers/platformFeeRecipient'
 import { PrismaClient } from '@prisma/client'
 import pay from '@/api/payIn/index'
 import { sweepFakeRewardsWallets } from '../helpers/sweepRewardsWallets'
+
+// Integrated platform fee legs: a real test recipient row (FK), throttle and
+// subaddress pool untouched.
+jest.mock('../../api/monero/feePool', () => ({
+  __esModule: true,
+  ...jest.requireActual('../../api/monero/feePool'),
+  resolvePlatformFeeRecipient: jest.fn(models => require('../../test/helpers/platformFeeRecipient').testPlatformFeeRecipient(models))
+}))
+// Fee legs register an lws webhook at issuance; never reach the real lws.
+jest.mock('../../api/monero/lwsClient', () => ({
+  __esModule: true, lwsClient: { addWebhook: jest.fn(async () => ({ event_id: 'test-fee-hook' })) }
+}))
 
 // `pay()` and `./lib/is` both import the `api/payIn/types` barrel, which pulls
 // `itemCreate`/`itemUpdate` -> `lib/lexical/server/mentions` -> the ESM-only
@@ -195,21 +208,17 @@ test('the territory Sub was created with billingStatus PENDING_FEE and linked to
   expect(sub.billingPayInId).toBe(created.payInId)
 })
 
-test('a rewards-wallet major-2 fee subaddress was reserved (ASSIGNED) for the fee', async () => {
-  expect(created.drawnMajor).toBe(2)
-  const idx = await prisma.subaddressIndex.findFirst({
-    where: {
-      accountId: created.rewardsAccountId,
-      majorIndex: created.drawnMajor,
-      minorIndex: created.drawnMinor
-    },
-    select: { state: true }
+test('no rewards-wallet fee subaddress is drawn for a new turf invoice', async () => {
+  expect(created.drawnMajor ?? null).toBeNull()
+  const assignedNow = await prisma.subaddressIndex.findMany({
+    where: { accountId: created.rewardsAccountId, majorIndex: 2, state: 'ASSIGNED' },
+    select: { id: true }
   })
-  expect(idx?.state).toBe('ASSIGNED')
+  expect(assignedNow.map(r => r.id).sort()).toEqual([...created.assignedBeforeIds].sort())
 })
 
-test('the returned PayIn carries the StasherNews monero fee URI + subaddress coords', () => {
+test('the returned PayIn carries an integrated-address TERRITORY_CREATE invoice frozen to the platform recipient', async () => {
   expect(result.moneroUri).toMatch(/^monero:/)
-  expect(result.moneroSubaddressMajor).toBe(2)
-  expect(result.moneroSubaddressMinor).toBe(created.drawnMinor)
+  const feeMap = await expectPlatformFeeLeg(prisma, result, 'TERRITORY_CREATE')
+  expect(feeMap.subName).toBe(created.subName)
 })

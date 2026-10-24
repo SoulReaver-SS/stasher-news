@@ -41,7 +41,7 @@ const ADDR = '5' + '3'.repeat(94) // 95-char Monero address placeholder
 
 // Tracks every row created across tests so afterAll can tear them down in
 // FK-safe order: ObservedTip/ObservedDownvote -> Item -> MoneroAccount -> users.
-const created = { users: [], items: [], accounts: [], tips: [], downvotes: [], subFees: [], bounties: [] }
+const created = { users: [], items: [], accounts: [], tips: [], downvotes: [], subFees: [], bounties: [], fees: [] }
 
 // Pin the fee config deterministically for the height-set-short reconcile
 // fixture (same regime as test/worker/bounties.test.js, so the quote math is
@@ -68,6 +68,7 @@ afterAll(async () => {
   await prisma.observedTip.deleteMany({ where: { id: { in: created.tips } } })
   await prisma.observedDownvote.deleteMany({ where: { id: { in: created.downvotes } } })
   await prisma.observedSubFee.deleteMany({ where: { id: { in: created.subFees } } })
+  await prisma.feeObservation.deleteMany({ where: { id: { in: created.fees } } })
   // ObservedBountyReceipt rows cascade on ObservedBounty delete (FK onDelete: Cascade).
   await prisma.observedBounty.deleteMany({ where: { id: { in: created.bounties } } })
   await prisma.feeObservation.deleteMany({ where: { postId: { in: created.items }, feeType: 'BOUNTY_FEE' } })
@@ -767,6 +768,24 @@ test('a mempool ObservedSubFee (height null) is skipped even at high chain heigh
   const after = await prisma.observedSubFee.findUnique({ where: { id: subFee.id } })
   expect(after.state).toBe('DETECTED')
   expect(after.confirmations).toBe(0)
+})
+
+// Integrated platform fee receipts (PID-bound FeeObservation rows) get their
+// height ONLY through the shared applier, which corrects the provisional
+// amount and replays the gate; the finalizer's bare height backfill must
+// leave them alone even when lws reports the tx mined.
+test('a NULL-height PID-bound FeeObservation is never height-stamped by the backfill', async () => {
+  const txHash = 'cfpidfee' + String(Date.now()).padStart(56, '0')
+  const fee = await prisma.feeObservation.create({
+    data: { txHash, paymentId: 'a1b2c3d4e5f60718', feeType: 'POSTING', recipientMajor: 0, recipientMinor: 0, piconeros: 9_000_000_000n, height: null, state: 'DETECTED' }
+  })
+  created.fees.push(fee.id)
+  const lws = { getAddressTxs: jest.fn().mockResolvedValue({ transactions: [{ hash: txHash, height: 990, confirmations: 11, piconeros: 1_000_000_000n }], blockchain_height: 1000 }) }
+
+  await runConfirmFinalizerOnce({ models: prisma, daemonClient: mockClient(1000), lwsClient: lws })
+
+  const after = await prisma.feeObservation.findUnique({ where: { id: fee.id } })
+  expect(after).toMatchObject({ height: null, piconeros: 9_000_000_000n, state: 'DETECTED' })
 })
 
 // Seed a DETECTED ObservedBounty directly (bypassing the webhook) so the test

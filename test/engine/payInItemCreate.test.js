@@ -17,6 +17,7 @@
 // test/worker/rewardsDistributor.test.js. Run via:
 //   docker exec -u apprunner app npx jest test/engine/payInItemCreate.test.js
 
+import { expectPlatformFeeLeg } from '../../test/helpers/platformFeeRecipient'
 import { PrismaClient } from '@prisma/client'
 import pay from '@/api/payIn/index'
 import { onPaid, getInitial } from '@/api/payIn/types/itemCreate'
@@ -24,6 +25,11 @@ import { performBotBehavior, countNonOwnedSubs } from '@/api/payIn/lib/item'
 import { flipPendingToLive } from '@/worker/rewardsWalletObserver'
 import { USER_ID } from '@/lib/constants'
 import { moneroUriAmountPiconeros } from '@/lib/format'
+
+// Fee legs register an lws webhook at issuance; never reach the real lws.
+jest.mock('../../api/monero/lwsClient', () => ({
+  __esModule: true, lwsClient: { addWebhook: jest.fn(async () => ({ event_id: 'test-fee-hook' })) }
+}))
 
 // itemCreate.js statically imports @/lib/lexical/server/mentions (ESM-only
 // mdast-util-from-markdown, which next/jest does not transform from node_modules)
@@ -48,6 +54,8 @@ jest.mock('../../api/resolvers/item', () => ({
 // reused in downZap.test.js).
 jest.mock('../../api/monero/feePool', () => ({
   __esModule: true,
+  throttleFeeIssuance: jest.fn(),
+  resolvePlatformFeeRecipient: jest.fn(models => require('../../test/helpers/platformFeeRecipient').testPlatformFeeRecipient(models)),
   reserveFeeSubaddress: jest.fn(async () => ({
     id: 1,
     major: 1,
@@ -213,7 +221,7 @@ test('getInitial returns a posting-fee URI for low-rep post authors past their 1
   expect(result.piconeros).toBe(0n)
   expect(result.moneroUri).toMatch(/^monero:/)
   expect(result.moneroUri).toContain('tx_amount=0.001')
-  expect(result.moneroSubaddressMajor).toBe(1)
+  await expectPlatformFeeLeg(prisma, result, 'POSTING')
 })
 
 test('getInitial returns a free prospect for established users', async () => {
@@ -238,7 +246,7 @@ test('getInitial returns a posting-fee URI for established authors who exhausted
   expect(result.piconeros).toBe(0n)
   expect(result.moneroUri).toMatch(/^monero:/)
   expect(result.moneroUri).toContain('tx_amount=0.001')
-  expect(result.moneroSubaddressMajor).toBe(1)
+  await expectPlatformFeeLeg(prisma, result, 'POSTING')
 })
 
 // --- Fix 4: comments beyond the daily freebie quota pay a flat comment fee ---
@@ -252,7 +260,7 @@ test('getInitial returns a comment-fee URI for authors past the freebie quota', 
   expect(result.piconeros).toBe(0n)
   expect(result.moneroUri).toMatch(/^monero:/)
   expect(moneroUriAmountPiconeros(result.moneroUri)).toBe(600_000_000n)
-  expect(result.moneroSubaddressMajor).toBe(1)
+  await expectPlatformFeeLeg(prisma, result, 'POSTING')
 })
 
 // --- anonymous comments pay the comment fee x ANON_COMMENT_FEE_MULTIPLIER ---
@@ -262,7 +270,7 @@ test('getInitial returns a x3 anon comment-fee URI for anonymous comments', asyn
   expect(result.piconeros).toBe(0n)
   expect(result.moneroUri).toMatch(/^monero:/)
   expect(moneroUriAmountPiconeros(result.moneroUri)).toBe(1_800_000_000n) // 0.0006 x 3
-  expect(result.moneroSubaddressMajor).toBe(1)
+  await expectPlatformFeeLeg(prisma, result, 'POSTING')
 })
 
 // --- anonymous posts pay the flat fee x ANON_POST_FEE_MULTIPLIER ---
@@ -272,7 +280,7 @@ test('getInitial returns a x10 anon posting-fee URI for anonymous posts', async 
   expect(result.piconeros).toBe(0n)
   expect(result.moneroUri).toMatch(/^monero:/)
   expect(result.moneroUri).toContain('tx_amount=0.01') // 0.001 x 10
-  expect(result.moneroSubaddressMajor).toBe(1)
+  await expectPlatformFeeLeg(prisma, result, 'POSTING')
 })
 
 // --- A-05: 1.5x spam-fee escalation (item_spam) is applied server-side ---

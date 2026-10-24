@@ -1,8 +1,7 @@
 import { PAID_ACTION_PAYMENT_METHODS, TERRITORY_PERIOD_COST } from '@/lib/constants'
 import { nextBilling, needsCadenceFee } from '@/lib/territory'
 import { territoryFeePiconeros } from '@/api/monero/territoryFee'
-import { reserveFeeSubaddress } from '@/api/monero/feePool'
-import { buildMoneroUri } from '@/api/monero/uri'
+import { createPlatformFeeLeg } from '@/api/monero/ownerFeeLeg'
 import { GqlInputError } from '@/lib/error'
 import { scheduleTerritoryBilling } from '../lib/scheduleTerritoryBilling'
 import { subOccWhere } from '../lib/territory'
@@ -44,13 +43,15 @@ export async function getInitial (models, { oldName, billingType, uploadIds = []
     const config = await models.platformFeeConfig.findUnique({ where: { id: 1 } })
     if (!config) throw new GqlInputError('fee config not initialized')
     const cadencePiconeros = territoryFeePiconeros(billingType, config)
-    const reserved = await reserveFeeSubaddress(models, 'TERRITORY_UPDATE', { me })
-    prospect.moneroUri = buildMoneroUri(
-      [{ address: reserved.address, amount: cadencePiconeros }],
-      { description: `StasherNews turf ${oldSub.name} switch to ${billingType}` }
-    )
-    prospect.moneroSubaddressMajor = reserved.major
-    prospect.moneroSubaddressMinor = reserved.minor
+    const leg = await createPlatformFeeLeg(models, undefined, {
+      me,
+      feeType: 'TERRITORY_UPDATE',
+      amountPiconeros: cadencePiconeros,
+      description: `StasherNews turf ${oldSub.name} switch to ${billingType}`,
+      subName: oldSub.name
+    })
+    prospect.moneroUri = leg.moneroUri
+    prospect.moneroPaymentId = leg.paymentId
   }
 
   return prospect

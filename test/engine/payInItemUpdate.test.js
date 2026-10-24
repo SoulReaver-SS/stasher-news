@@ -43,6 +43,7 @@
 // Real-DB integration test (mirrors test/engine/payInItemCreate.test.js):
 //   docker exec -u apprunner app npx jest test/engine/payInItemUpdate.test.js
 
+import { expectPlatformFeeLeg } from '../../test/helpers/platformFeeRecipient'
 import { randomUUID } from 'node:crypto'
 import { PrismaClient } from '@prisma/client'
 import pay from '@/api/payIn/index'
@@ -69,6 +70,8 @@ jest.mock('../../api/resolvers/item', () => ({
 // SubaddressIndex rows (deterministic; same stub as payInItemCreate.test.js).
 jest.mock('../../api/monero/feePool', () => ({
   __esModule: true,
+  throttleFeeIssuance: jest.fn(),
+  resolvePlatformFeeRecipient: jest.fn(models => require('../../test/helpers/platformFeeRecipient').testPlatformFeeRecipient(models)),
   reserveFeeSubaddress: jest.fn(async () => ({
     id: 1,
     major: 1,
@@ -540,8 +543,8 @@ test('an edit adding 2 non-owned turfs defers and charges the BASE posting fee â
   // pricing: BASE platform floor x 2 (two non-owned turfs -> no single-owner
   // route), no owner leg, no spam escalation â€” reposts are exempt (2026-09-26)
   expect(result.moneroUri).toMatch(/^monero:/)
-  expect(result.moneroSubaddressMajor).toBe(1) // feePool stub
-  expect(result.moneroPaymentId).toBeNull()
+  const feeMap = await expectPlatformFeeLeg(prisma, result, 'POSTING')
+  expect(feeMap.postId).toBe(itemId) // an edit binds its known item at issuance
   const config = await prisma.platformFeeConfig.findUnique({ where: { id: 1 } })
   const expected = config.postingFeeFloorPiconeros * 2n
   expect(moneroUriAmountPiconeros(result.moneroUri)).toBe(expected)
@@ -658,8 +661,7 @@ test('a combined upload + turf-add edit quotes ONE platform URI covering both (R
   created.payIns.push(result.id)
 
   // upload fees force the platform leg (no premium, no owner-direct)
-  expect(result.moneroSubaddressMajor).toBe(1)
-  expect(result.moneroPaymentId).toBeNull()
+  await expectPlatformFeeLeg(prisma, result, 'POSTING')
   const config = await prisma.platformFeeConfig.findUnique({ where: { id: 1 } })
   const expected = 1_000_000_000n + config.postingFeeFloorPiconeros
   expect(moneroUriAmountPiconeros(result.moneroUri)).toBe(expected)

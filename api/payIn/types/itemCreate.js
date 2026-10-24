@@ -9,10 +9,8 @@ import { getItem } from '@/api/resolvers/item'
 import { getTempImgproxyUrls } from '../lib/upload'
 import { incrementFreeCommentCount, incrementFreePostCount } from '../lib/freebie'
 import { postingFeePiconeros, commentQuotaFor, postQuotaFor } from '@/api/monero/postingFee'
-import { reserveFeeSubaddress } from '@/api/monero/feePool'
-import { buildMoneroUri } from '@/api/monero/uri'
 import { resolveOwnerFeeRoute, postFeePiconerosForSubs, postFloorPiconerosForSubs, commentFeePiconerosForSubs, commentFloorPiconerosForSubs } from '@/api/monero/turfFeeRouting'
-import { createOwnerFeeLeg } from '@/api/monero/ownerFeeLeg'
+import { createOwnerFeeLeg, createPlatformFeeLeg } from '@/api/monero/ownerFeeLeg'
 import { lwsClient } from '@/api/monero/lwsClient'
 import { uploadFees } from '@/api/resolvers/upload'
 import * as MEDIA_UPLOAD from './mediaUpload'
@@ -44,47 +42,62 @@ export async function escalatedFeePiconeros (models, { parentId, userId, basePic
 
 // Build the fee payment prospect for a fee-charging branch: owner-direct leg
 // when the route resolves (one non-owned turf + owner wallet + no upload fees),
-// else the platform rewards-wallet subaddress. `fee` is the platform FLOOR
-// math only; `premiumPiconeros` (the turf-owner surcharge delta) is added
-// EXCLUSIVELY on the owner-routed leg — a premium must never be charged when
-// the payment would land in the platform wallet.
+// else a platform rewards-wallet leg. Both are integrated-address invoices
+// (api/monero/ownerFeeLeg.js); legacy subaddress invoices issued before the
+// migration keep settling through rewardsWalletObserver. `fee` is the
+// platform FLOOR math only; `premiumPiconeros` (the turf-owner surcharge
+// delta) is added EXCLUSIVELY on the owner-routed leg — a premium must never
+// be charged when the payment would land in the platform wallet.
 //
 // R10: shared with api/payIn/types/itemUpdate.js for edit-time turf-addition
 // fees. Callers pass `payInType`/`itemPayIn` when the prospect belongs to a
 // non-ITEM_CREATE flow; the routing/pricing math is identical, so an editor
 // adding turfs pays exactly what a creator would have.
-export async function feeLegOrSubaddress (models, { subs, userId, fee, premiumPiconeros = 0n, uploadFeesPiconeros, description, payInType = 'ITEM_CREATE', itemPayIn = undefined, beneficiaries }) {
+export async function itemFeeLeg (models, { subs, userId, fee, premiumPiconeros = 0n, uploadFeesPiconeros, description, payInType = 'ITEM_CREATE', itemPayIn = undefined, beneficiaries }) {
+  const me = { id: userId }
   const route = await resolveOwnerFeeRoute(models, { subs, userId, uploadFeesPiconeros })
-  if (route) {
-    const leg = await createOwnerFeeLeg(models, lwsClient, {
+  const leg = route
+    ? await createOwnerFeeLeg(models, lwsClient, {
+      me,
       ownerAccount: route.ownerAccount,
       subName: route.sub.name,
       amountPiconeros: fee + premiumPiconeros + uploadFeesPiconeros,
       description
     })
-    return {
-      payInType,
-      userId,
-      piconeros: 0n,
-      moneroUri: leg.moneroUri,
-      moneroPaymentId: leg.paymentId,
-      ...(itemPayIn ? { itemPayIn } : {}),
-      beneficiaries
-    }
-  }
-  const sub = await reserveFeeSubaddress(models, 'POSTING', { me: { id: userId } })
-  const moneroUri = buildMoneroUri(
-    [{ address: sub.address, amount: fee + uploadFeesPiconeros }],
-    { description }
-  )
+    : await createPlatformFeeLeg(models, lwsClient, {
+      me,
+      feeType: 'POSTING',
+      amountPiconeros: fee + uploadFeesPiconeros,
+      description,
+      // edits know their item now; creations bind it in onBegin
+      postId: itemPayIn?.itemId ?? null
+    })
   return {
     payInType,
     userId,
     piconeros: 0n,
-    moneroUri,
-    moneroSubaddressMajor: sub.major,
-    moneroSubaddressMinor: sub.minor,
+    moneroUri: leg.moneroUri,
+    moneroPaymentId: leg.paymentId,
     ...(itemPayIn ? { itemPayIn } : {}),
+    beneficiaries
+  }
+}
+
+// Upload-fee-only prospect (bios, owner-free items, in-quota items): the
+// >10MB upload fee is platform revenue, so it always takes a platform leg.
+async function uploadFeeLeg (models, { me, uploadFeesPiconeros, beneficiaries }) {
+  const leg = await createPlatformFeeLeg(models, lwsClient, {
+    me,
+    feeType: 'POSTING',
+    amountPiconeros: uploadFeesPiconeros,
+    description: 'StasherNews upload fee'
+  })
+  return {
+    payInType: 'ITEM_CREATE',
+    userId: me.id,
+    piconeros: 0n,
+    moneroUri: leg.moneroUri,
+    moneroPaymentId: leg.paymentId,
     beneficiaries
   }
 }
@@ -117,20 +130,7 @@ export async function getInitial (models, args, { me }) {
   // still apply, exactly like posts/comments.
   if (args.bio) {
     if (uploadFeesPiconeros > 0n) {
-      const sub = await reserveFeeSubaddress(models, 'POSTING', { me })
-      const moneroUri = buildMoneroUri(
-        [{ address: sub.address, amount: uploadFeesPiconeros }],
-        { description: 'StasherNews upload fee' }
-      )
-      return {
-        payInType: 'ITEM_CREATE',
-        userId: me.id,
-        piconeros: 0n,
-        moneroUri,
-        moneroSubaddressMajor: sub.major,
-        moneroSubaddressMinor: sub.minor,
-        beneficiaries
-      }
+      return await uploadFeeLeg(models, { me, uploadFeesPiconeros, beneficiaries })
     }
     return { payInType: 'ITEM_CREATE', userId: me.id, piconeros: 0n }
   }
@@ -156,20 +156,7 @@ export async function getInitial (models, args, { me }) {
 
   if (feeMultiplier === 0n) {
     if (uploadFeesPiconeros > 0n) {
-      const sub = await reserveFeeSubaddress(models, 'POSTING', { me })
-      const moneroUri = buildMoneroUri(
-        [{ address: sub.address, amount: uploadFeesPiconeros }],
-        { description: 'StasherNews upload fee' }
-      )
-      return {
-        payInType: 'ITEM_CREATE',
-        userId: me.id,
-        piconeros: 0n,
-        moneroUri,
-        moneroSubaddressMajor: sub.major,
-        moneroSubaddressMinor: sub.minor,
-        beneficiaries
-      }
+      return await uploadFeeLeg(models, { me, uploadFeesPiconeros, beneficiaries })
     }
     return { payInType: 'ITEM_CREATE', userId: me.id, piconeros: 0n }
   }
@@ -195,7 +182,7 @@ export async function getInitial (models, args, { me }) {
       const nonOwned = feeSubs.filter(s => Number(s.userId) !== Number(USER_ID.anon))
       const base = commentFloorPiconerosForSubs(config, nonOwned) * BigInt(ANON_COMMENT_FEE_MULTIPLIER)
       const premium = (commentFeePiconerosForSubs(config, nonOwned) - commentFloorPiconerosForSubs(config, nonOwned)) * BigInt(ANON_COMMENT_FEE_MULTIPLIER)
-      return await feeLegOrSubaddress(models, {
+      return await itemFeeLeg(models, {
         subs: feeSubs,
         userId: me.id,
         fee: base,
@@ -211,20 +198,7 @@ export async function getInitial (models, args, { me }) {
     const commentsLeft = (await commentQuotaFor(models, commenter)).left
     if (commentsLeft > 0) {
       if (uploadFeesPiconeros > 0n) {
-        const sub = await reserveFeeSubaddress(models, 'POSTING', { me })
-        const moneroUri = buildMoneroUri(
-          [{ address: sub.address, amount: uploadFeesPiconeros }],
-          { description: 'StasherNews upload fee' }
-        )
-        return {
-          payInType: 'ITEM_CREATE',
-          userId: me.id,
-          piconeros: 0n,
-          moneroUri,
-          moneroSubaddressMajor: sub.major,
-          moneroSubaddressMinor: sub.minor,
-          beneficiaries
-        }
+        return await uploadFeeLeg(models, { me, uploadFeesPiconeros, beneficiaries })
       }
       return { payInType: 'ITEM_CREATE', userId: me.id, piconeros: 0n }
     }
@@ -236,7 +210,7 @@ export async function getInitial (models, args, { me }) {
       userId: me.id,
       basePiconeros: commentFloorPiconerosForSubs(config, nonOwned)
     })
-    return await feeLegOrSubaddress(models, {
+    return await itemFeeLeg(models, {
       subs: feeSubs,
       userId: me.id,
       fee: base,
@@ -262,7 +236,7 @@ export async function getInitial (models, args, { me }) {
     const nonOwned = feeSubs.filter(s => Number(s.userId) !== Number(USER_ID.anon))
     const base = (feeSubs.length === 0 ? postingFeePiconeros(config) : postFloorPiconerosForSubs(config, nonOwned)) * BigInt(ANON_POST_FEE_MULTIPLIER)
     const premium = (postFeePiconerosForSubs(config, nonOwned) - postFloorPiconerosForSubs(config, nonOwned)) * BigInt(ANON_POST_FEE_MULTIPLIER)
-    return await feeLegOrSubaddress(models, {
+    return await itemFeeLeg(models, {
       subs: feeSubs,
       userId: me.id,
       fee: base,
@@ -280,20 +254,7 @@ export async function getInitial (models, args, { me }) {
 
   if (postsLeft > 0) {
     if (uploadFeesPiconeros > 0n) {
-      const sub = await reserveFeeSubaddress(models, 'POSTING', { me })
-      const moneroUri = buildMoneroUri(
-        [{ address: sub.address, amount: uploadFeesPiconeros }],
-        { description: 'StasherNews upload fee' }
-      )
-      return {
-        payInType: 'ITEM_CREATE',
-        userId: me.id,
-        piconeros: 0n,
-        moneroUri,
-        moneroSubaddressMajor: sub.major,
-        moneroSubaddressMinor: sub.minor,
-        beneficiaries
-      }
+      return await uploadFeeLeg(models, { me, uploadFeesPiconeros, beneficiaries })
     }
     return {
       payInType: 'ITEM_CREATE',
@@ -316,7 +277,7 @@ export async function getInitial (models, args, { me }) {
     userId: me.id,
     basePiconeros: feeSubs.length === 0 ? postingFeePiconeros(config) : postFloorPiconerosForSubs(config, nonOwned)
   })
-  return await feeLegOrSubaddress(models, {
+  return await itemFeeLeg(models, {
     subs: feeSubs,
     userId: me.id,
     fee: base,
@@ -363,9 +324,10 @@ export async function onBegin (tx, payInId, args) {
   if (data.text) data.text = canonicalizeItemText(data.text)
   const payIn = await tx.payIn.findUnique({ where: { id: payInId } })
 
-  // StasherNews posting-fee gate: a PayIn that reserved a rewards-wallet fee
-  // subaddress (moneroSubaddressMajor set) or routed owner-direct
-  // (moneroPaymentId set) creates the Item PENDING_FEE (invisible until the fee
+  // StasherNews posting-fee gate: a PayIn carrying a fee invoice — an
+  // integrated-address leg (moneroPaymentId set, platform or owner-direct) or
+  // a legacy rewards-wallet subaddress (moneroSubaddressMajor set) — creates
+  // the Item PENDING_FEE (invisible until the fee
   // is observed on-chain and flipped to FEE_PAID); otherwise the Item is live
   // (FEE_NOT_REQUIRED). feeStatus is derived here from the PayIn's fee markers
   // rather than threaded through the prospect, since feeStatus is an Item
@@ -408,15 +370,15 @@ export async function onBegin (tx, payInId, args) {
         // reserved or spent the unit in between. Throwing rolls back the
         // unpaid payIn/item; a fresh submit re-prices against the held unit.
         //
-        // "Priced upload-fee-only" is recognizable from the stored payIn:
-        // getInitial's in-quota branch routes to a rewards-wallet subaddress
-        // and prices the URI at exactly the upload fees — never owner-direct
-        // (that leg is feeLegOrSubaddress and carries the item fee), never
-        // charged (a charged URI = item fee + upload fees > upload fees).
-        // Charged items, owner-free items, bios, and anons never reach this
-        // throw: charged legs fail the amount equality, the rest never enter
-        // the quota block.
-        if (!feeQuotaEligible && payIn.moneroSubaddressMajor != null && payIn.moneroPaymentId == null) {
+        // "Priced upload-fee-only" is recognizable from the stored payIn's
+        // full quote alone: getInitial's in-quota branch prices the URI at
+        // exactly the upload fees. A charged URI is item fee + upload fees >
+        // upload fees, and an owner-direct leg never carries upload fees
+        // (resolveOwnerFeeRoute refuses them) while its item fee is positive,
+        // so both fail the amount equality — for legacy subaddress and
+        // integrated invoices alike. Owner-free items, bios, and anons never
+        // enter the quota block.
+        if (!feeQuotaEligible) {
           const expected = moneroUriAmountPiconeros(payIn.moneroUri)
           if (expected != null && expected > 0n) {
             const { totalFeesPiconeros } = await uploadFees(uploadIds, { models: tx, me: { id: payIn.userId } })
@@ -514,6 +476,15 @@ export async function onBegin (tx, payInId, args) {
       }
       throw err
     }
+  }
+
+  // Bind the created item to its platform fee intent (retained attribution:
+  // a late receipt on an abandoned invoice still books the right postId).
+  if (payIn.moneroPaymentId != null) {
+    await tx.subFeePidMap.updateMany({
+      where: { paymentId: payIn.moneroPaymentId, feeType: { not: null } },
+      data: { postId: item.id }
+    })
   }
 
   await performBotBehavior(tx, { ...item, userId: payIn.userId })

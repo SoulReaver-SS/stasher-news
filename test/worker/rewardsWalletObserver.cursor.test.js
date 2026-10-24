@@ -245,6 +245,8 @@ describe('other dispatcher branches stay routed through the fresh slice', () => 
       update: jest.fn().mockResolvedValue({})
     }
     models.observedTip = { findFirst: jest.fn().mockResolvedValue(null) }
+    // not an integrated-fee pid: the fee branch must fall through
+    models.subFeePidMap = { findUnique: jest.fn().mockResolvedValue(null) }
     models.$queryRaw.mockResolvedValue([{ id: 1 }])
     const lws = {
       getAddressTxs: jest.fn(async () => ({

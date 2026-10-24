@@ -74,6 +74,51 @@ export const FEE_RESERVE_ATTEMPTS_PER_USER = Number(process.env.FEE_RESERVE_ATTE
 export const FEE_RESERVE_WINDOW_MS = Number(process.env.FEE_RESERVE_WINDOW_MS) || 10 * 60_000
 
 /**
+ * The per-user fee-invoice attempt throttle, shared by every fee issuer: the
+ * legacy subaddress draw above AND integrated fee legs (api/monero/ownerFeeLeg.js),
+ * which register an lws webhook per attempt. One key/limit/window, so moving
+ * a fee type from subaddresses to integrated addresses never widens the budget.
+ * Throws GqlInputError when exhausted; call it before any side effect.
+ */
+export function throttleFeeIssuance ({ me } = {}) {
+  const rl = rateLimit({
+    key: `feereserve:${Number(me?.id) || USER_ID.anon}`,
+    limit: FEE_RESERVE_ATTEMPTS_PER_USER,
+    windowMs: FEE_RESERVE_WINDOW_MS
+  })
+  if (!rl.allowed) throw new GqlInputError('too many fee reservations, try again shortly')
+}
+
+/**
+ * The ONLY issuance-time choice of the platform wallet for integrated fee
+ * invoices (createPlatformFeeLeg is its only caller). Same selection as the
+ * observer's findRewardsAccount — label, active network, view key present,
+ * first registered wins — so the invoice pays the account the observer and
+ * reconciler actually scan; additionally requires ACTIVE status and, when
+ * configured, the PLATFORM_REWARDS_ADDRESS primary (the address downvote
+ * invoices already use). Everything after issuance uses the intent's frozen
+ * recipient, never this lookup. Throws when no account qualifies.
+ */
+export async function resolvePlatformFeeRecipient (models = prisma) {
+  const account = await models.moneroAccount.findFirst({
+    where: {
+      label: 'platform_rewards',
+      network: (process.env.MONERO_NETWORK || 'STAGENET').toUpperCase(),
+      viewKey: { isNot: null }
+    },
+    orderBy: { id: 'asc' }
+  })
+  if (!account || account.status !== 'ACTIVE') {
+    throw new Error('resolvePlatformFeeRecipient: no ACTIVE scannable platform_rewards wallet registered')
+  }
+  const configured = process.env.PLATFORM_REWARDS_ADDRESS
+  if (configured && configured !== account.address) {
+    throw new Error(`resolvePlatformFeeRecipient: registered platform_rewards account ${account.id} does not match PLATFORM_REWARDS_ADDRESS`)
+  }
+  return account
+}
+
+/**
  * Atomically draw + reserve one AVAILABLE fee subaddress for a pending fee event.
  *
  * Uses FOR UPDATE SKIP LOCKED so concurrent draws never double-assign: if two
@@ -85,12 +130,7 @@ export async function reserveFeeSubaddress (models, feeType, { me } = {}) {
   const major = FEE_TYPE_TO_MAJOR[feeType]
   if (!major) throw new Error(`reserveFeeSubaddress: unknown feeType ${feeType}`)
 
-  const rl = rateLimit({
-    key: `feereserve:${Number(me?.id) || USER_ID.anon}`,
-    limit: FEE_RESERVE_ATTEMPTS_PER_USER,
-    windowMs: FEE_RESERVE_WINDOW_MS
-  })
-  if (!rl.allowed) throw new GqlInputError('too many fee reservations, try again shortly')
+  throttleFeeIssuance({ me })
 
   const walletId = await getRewardsWalletId(models)
 

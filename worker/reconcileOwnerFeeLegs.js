@@ -1,14 +1,22 @@
 import { lwsClient } from '@/api/monero/lwsClient'
 import { daemonClient } from '@/api/monero/daemonClient'
-import { applySubFeeReceipt } from '@/api/monero/subFeeObservation'
+import { applyFeeReceipt, excludeProvisionalFeeReceipt } from '@/api/monero/feeObservation'
+import { resolveFeeAccount } from '@/api/monero/ownerFeeLeg'
 import { isSelfSend } from '@/api/monero/selfTip'
 import { decryptViewKey } from '@/api/monero/viewkey'
 import { createReconciliationCheckpoint, scanRawPaymentIds } from '@/worker/reconciliationScan'
 import { getReconciliationRawReader } from '@/worker/reconciliationRawTransactions'
 import { alert } from '@/lib/alert'
 
-// Cron-owned backstop for owner-routed fee legs (the eighth money-observation
-// chain). The lws tx-confirmation webhook is primary; this chain self-heals:
+// Cron-owned backstop for integrated-address fee legs (the eighth
+// money-observation chain). Historically owner-routed only — hence the file
+// and pg-boss job name `reconcileOwnerFeeLegs`, kept for persisted
+// schedule/queue compatibility — it now also covers PLATFORM fee legs
+// (posting/turf/boost invoices paying the rewards wallet primary). Legs are
+// grouped by their FROZEN recipient account (SubFeePidMap.recipientAccountId;
+// historical owner legs fall back to the owner's ACTIVE account) and the
+// shared applier (api/monero/feeObservation.js) picks the ledger. The lws
+// tx-confirmation webhook is primary; this chain self-heals:
 //   - a missed 0-conf callback (deploy restart across the confirmation
 //     window): re-observes receipts via lws and re-runs the cumulative gate,
 //     flipping PENDING_FEE items before abandonFeeItems strikes at 1 day;
@@ -41,29 +49,27 @@ import { alert } from '@/lib/alert'
 // idempotent applier call, issued-pid binding, exact self-send refusal
 // (foreign-index spent_outputs stay legitimate). Returns the applier result,
 // or null when the self-send ban refused the receipt.
-async function replayOwnerReceipt ({ models, account, leg, tx }) {
-  const paymentId = leg.paymentId
+async function replayFeeReceipt ({ models, account, leg, tx }) {
+  const paymentId = leg.feeMap.paymentId
   // Self-payments can inflate receipts with change (2026-09-19). Use the
   // shared closure gate, not candidate presence: lws includes decoy references.
   // Match cleanup by ISSUED pid + hash; raw-discovery rows can have scrambled
   // served PIDs. Only provisional receipts are excluded, as in the webhook.
   if (isSelfSend(account, tx)) {
-    const excluded = await models.$executeRaw`
-      UPDATE "ObservedSubFee" SET state = 'EXCLUDED'::"ObservedState"
-      WHERE "tx_hash" = ${tx.hash} AND "payment_id" = ${paymentId} AND height IS NULL`
+    const excluded = await excludeProvisionalFeeReceipt(models, leg.feeMap, tx.hash)
     if (excluded > 0) {
-      alert('warn', 'owner-fee self-payment refused',
+      alert('warn', leg.feeMap.feeType != null ? 'platform fee self-payment refused' : 'owner-fee self-payment refused',
         `fee leg ${paymentId} tx ${tx.hash}: payer shares the owner account (change-inflated); provisional receipt excluded by the backstop`,
         { dedupeKey: `subfee-selfpay-${paymentId}-${tx.hash}` })
     }
     return null
   }
   // Replay through the shared applier — idempotent by construction (one
-  // ObservedSubFee row per (txHash, paymentId), ON CONFLICT DO NOTHING),
-  // so an hourly rescan of an already-replayed receipt is a no-op.
-  return await applySubFeeReceipt(models, {
+  // receipt row per tx, ON CONFLICT DO NOTHING), so an hourly rescan of an
+  // already-replayed receipt only re-runs the cumulative gate.
+  return await applyFeeReceipt(models, {
+    feeMap: leg.feeMap,
     feePayIn: leg.feePayIn,
-    paymentId,
     txHash: tx.hash,
     piconeros: tx.piconeros,
     height: tx.height ?? null,
@@ -117,16 +123,21 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
   // Injected reader wins; otherwise the shared per-daemon reader; with neither
   // the raw pass keeps its legacy no-op (existing core callers/tests).
   const reader = rawReader ?? (daemon ? getReconciliationRawReader(daemon) : null)
-  // Active legs = map rows still holding an lws webhook (unexpired) whose
-  // PayIn still exists. NO payInState filter: fee payIns are created PAID by
-  // design (piconeros=0 — the fee-gated Item/Sub lives on Item.feeStatus, not
-  // the PayIn; see api/payIn/types/itemCreate.js getInitial). The earlier
+  // Active legs = intents inside their webhook-retention window. NO
+  // payInState filter: fee payIns are created PAID by design (piconeros=0 —
+  // the fee-gated Item/Sub lives on Item.feeStatus, not the PayIn; see
+  // api/payIn/types/itemCreate.js getInitial). The earlier
   // `payInState: 'PENDING_PAYMENT'` filter could never match, so this backstop
   // never scanned a single leg (2026-09-19 fix). Re-scanning settled legs is
-  // harmless: applySubFeeReceipt's insert/CAS are idempotent and
-  // flipPendingToLive is guarded by WHERE feeStatus = 'PENDING_FEE'.
+  // harmless: the applier's insert/CAS are idempotent and flipPendingToLive is
+  // guarded by WHERE feeStatus = 'PENDING_FEE'. Owner legs still need their
+  // PayIn (legacy semantics; the webhook records abandoned owner receipts);
+  // platform legs stay eligible without one so an abandoned invoice's
+  // receipt is still booked as rewards-wallet cash (payInId NULL, no gate).
+  // Past retention, served-pid platform receipts are still booked by
+  // rewardsWalletObserver; only raw wrong-pid recovery is window-bound.
   const maps = await models.subFeePidMap.findMany({
-    where: { webhookEventId: { not: null }, expiresAt: { gt: new Date() } }
+    where: { expiresAt: { gt: new Date() } }
   })
   if (maps.length === 0) return { legs: 0, replayed: 0, flipped: 0, pidFallback: 0 }
 
@@ -134,41 +145,49 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
     where: { moneroPaymentId: { in: maps.map(m => m.paymentId) } }
   })
   const byPid = new Map(payIns.map(p => [p.moneroPaymentId, p]))
-  const legs = maps.filter(m => byPid.has(m.paymentId))
+  const legs = maps.filter(m => m.feeType != null || byPid.has(m.paymentId))
   if (legs.length === 0) return { legs: 0, replayed: 0, flipped: 0, pidFallback: 0 }
 
-  // Group by owner account; one full-history scan per owner per run (owner
-  // accounts are low-history; the tip webhook cursor optimization does not
-  // apply here — this is an hourly backstop over few legs).
-  const byOwner = new Map()
+  // Group by recipient account; one full-history scan per account per run.
+  const byAccount = new Map()
   for (const leg of legs) {
-    if (!byOwner.has(leg.ownerUserId)) byOwner.set(leg.ownerUserId, [])
-    byOwner.get(leg.ownerUserId).push(leg)
+    const key = leg.recipientAddress != null ? `account ${leg.recipientAccountId}` : `owner ${leg.ownerUserId}`
+    if (!byAccount.has(key)) byAccount.set(key, [])
+    byAccount.get(key).push(leg)
   }
 
   let replayed = 0
   let pidFallback = 0
-  for (const [ownerUserId, ownerLegs] of byOwner) {
+  for (const [accountKey, accountLegs] of byAccount) {
     const pause = checkpoint()
     if (pause) await pause
-    const account = await models.moneroAccount.findFirst({
-      where: { ownerUserId, status: 'ACTIVE' },
-      include: { viewKey: true, subaddresses: true }
-    })
-    if (!account?.viewKey) continue // unscanable: webhook remains primary
+    const platform = accountLegs.some(leg => leg.feeType != null)
+    // Frozen recipient (snapshot-checked) for new legs; the legacy owner
+    // fallback for historical ones. Every leg in a group shares the account.
+    const account = await resolveFeeAccount(models, accountLegs[0])
+    if (!account?.viewKey || (platform && account.status !== 'ACTIVE')) {
+      // Owner legs: unscannable, webhook remains primary (legacy). Platform
+      // legs fail loudly — their cash and gates depend on this account.
+      if (platform) {
+        alert('critical', 'platform fee reconciliation unavailable',
+          `${accountKey}: not scannable or no longer matches its intent snapshot; ${accountLegs.length} leg(s) deferred`,
+          { dedupeKey: `platform-fee-reconcile-unscannable-${accountLegs[0].recipientAccountId}` })
+      }
+      continue
+    }
     let txs
     try {
       txs = (await monero.getAddressTxs(account, 0, null)).transactions || []
     } catch (err) {
-      console.warn(`reconcileOwnerFeeLegs: lws scan failed for owner ${ownerUserId}: ${err?.message || err}`)
+      console.warn(`reconcileOwnerFeeLegs: lws scan failed for ${accountKey}: ${err?.message || err}`)
       continue
     }
 
     // Owner-local lookup keyed by NORMALIZED served pid; the value retains the
     // ISSUED pid (the applier/cryptography key) and the exact PayIn row.
-    const legByPid = new Map(ownerLegs.map(leg => [String(leg.paymentId).toLowerCase(), {
-      paymentId: leg.paymentId,
-      feePayIn: byPid.get(leg.paymentId)
+    const legByPid = new Map(accountLegs.map(leg => [String(leg.paymentId).toLowerCase(), {
+      feeMap: leg,
+      feePayIn: byPid.get(leg.paymentId) ?? null
     }]))
 
     // Dedup by lowercase hash (lws can repeat rows across scan passes) and
@@ -177,6 +196,10 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
     const rowsByHash = new Map()
     for (const row of txs) {
       if (!row.hash) continue
+      // An integrated address always pays the PRIMARY (0,0): on the rewards
+      // wallet every subaddress-pool row is out of scope (and would only feed
+      // the raw pass needless decryption work).
+      if (platform && ((row.recipient?.maj_i ?? 0) !== 0 || (row.recipient?.min_i ?? 0) !== 0)) continue
       const hash = String(row.hash).toLowerCase()
       if (!rowsByHash.has(hash)) rowsByHash.set(hash, { ...row, hash })
     }
@@ -191,7 +214,7 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
         rawRows.set(hash, tx)
         continue
       }
-      const result = await replayOwnerReceipt({ models, account, leg, tx })
+      const result = await replayFeeReceipt({ models, account, leg, tx })
       if (result) replayed += 1
     }
 
@@ -208,7 +231,7 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
         // Fixed-category diagnostics only: transport/crypto error text can
         // embed sensitive input (key material, raw payloads), so neither this
         // log nor the alert below may echo exception content.
-        console.warn(`reconcileOwnerFeeLegs: raw-decrypt fallback failed for owner ${ownerUserId} (${rawRows.size} candidate(s)); next hourly run retries`)
+        console.warn(`reconcileOwnerFeeLegs: raw-decrypt fallback failed for ${accountKey} (${rawRows.size} candidate(s)); next hourly run retries`)
         alert('warn', 'owner-fee raw-decrypt fallback failed',
           `account ${account.id}: raw acquisition or view-key decryption failed for ${rawRows.size} candidate(s); next hourly run retries`,
           { dedupeKey: `subfee-pid-fallback-error-${account.id}` })
@@ -216,7 +239,7 @@ export async function runReconcileOwnerFeeLegsOnce ({ models, monero = lwsClient
     }
     let ownerRecovered = 0
     for (const { tx, leg } of rawMatches) {
-      const result = await replayOwnerReceipt({ models, account, leg, tx })
+      const result = await replayFeeReceipt({ models, account, leg, tx })
       if (result) replayed += 1
       // Only a NEW height transition is a recovery: provisional inserts,
       // replays, EXCLUDED rows, and already-matured receipts do not re-alert.

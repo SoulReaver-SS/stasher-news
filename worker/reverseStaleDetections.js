@@ -120,7 +120,10 @@ export async function runReverseStaleDetectionsOnce ({
         WHERE id = ${fee.id} AND state = 'DETECTED' AND height IS NULL`
       if (n === 0) return
       out.fees += 1
-      if (fee.payInId == null) return
+      // Integrated (PID-bound) receipts open gates and bump boosts only at the
+      // verified height transition, so a stale height-NULL one applied
+      // nothing: the ledger flip is the whole reversal.
+      if (fee.payInId == null || fee.paymentId != null) return
       const confirmed = await tx.feeObservation.count({ where: { payInId: fee.payInId, state: 'CONFIRMED' } })
       if (confirmed > 0) return // partially-confirmed funding is real — leave the item live
       // Platform-routed boost (fee-pool subaddress receipt): give back the boost

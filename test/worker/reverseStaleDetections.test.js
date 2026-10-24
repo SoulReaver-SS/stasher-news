@@ -276,6 +276,18 @@ test('a stale POSTING fee never touches boost weight (undefined feeType stays on
   expect(reverseBoostDetected).not.toHaveBeenCalled()
 })
 
+// Integrated (PID-bound) receipts bump boosts and open gates only at the
+// verified height transition, so a stale height-NULL one applied nothing:
+// it goes REORGED with no boost/territory/item side effect.
+test.each(['BOOST', 'TERRITORY_BILLING', 'POSTING'])('a stale integrated %s receipt is ledger-only on reversal', async feeType => {
+  const { models, subUpdateMany } = feeModels({ fee: feeRow({ feeType, paymentId: 'a1b2c3d4e5f60718' }), payIn: { id: 10, payInType: feeType === 'POSTING' ? 'ITEM_CREATE' : feeType } })
+  const out = await runReverseStaleDetectionsOnce({ models, monero: {}, reverse: async () => {} })
+  expect(out.fees).toBe(1)
+  expect(reverseBoostDetected).not.toHaveBeenCalled()
+  expect(subUpdateMany).not.toHaveBeenCalled()
+  expect(out.itemsAbandoned).toBe(0)
+})
+
 test('a lost BOOST fee claim reverses no boost weight', async () => {
   const { models } = feeModels({
     fee: feeRow({ feeType: 'BOOST' }),

@@ -11,9 +11,16 @@ import { getInitial as getUpdateInitial } from '@/api/payIn/types/territoryUpdat
 import { getInitial as getUnarchiveInitial } from '@/api/payIn/types/territoryUnarchive'
 import { getInitial as getCreateInitial } from '@/api/payIn/types/territoryCreate'
 
+// Fee legs register an lws webhook at issuance; never reach the real lws.
+jest.mock('../../api/monero/lwsClient', () => ({
+  __esModule: true, lwsClient: { addWebhook: jest.fn(async () => ({ event_id: 'test-fee-hook' })) }
+}))
+
 // The cap must reject BEFORE any draw; a call here is a bug.
 jest.mock('../../api/monero/feePool', () => ({
   __esModule: true,
+  throttleFeeIssuance: jest.fn(),
+  resolvePlatformFeeRecipient: jest.fn(models => require('../../test/helpers/platformFeeRecipient').testPlatformFeeRecipient(models)),
   reserveFeeSubaddress: jest.fn(async () => {
     throw new Error('reserveFeeSubaddress must not be called for oversized uploads')
   })

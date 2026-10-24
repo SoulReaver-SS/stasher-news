@@ -14,7 +14,7 @@ import { subsDiff } from '@/lib/subs'
 import { moneroWallEnabled } from '@/lib/monero-wall'
 import { getTempImgproxyUrls } from '../lib/upload'
 import { postFloorPiconerosForSubs, postFeePiconerosForSubs } from '@/api/monero/turfFeeRouting'
-import { feeLegOrSubaddress } from './itemCreate'
+import { itemFeeLeg } from './itemCreate'
 import { serializePayInArgs, deserializePayInArgs } from '../lib/payInArgs'
 
 export const anonable = true
@@ -46,7 +46,7 @@ export async function getInitial (models, { id, uploadIds = [], bio, subNames },
   // R10 + repost decision (2026-09-26): charge for turfs ADDED by this edit
   // exactly the BASE platform floor per added non-owned turf, with the owner
   // premium riding the owner-direct leg when the added set resolves to one
-  // walleted owner and no upload fees are folded in (feeLegOrSubaddress owns
+  // walleted owner and no upload fees are folded in (itemFeeLeg owns
   // that decision). Reposts are EXEMPT from the anti-spam escalation: the
   // post already paid it at creation, and item_spam would count the post
   // being reposted itself (>= 1.5x the picker's quote in the common fresh
@@ -82,7 +82,7 @@ export async function getInitial (models, { id, uploadIds = [], bio, subNames },
   }
 
   if (turfFeePiconeros + turfPremiumPiconeros > 0n || uploadFeesPiconeros > 0n) {
-    return await feeLegOrSubaddress(models, {
+    return await itemFeeLeg(models, {
       subs: addedSubs,
       userId: me.id,
       fee: turfFeePiconeros,
@@ -110,9 +110,10 @@ export async function getInitial (models, { id, uploadIds = [], bio, subNames },
 export async function onBegin (tx, payInId, args) {
   const payIn = await tx.payIn.findUnique({ where: { id: payInId } })
 
-  // StasherNews: a fee-bearing edit (getInitial reserved a POSTING fee
-  // subaddress for upload fees and/or added-turf fees, OR routed owner-direct
-  // for a single added turf's fee+premium) is NOT applied here.
+  // StasherNews: a fee-bearing edit (getInitial issued a platform POSTING fee
+  // leg for upload fees and/or added-turf fees, OR routed owner-direct for a
+  // single added turf's fee+premium; legacy edits carry a fee subaddress) is
+  // NOT applied here.
   // The edit is stored and rewardsWalletObserver.flipPendingToLive applies it
   // once the covering fee is observed on the rewards wallet — applying at
   // creation let a user attach >10MB media for free by dismissing the fee QR

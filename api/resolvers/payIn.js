@@ -1,6 +1,7 @@
 import { USER_ID, PAY_IN_NOTIFICATION_TYPES, WALLET_MAX_RETRIES, WALLET_RETRY_BEFORE_MS } from '@/lib/constants'
 import { GqlAuthenticationError } from '@/lib/error'
 import { moneroUriAmountPiconeros } from '@/lib/format'
+import { feeReceivedPiconerosForPayIn } from '@/api/monero/postingFee'
 import { retry } from '../payIn'
 import { payInTypesSql } from '../payIn/lib/sql'
 import { decodeCursor, LIMIT, nextCursorEncoded } from '@/lib/cursor'
@@ -229,12 +230,20 @@ export default {
     // are born PAID, so the client's fee modals poll observation state; modals
     // whose gated record settles only at FULL coverage (Upload.paid) must poll
     // this instead of feeObserved, which flips on any partial payment. The sums
-    // intentionally mirror the observer's settle gates exactly (no state filter
-    // — rewardsWalletObserver.attributeFeeBySubaddress and
-    // subFeeObservation.applySubFeeReceipt both sum every observation row).
+    // mirror the settle gates: integrated (payment-id) invoices count only
+    // verified receipts (api/monero/feeObservation.js); legacy subaddress
+    // invoices keep their unfiltered sum (rewardsWalletObserver
+    // attributeFeeBySubaddress).
     feeCovered: async (payIn, args, { models }) => {
       if (typeof payIn.feeCovered !== 'undefined') return payIn.feeCovered
       const expected = payIn.moneroUri ? moneroUriAmountPiconeros(payIn.moneroUri) : null
+      // Integrated (payment-id) invoices: coverage means exactly what their
+      // gate counts — height-bearing, live-state receipts — so provisional
+      // money never reads as settled.
+      if (payIn.moneroPaymentId != null) {
+        if (expected == null || expected <= 0n) return false
+        return (await feeReceivedPiconerosForPayIn(models, payIn.id, { verifiedOnly: true })) >= expected
+      }
       // no parseable URI = a legacy/ungated fee: any observation covers it
       if (expected === null) return await isFeeObserved(payIn, { models })
       const [fees, subFees] = await Promise.all([
@@ -366,14 +375,14 @@ export default {
 
 // The "payment succeeded" observation predicate shared by feeObserved and the
 // URI-less fallback of feeCovered: a FeeObservation in a success state, or an
-// owner-routed ObservedSubFee receipt (born DETECTED and only matured, so any
-// receipt row means coins landed).
+// owner-routed ObservedSubFee receipt in a live state (a refused EXCLUDED or
+// reversed REORGED receipt never signals payment).
 async function isFeeObserved (payIn, { models }) {
   const obs = await models.feeObservation.findFirst({
     where: { payInId: payIn.id, state: { in: ['DETECTED', 'CONFIRMED'] } }
   })
   if (obs) return true
-  const subFee = await models.observedSubFee.findFirst({ where: { payInId: payIn.id } })
+  const subFee = await models.observedSubFee.findFirst({ where: { payInId: payIn.id, state: { in: ['DETECTED', 'CONFIRMED'] } } })
   return !!subFee
 }
 

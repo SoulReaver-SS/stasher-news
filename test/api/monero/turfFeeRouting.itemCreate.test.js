@@ -27,11 +27,13 @@ jest.mock('../../../api/resolvers/item', () => ({ __esModule: true, getItem: jes
 // payInItemCreate.test.js instead of a placeholder string.
 jest.mock('../../../api/monero/feePool', () => ({
   __esModule: true,
-  reserveFeeSubaddress: jest.fn(async () => ({
-    id: 1,
-    major: 1,
-    minor: 1,
-    address: '5AWPhvfMuvWeePRNT192gwa9m63XHdzBmMxfizUhBJedJSqA1Y1BViTETV6uxyCS8Zf8Tz2KKEhHC8FjSRvuDgsd2JuAX6J'
+  reserveFeeSubaddress: jest.fn(),
+  throttleFeeIssuance: jest.fn(),
+  // the platform recipient (test-only address, distinct from the owner's)
+  resolvePlatformFeeRecipient: jest.fn(async () => ({
+    id: 91,
+    status: 'ACTIVE',
+    address: '53fNxyrnpzq9b7oZQt3SHsGJgyLLXEJGDP2G979eNKNdVjqJPC8xg6hcTNGgFKocCVj1EmSNAyrBf6uHjeeDNhPb9YHQX88'
   }))
 }))
 // lwsClient stub so createOwnerFeeLeg registers no real webhook.
@@ -95,6 +97,15 @@ function models ({ subOwnerHasWallet = true, premium = {}, parentSubs = null, ho
   }
 }
 
+// The fee took the PLATFORM leg: an integrated POSTING invoice frozen to the
+// rewards recipient — no subaddress draw, no owner attribution.
+function expectPlatformLeg (r, m) {
+  expect(r.moneroPaymentId).toMatch(/^[0-9a-f]{16}$/)
+  expect(r.moneroSubaddressMajor).toBeUndefined()
+  expect(reserveFeeSubaddress).not.toHaveBeenCalled()
+  expect(m.mapCreated[0]).toMatchObject({ feeType: 'POSTING', recipientAccountId: 91, ownerUserId: null, subName: null })
+}
+
 const subArgs = { subNames: ['turf'], parentId: null }
 const lowRepMe = { id: 7 } // never the owner (42) of any mocked turf
 
@@ -117,19 +128,16 @@ describe('ITEM_CREATE getInitial routing', () => {
     expect(m.mapCreated[0]).toMatchObject({ subName: 'turf', ownerUserId: 42, amountPiconeros: 1_500_000_000n })
   })
 
-  it('falls back to the platform subaddress when the owner has no wallet', async () => {
+  it('falls back to the platform leg when the owner has no wallet', async () => {
     const m = models({ subOwnerHasWallet: false })
     const r = await getInitial(m, { ...subArgs, title: 'x' }, { me: lowRepMe })
-    expect(r.moneroPaymentId).toBeUndefined()
-    expect(reserveFeeSubaddress).toHaveBeenCalled()
+    expectPlatformLeg(r, m)
   })
 
-  it('wallet-less owner falls back to the rewards-wallet subaddress charging FLOOR ONLY (no premium)', async () => {
+  it('wallet-less owner falls back to the rewards-wallet leg charging FLOOR ONLY (no premium)', async () => {
     const m = models({ subOwnerHasWallet: false, premium: { post: 2_000_000_000n } })
     const r = await getInitial(m, { ...subArgs, title: 'x' }, { me: lowRepMe })
-    expect(r.moneroPaymentId).toBeUndefined()
-    expect(r.moneroSubaddressMajor).toBeDefined()
-    expect(reserveFeeSubaddress).toHaveBeenCalled()
+    expectPlatformLeg(r, m)
     // uri quotes floor only — the 0.002 premium is NOT charged when it would
     // land in the platform wallet
     expect(r.moneroUri).toContain('tx_amount=0.001')
@@ -142,8 +150,7 @@ describe('ITEM_CREATE getInitial routing', () => {
     // 'turf' the configured premium and 'other' none — neither premium may be
     // charged on the platform fallback leg
     const r = await getInitial(m, { subNames: ['turf', 'other'], title: 'x' }, { me: lowRepMe })
-    expect(r.moneroPaymentId).toBeUndefined()
-    expect(reserveFeeSubaddress).toHaveBeenCalled()
+    expectPlatformLeg(r, m)
     // 2 floors, no premium — premiums never route to the platform wallet
     expect(r.moneroUri).toContain('tx_amount=0.002')
     expect(r.moneroUri).not.toContain('0.0025')
@@ -153,8 +160,7 @@ describe('ITEM_CREATE getInitial routing', () => {
     delete process.env.TURF_OWNER_FEES
     const m = models()
     const r = await getInitial(m, { ...subArgs, title: 'x' }, { me: lowRepMe })
-    expect(r.moneroPaymentId).toBeUndefined()
-    expect(reserveFeeSubaddress).toHaveBeenCalled()
+    expectPlatformLeg(r, m)
   })
 
   it('comments route owner-direct with floor + comment premium', async () => {
@@ -170,7 +176,7 @@ describe('ITEM_CREATE getInitial routing', () => {
     expect(moneroUriAmountPiconeros(r.moneroUri)).toBe(800_000_000n)
   })
 
-  it('comments fall back to the platform subaddress charging FLOOR ONLY (no premium)', async () => {
+  it('comments fall back to the platform leg charging FLOOR ONLY (no premium)', async () => {
     const m = models({
       subOwnerHasWallet: false,
       premium: { comment: 200_000_000n },
@@ -178,8 +184,7 @@ describe('ITEM_CREATE getInitial routing', () => {
     })
     m.user = { findUnique: async () => ({ id: 7, freeCommentCount: 99, freeCommentResetAt: new Date(Date.now() + 86_400_000), stackedPiconeros: 0n, createdAt: new Date() }) }
     const r = await getInitial(m, { parentId: '123', subNames: null }, { me: lowRepMe })
-    expect(r.moneroPaymentId).toBeUndefined()
-    expect(reserveFeeSubaddress).toHaveBeenCalled()
+    expectPlatformLeg(r, m)
     expect(moneroUriAmountPiconeros(r.moneroUri)).toBe(600_000_000n)
     expect(r.moneroUri).not.toContain('0.0008')
   })
@@ -209,8 +214,7 @@ describe('ITEM_CREATE getInitial — comment routing on the home turf', () => {
       commenter: spentCommenter
     })
     const r = await getInitial(m, { parentId: '5' }, { me: lowRepMe })
-    expect(r.moneroPaymentId).toBeUndefined()
-    expect(r.moneroSubaddressMajor).toBe(1) // rewards-wallet subaddress stub
+    expectPlatformLeg(r, m)
     expect(r.moneroUri).toContain('tx_amount=0.0006') // flat floor, NO premium
   })
 })

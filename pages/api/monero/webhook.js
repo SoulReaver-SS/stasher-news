@@ -10,7 +10,8 @@ import { isUniqueViolation } from '@/lib/error'
 import { driveBountyFunding, recordBountyReceipt, bountyExpectedPiconeros } from '@/api/monero/bountyFunding'
 import { applyDownvoteTransition } from '@/api/monero/downvote'
 import { shouldExcludeTip, resolveItemSubName, lookupTipTx, recheckDetectedTip, isSelfSend } from '@/api/monero/selfTip'
-import { applySubFeeReceipt } from '@/api/monero/subFeeObservation'
+import { applyFeeReceipt, excludeProvisionalFeeReceipt } from '@/api/monero/feeObservation'
+import { resolveFeeAccount } from '@/api/monero/ownerFeeLeg'
 import { parsePiconeros, verifyReceiptAmount, ReceiptLookupError } from '@/api/monero/receiptVerification'
 import { moneroUriAmountPiconeros } from '@/lib/format'
 import { maybeGrantVerifiedBadge } from '@/api/verifiedBadge'
@@ -721,54 +722,60 @@ export async function handleWebhook (req, res, models = prisma, monero = lwsClie
     return res.status(200).end()
   }
 
-  // Turf-owner fee branch ("fee:" namespace): owner-routed posting/comment
-  // fees and boosts pay the OWNER's wallet at an integrated address whose
-  // embedded pid is stored on the PayIn (unique reverse map). Receipt insert,
-  // boost bump, cumulative amount gate, and N-conf maturity live in the
-  // shared applier (api/monero/subFeeObservation.js) — idempotent by
-  // construction (one receipt row per tx via @@unique(txHash, paymentId) +
-  // ON CONFLICT DO NOTHING). Unknown pids: 200 no-op (lws retry hygiene).
-  const feePayIn = await models.payIn.findUnique({ where: { moneroPaymentId: paymentId } })
-  // Owner attribution for both fee paths below: the pid map is created for
-  // every owner-routed leg (api/monero/ownerFeeLeg.js), so its ownerUserId is
-  // the only way to resolve the account whose view key can verify the receipt.
-  // Fetched once here and shared — no duplicate lookup in the abandoned path.
+  // Integrated fee branch ("fee:" namespace): owner-routed fees pay the
+  // OWNER's wallet and platform posting/turf/boost fees pay the rewards
+  // wallet PRIMARY, both at an integrated address whose pid is the
+  // SubFeePidMap intent (and, while it exists, the PayIn's unique
+  // moneroPaymentId). One branch for both destinations: verification uses the
+  // intent's FROZEN recipient (api/monero/ownerFeeLeg.js resolveFeeAccount),
+  // and the shared applier (api/monero/feeObservation.js) picks the ledger and
+  // owns the insert/CAS/boost/cumulative gate/maturity — idempotent by
+  // construction. A PayIn-less intent is an abandoned leg: the receipt is
+  // still recorded (ledger visibility, payInId NULL, no gate) and operators
+  // are paged. Unknown pids fall through to the downvote dispatch (200 no-op).
   const feeMapRow = await models.subFeePidMap.findUnique({ where: { paymentId } })
-  if (feePayIn) {
+  const feePayIn = await models.payIn.findUnique({ where: { moneroPaymentId: paymentId } })
+  if (feeMapRow || feePayIn) {
     const piconeros = parseOrReject()
     if (piconeros == null) return
+    const platform = feeMapRow?.feeType != null
+    const feeAccount = await resolveFeeAccount(models, feeMapRow)
+    const context = feePayIn ? `fee ${feePayIn.id}` : `abandoned fee ${paymentId}`
+    // Platform receipts fund rewards and unlock content, so they never take
+    // the documented legacy owner fail-open: an unscannable (or no longer
+    // snapshot-matching) recipient defers with 503 so lws retries, and the
+    // hourly reconciler recovers once it is scannable again.
+    if (platform && (!feeAccount?.viewKey || feeAccount.status !== 'ACTIVE')) {
+      alert('critical', 'platform fee verification unavailable',
+        `fee intent ${feeMapRow.id}: registered recipient account ${feeMapRow.recipientAccountId} is not scannable or no longer matches its snapshot`,
+        { dedupeKey: `platform-fee-unscannable-${feeMapRow.id}` })
+      return res.status(503).end()
+    }
     // Chain verification before the receipt insert (C6): bind the callback
-    // amount/txHash to the verified tx on the OWNER's account — a token-holding
-    // replay with a fabricated amount must never seed a receipt nor open the
-    // cumulative live-flip gate. No map row / no ACTIVE account -> unscannable
-    // -> skip (fail-open), same posture as C4/C5. Detection accepts the daemon
+    // amount/txHash to the verified tx on the RECIPIENT's account — a
+    // token-holding replay with a fabricated amount must never seed a receipt
+    // nor open the cumulative live-flip gate. Detection accepts the daemon
     // level (provisional receipt); the applier's flip/maturity gates are the
-    // credit side.
-    const ownerAccount = feeMapRow
-      ? await models.moneroAccount.findFirst({
-        where: { ownerUserId: feeMapRow.ownerUserId, status: 'ACTIVE' },
-        include: { viewKey: true, subaddresses: true }
-      })
-      : null
+    // credit side. Historical owner legs with no ACTIVE account keep the
+    // documented fail-open (skipped) edge.
     const verdict = await verifyOrReject({
-      account: ownerAccount,
+      account: feeAccount,
       paymentId,
       piconeros,
       txHash,
-      context: `fee ${feePayIn.id}`,
+      context,
       daemon,
       allowProvisional: true
     })
     if (!verdict) return
+    if (platform && verdict.skipped) return res.status(503).end()
     // Self-payment change inflated a fee callback in the 2026-09-19 incident.
     // Require the shared closure gate, not ring-candidate presence, before
     // refusing and excluding any provisional receipt seeded at 0-conf.
-    if (verdict.tx && isSelfSend(ownerAccount, verdict.tx)) {
-      await models.$executeRaw`
-        UPDATE "ObservedSubFee" SET state = 'EXCLUDED'::"ObservedState"
-        WHERE "tx_hash" = ${verdict.tx.hash} AND "payment_id" = ${paymentId} AND height IS NULL`
-      alert('warn', 'owner-fee self-payment refused',
-        `fee leg ${paymentId} tx ${verdict.tx.hash}: payer shares the owner account (change-inflated); no receipt credited`,
+    if (verdict.tx && isSelfSend(feeAccount, verdict.tx)) {
+      if (feeMapRow) await excludeProvisionalFeeReceipt(models, feeMapRow, verdict.tx.hash)
+      alert('warn', platform ? 'platform fee self-payment refused' : 'owner-fee self-payment refused',
+        `${context} pid ${paymentId} tx ${verdict.tx.hash}: payer shares the recipient account (change-inflated); no receipt credited`,
         { dedupeKey: `subfee-selfpay-${paymentId}-${String(verdict.tx.hash).toLowerCase()}` })
       return res.status(200).end()
     }
@@ -776,18 +783,19 @@ export async function handleWebhook (req, res, models = prisma, monero = lwsClie
     // lws verdict proves the RingCT amount and carries the mined height, so a
     // daemon verdict (and the attacker-supplied tx_info.block) must not claim a
     // receipt height — the receipt stays display-only until the applier's
-    // atomic CAS sees a chain-verified height. Unscannable owners (skipped)
-    // keep the callback values — the documented fail-open edge.
+    // atomic CAS sees a chain-verified height. Unscannable historical owners
+    // (skipped) keep the callback values — the documented fail-open edge.
     // DAEMON OVER-CLAIM BOUND: a daemon verdict proves the tx but not the
     // RingCT amount, and daemon raw txs carry no spent_outputs, so the
     // self-send ban above cannot fire on this level (mempool-only self-sends
-    // pass through here). A top-up claim can never exceed the quoted fee
+    // pass through here). A gated top-up claim can never exceed the quoted fee
     // (partials accumulate), so an over-claim is refused outright instead of
     // seeding a display-only provisional row that shows phantom progress.
-    if (verdict.level === 'daemon') {
-      const expected = feePayIn.moneroUri ? moneroUriAmountPiconeros(feePayIn.moneroUri) : null
+    // (Boosts have no quote ceiling — overpaying a boost is legitimate.)
+    if (verdict.level === 'daemon' && feeMapRow?.feeType !== 'BOOST') {
+      const expected = feePayIn?.moneroUri ? moneroUriAmountPiconeros(feePayIn.moneroUri) : (feeMapRow?.amountPiconeros ?? null)
       if (expected != null && BigInt(piconeros) > expected) {
-        alert('warn', 'owner-fee over-claim refused',
+        alert('warn', platform ? 'platform fee over-claim refused' : 'owner-fee over-claim refused',
           `fee leg ${paymentId} tx ${txHash}: daemon-verdict claim ${piconeros} exceeds the quoted ${expected} — no receipt seeded`,
           { dedupeKey: `subfee-overclaim-${paymentId}` })
         return res.status(200).end()
@@ -799,74 +807,33 @@ export async function handleWebhook (req, res, models = prisma, monero = lwsClie
     // branch): the callback's `confirmations` is attacker-controlled, so a
     // forged count must never mature the receipt. A scannable account with an
     // unknown tx/height derives 0 (fail closed; the applier's CAS/flip stay
-    // height-gated). Unscannable owners have no chain view (verification
-    // skipped — the documented fail-open edge), so the callback count remains
-    // their maturity source.
+    // height-gated). Unscannable historical owners have no chain view
+    // (verification skipped), so the callback count remains their source.
     const derivedConfirmations = verdict.skipped
       ? confirmations
       : (verdict.chainHeight != null && verifiedHeight != null
           ? verdict.chainHeight - verifiedHeight + 1
           : 0)
-    await applySubFeeReceipt(models, { feePayIn, paymentId, txHash: verifiedHash, piconeros, height: verifiedHeight, confirmations: derivedConfirmations })
-    return res.status(200).end()
-  }
-
-  // Money landed on a fee pid with NO PayIn: the leg was abandoned
-  // (underpaid past the window — abandonFeeItems deleted the PayIn) but the
-  // SubFeePidMap row persists for attribution. Record the receipt (ledger
-  // visibility; the owner keeps the XMR) and page operators for manual
-  // reconciliation — bounty-branch parity (see the EXPIRED bounty case
-  // above). No map row: fall through to the downvote dispatch below, so
-  // unknown pids keep their 200 no-op (lws retry hygiene).
-  if (feeMapRow) {
-    const piconeros = parseOrReject()
-    if (piconeros == null) return
-    // Chain verification before the abandoned-leg receipt (C6): even a
-    // ledger-visibility row must carry a chain-verified amount, or a replayed
-    // callback could fabricate balances for manual reconciliation. Same owner
-    // account as the live-fee path, same fail-open skip for unscannable owners;
-    // detection accepts the daemon level (provisional receipt).
-    const ownerAccount = await models.moneroAccount.findFirst({
-      where: { ownerUserId: feeMapRow.ownerUserId, status: 'ACTIVE' },
-      include: { viewKey: true, subaddresses: true }
-    })
-    const verdict = await verifyOrReject({
-      account: ownerAccount,
-      paymentId,
-      piconeros,
-      txHash,
-      context: `abandoned fee ${paymentId}`,
-      daemon,
-      allowProvisional: true
-    })
-    if (!verdict) return
-    // Same self-payment ban as the live-fee path (exact monetary closure on
-    // account-owned inputs): a change-inflated self-send must not seed a
-    // ledger receipt either.
-    if (verdict.tx && isSelfSend(ownerAccount, verdict.tx)) {
-      alert('warn', 'owner-fee self-payment refused',
-        `abandoned fee leg ${paymentId} tx ${verdict.tx.hash}: payer shares the owner account (change-inflated); no receipt recorded`,
-        { dedupeKey: `subfee-selfpay-${paymentId}-${String(verdict.tx.hash).toLowerCase()}` })
+    // A pid with a PayIn but no intent row predates intents entirely; the
+    // owner applier's map-joined insert records nothing for it (legacy).
+    const feeMap = feeMapRow ?? { paymentId, feeType: null }
+    const receipt = { feeMap, feePayIn, txHash: verifiedHash, piconeros, height: verifiedHeight, confirmations: derivedConfirmations }
+    if (feePayIn) {
+      await applyFeeReceipt(models, receipt)
       return res.status(200).end()
     }
-    // A daemon verdict proves the tx but not the RingCT amount: the receipt is
-    // inserted provisional (height NULL) so a forged callback block cannot make
-    // its amount look chain-verified. Same chain-derived maturity discipline as
-    // the live-fee path: the callback's confirmation count cannot mature it.
-    const verifiedHash = verdict.tx ? verdict.tx.hash : (txHash ?? null)
-    const verifiedHeight = verdict.tx ? (verdict.tx.height ?? null) : (height ?? null)
-    const derivedConfirmations = verdict.skipped
-      ? confirmations
-      : (verdict.chainHeight != null && verifiedHeight != null
-          ? verdict.chainHeight - verifiedHeight + 1
-          : 0)
+    // Money landed on an intent with NO PayIn: the leg was abandoned
+    // (underpaid past the window — abandonFeeItems deleted the PayIn) but the
+    // intent persists for attribution. Record the receipt (owner legs: the
+    // owner keeps the XMR; platform legs: it is rewards-wallet cash) and page
+    // operators for manual reconciliation — never revive deleted content.
     try {
-      await applySubFeeReceipt(models, { feePayIn: null, paymentId, txHash: verifiedHash, piconeros, height: verifiedHeight, confirmations: derivedConfirmations })
+      await applyFeeReceipt(models, receipt)
     } catch (err) {
       console.warn(`webhook: abandoned-fee receipt record failed (best-effort): ${err && err.message}`)
     }
     alert('critical', 'payment arrived after fee abandonment',
-      `turf ${feeMapRow.subName}: ${piconeros} piconeros arrived on abandoned fee leg ${paymentId}; manual reconciliation required`,
+      `${platform ? `platform ${feeMapRow.feeType} fee` : `turf ${feeMapRow.subName}`}: ${piconeros} piconeros arrived on abandoned fee leg ${paymentId}; manual reconciliation required`,
       { dedupeKey: `subfee-late-payment-${paymentId}` })
     return res.status(200).end()
   }

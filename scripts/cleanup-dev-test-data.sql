@@ -31,6 +31,10 @@ WHERE "accountId" IN (SELECT id FROM "MoneroAccount" WHERE "ownerUserId" IN (SEL
 DELETE FROM "MoneroViewKey"
 WHERE "accountId" IN (SELECT id FROM "MoneroAccount" WHERE "ownerUserId" IN (SELECT id FROM dbg_turf_users));
 
+-- fee intents frozen to these accounts (recipient FK is ON DELETE RESTRICT)
+DELETE FROM "SubFeePidMap"
+WHERE "recipient_account_id" IN (SELECT id FROM "MoneroAccount" WHERE "ownerUserId" IN (SELECT id FROM dbg_turf_users));
+
 DELETE FROM "MoneroAccount"
 WHERE "ownerUserId" IN (SELECT id FROM dbg_turf_users);
 
@@ -59,6 +63,12 @@ WHERE "accountId" IN (
 
 DELETE FROM "MoneroViewKey"
 WHERE "accountId" IN (
+  SELECT id FROM "MoneroAccount"
+  WHERE "ownerUserId" IN (SELECT id FROM users WHERE name = 'loadtest_author' OR name LIKE 'dist-test-%')
+);
+
+DELETE FROM "SubFeePidMap"
+WHERE "recipient_account_id" IN (
   SELECT id FROM "MoneroAccount"
   WHERE "ownerUserId" IN (SELECT id FROM users WHERE name = 'loadtest_author' OR name LIKE 'dist-test-%')
 );

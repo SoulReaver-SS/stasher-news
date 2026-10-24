@@ -1,14 +1,13 @@
 import { PAID_ACTION_PAYMENT_METHODS } from '@/lib/constants'
-import { reserveFeeSubaddress } from '@/api/monero/feePool'
-import { buildMoneroUri } from '@/api/monero/uri'
+import { createPlatformFeeLeg } from '@/api/monero/ownerFeeLeg'
 import { piconerosToXmr, xmrToPiconeros } from '@/lib/format'
 import { GqlInputError } from '@/lib/error'
 import { getItemResult } from '../lib/item'
 
 // StasherNews boost (A-14) — upstream-faithful one-time permanent ranking
-// weight, 1:1 with tips. EVERY boost pays the platform rewards wallet via a
-// DEDICATED major-5 fee subaddress (DONATE pattern, NOT the legacy custodial
-// sats path). R08: the owner-direct leg was REMOVED — a boost on an item in a
+// weight, 1:1 with tips. EVERY boost pays the platform rewards wallet via an
+// integrated-address invoice (legacy invoices: a DEDICATED major-5 fee
+// subaddress, still observed), NOT the legacy custodial sats path. R08: the owner-direct leg was REMOVED — a boost on an item in a
 // single owned turf used to route 100% to that turf's owner when the owner had
 // a registered wallet; an item author could boost their own post in a
 // colluding owner's turf, paying the owner (minus tx fees) and getting the
@@ -20,9 +19,10 @@ import { getItemResult } from '../lib/item'
 // The payIn is born PAID (fee payIns resolve to PAID at creation with
 // piconeros=0n — the FeeObservation carries the real on-chain amount): the
 // client shows the monero: URI and polls `payIn(id).feeObserved`; the
-// rewardsWalletObserver records the on-chain output as a
-// FeeObservation('BOOST') at DETECTION and applies the ranking bump
-// (Item.boost += actual on-chain amount) — the PESSIMISTIC-only restriction is
+// shared fee applier (api/monero/feeObservation.js) records the on-chain
+// output as a FeeObservation('BOOST') and applies the ranking bump
+// (Item.boost += actual on-chain amount) exactly once, at the verified
+// height transition (legacy subaddress boosts: at detection) — the PESSIMISTIC-only restriction is
 // deliberate: a custodial-funded boost would never produce an on-chain tx, so
 // never create a FeeObservation, so never rank or fund the pool (silent
 // no-op), exactly as DONATE documents.
@@ -47,19 +47,20 @@ export async function getInitial (models, { id, piconeros }, { me }) {
   const item = await models.item.findUnique({ where: { id: parseInt(id) } })
   if (!item) throw new GqlInputError('item not found')
 
-  const sub = await reserveFeeSubaddress(models, 'BOOST', { me })
-  const moneroUri = buildMoneroUri(
-    [{ address: sub.address, amount }],
-    { description: 'StasherNews boost' }
-  )
+  const leg = await createPlatformFeeLeg(models, undefined, {
+    me,
+    feeType: 'BOOST',
+    amountPiconeros: amount,
+    description: 'StasherNews boost',
+    postId: item.id
+  })
 
   return {
     payInType: 'BOOST',
     userId: me.id,
     piconeros: 0n,
-    moneroUri,
-    moneroSubaddressMajor: sub.major,
-    moneroSubaddressMinor: sub.minor,
+    moneroUri: leg.moneroUri,
+    moneroPaymentId: leg.paymentId,
     itemPayIn: { itemId: parseInt(id) }
   }
 }
@@ -80,8 +81,7 @@ export async function onBegin (tx, payInId, { id }) {
 }
 
 // No-op: with the FeeObservation carrying the real amount, the ranking bump is
-// applied by the rewardsWalletObserver at DETECTION (never before the money is
-// on-chain).
+// applied by the fee observation path (never before the money is on-chain).
 export async function onPaid (tx, payInId) {
 }
 

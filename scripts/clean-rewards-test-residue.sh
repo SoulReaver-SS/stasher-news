@@ -161,6 +161,15 @@ WHERE "accountId" IN (
      OR id IN (SELECT id FROM _tip_accounts)
      OR "ownerUserId" IN (SELECT id FROM _tu));
 
+-- Fee intents frozen to a test account (recipient FK is ON DELETE RESTRICT)
+-- before the accounts they lock (same three scopes as the account delete).
+DELETE FROM "SubFeePidMap"
+WHERE "recipient_account_id" IN (
+  SELECT id FROM "MoneroAccount"
+  WHERE address ~ 'A{90}$'
+     OR id IN (SELECT id FROM _tip_accounts)
+     OR "ownerUserId" IN (SELECT id FROM _tu));
+
 -- Test MoneroAccounts.
 DELETE FROM "MoneroAccount"
 WHERE address ~ 'A{90}$'

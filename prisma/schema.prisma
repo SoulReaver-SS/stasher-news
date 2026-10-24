@@ -1587,6 +1587,7 @@ model MoneroAccount {
   subaddresses     SubaddressIndex[]
   observedTips     ObservedTip[]
   observedBounties ObservedBounty[]
+  feeIntents       SubFeePidMap[]
 
   @@unique([address, network])
   @@index([ownerUserId])
@@ -1904,11 +1905,16 @@ model FeeObservation {
   // (e.g. one rollover output carrying prize + fee). NULL uses the source's
   // existing allocation rule. Enforced 0 <= rewardsPiconeros <= piconeros.
   rewardsPiconeros BigInt?
+  // Issued payment id of an integrated-address platform fee receipt (always
+  // recipient (0,0)); binds the receipt to exactly one SubFeePidMap intent.
+  // NULL for subaddress-pool and every other receipt kind.
+  paymentId        String?
 
   payIn PayIn? @relation(fields: [payInId], references: [id])
 
   @@unique([txHash, recipientMajor, recipientMinor])
   @@index([payInId])
+  @@index([paymentId])
   @@index([feeType, state])
   @@index([state, confirmedAt])
 }
@@ -2197,24 +2203,37 @@ model ObservedSubFee {
   @@map("ObservedSubFee")
 }
 
-// Leg intent for an owner-routed fee: created at getInitial (before the PayIn
-// exists), carries the lws webhook event id for cleanup, denormalizes
-// subName/ownerUserId for receipt rows. Mirrors DownvotePidMap. If begin()
-// fails the client never sees the URI, so no payment can arrive — the map row
-// exists solely so webhookCleanup can reap the registered webhook after
-// expiry.
+// Integrated-address fee intent, one per issued fee invoice. Created at
+// getInitial (before the PayIn exists), carries the lws webhook event id for
+// cleanup, and is the frozen identity every receipt copies. Mirrors
+// DownvotePidMap. If begin() fails the client never sees the URI, so no
+// payment can arrive. Historically owner-routed only (hence the name):
+//   - platform intent: feeType set, ownerUserId NULL; receipts land in
+//     FeeObservation (recipient (0,0) of the rewards wallet).
+//   - owner intent: feeType NULL, ownerUserId/subName set; receipts land in
+//     ObservedSubFee.
+// recipientAccountId + recipientAddress snapshot the receiving wallet at
+// issuance (NULL only on historical owner rows, which keep owner-account
+// resolution). Verification uses that account and defers if its address no
+// longer equals the snapshot. Rows are retained after webhook expiry.
 model SubFeePidMap {
-  id              Int      @id @default(autoincrement())
-  createdAt       DateTime @default(now()) @map("created_at")
-  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
-  paymentId       String   @unique @map("payment_id")
-  subName         String   @db.Citext
-  ownerUserId     Int      @map("owner_user_id")
-  amountPiconeros BigInt   @map("amount_piconeros")
-  webhookEventId  String?  @map("webhook_event_id")
-  expiresAt       DateTime @map("expires_at")
+  id                 Int            @id @default(autoincrement())
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @default(now()) @updatedAt @map("updated_at")
+  paymentId          String         @unique @map("payment_id")
+  subName            String?        @db.Citext
+  ownerUserId        Int?           @map("owner_user_id")
+  amountPiconeros    BigInt         @map("amount_piconeros")
+  webhookEventId     String?        @map("webhook_event_id")
+  expiresAt          DateTime       @map("expires_at")
+  recipientAccountId Int?           @map("recipient_account_id")
+  recipientAccount   MoneroAccount? @relation(fields: [recipientAccountId], references: [id], onDelete: Restrict)
+  recipientAddress   String?        @map("recipient_address")
+  feeType            FeeType?       @map("fee_type")
+  postId             Int?           @map("post_id")
 
   @@index([expiresAt])
+  @@index([recipientAccountId])
   @@map("SubFeePidMap")
 }
 

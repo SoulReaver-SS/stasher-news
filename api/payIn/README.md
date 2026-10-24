@@ -141,17 +141,64 @@ stateDiagram-v2
 ```
 </details>
 
+## Fee invoice destinations: integrated addresses (StasherNews, 2026-10-24)
+
+New posting/comment/upload (`ITEM_CREATE`, `ITEM_UPDATE`), turf
+(`TERRITORY_CREATE`/`_BILLING`/`_UNARCHIVE`/fee-bearing `_UPDATE`) and `BOOST`
+invoices are **integrated-address** legs, not rewards-wallet subaddress draws.
+Pricing, quotas, routing and billing are unchanged; only the destination
+mechanism moved. Wherever the sections below say "reserved subaddress", that
+now means the invoice destination stored in the PayIn's `moneroUri`.
+
+- **One issuer.** `api/monero/ownerFeeLeg.js` `createFeeLeg` mints a `fee:` HMAC
+  pid, folds it into the recipient's primary as an integrated address, quotes
+  the FULL amount, registers an lws webhook and writes a `SubFeePidMap` intent
+  (the table keeps its historical name). Platform legs (`createPlatformFeeLeg`,
+  `feeType` set) pay the rewards wallet primary `(0,0)`; owner-routed legs pay
+  the turf owner as before. The PayIn carries `moneroPaymentId` and no
+  subaddress coordinates. Every issuer shares the per-user `throttleFeeIssuance`.
+- **Frozen recipient.** The intent stores `recipientAccountId` +
+  `recipientAddress` at issuance. Verification and reconciliation always use
+  that account and defer when it no longer matches; only
+  `resolvePlatformFeeRecipient` (issuance) chooses the platform wallet.
+- **Ledgers stay separate.** `api/monero/feeObservation.js` `applyFeeReceipt` is
+  the only writer: platform intents → `FeeObservation` at `(0,0)` with the issued
+  `paymentId` (rewards/ops cash); owner intents → `ObservedSubFee` (owner income).
+  Receipt identity (feeType, postId, subName, pid) is copied from the intent.
+- **Provisional vs verified.** A receipt is inserted with `height = NULL`
+  (display-only); a chain-verified sight claims the height via an atomic CAS,
+  correcting the amount. Gates (`flipPendingToLive`) and `PayIn.feeCovered`
+  count only height-bearing DETECTED/CONFIRMED receipts against a positive full
+  quote that agrees with the intent. A boost bumps by the actual amount exactly
+  once, at that transition (no quote gate).
+- **Observation paths.** The lws webhook is primary (platform legs fail closed
+  with 503 when the frozen recipient cannot verify); `rewardsWalletObserver`
+  books served-pid platform receipts with no time window; the hourly
+  `reconcileOwnerFeeLegs` job (legacy name) recovers missed callbacks and
+  wrong-pid lws rows for both destinations during the 7-day intent retention,
+  including PayIn-less (abandoned) platform intents. `confirmFinalizer` never
+  height-stamps a pid-bound receipt.
+- **Late payments.** `SubFeePidMap.expiresAt` is webhook retention, not address
+  validity; intents are never deleted. A payment after abandonment is recorded
+  as cash with `payInId NULL` and alerted — it never revives deleted content or
+  pays a newer turf invoice (`flipPendingToLive` only settles the Sub whose
+  current `billingPayInId` matches and is `PENDING_FEE`).
+- **Legacy.** Invoices issued before the migration keep their stored subaddress
+  URI and settle through `rewardsWalletObserver.attributeFeeBySubaddress`; all
+  fee-pool majors stay watched. Donations (major 3) and wallet-less tips
+  (major 4) still use subaddresses.
+
 ## ITEM_CREATE posting-fee outcomes (StasherNews)
 
 ITEM_CREATE has three post outcomes, selected in `getInitial` by the reputation gate
 (`canPostFree` = stacked ≥ `freePostThresholdPiconeros` AND age ≥ `freePostMinAgeDays`) and
 the user's monthly free-post quota (`freePostCount` / `freePostResetAt`):
 
-1. **Established + quota remaining → free.** `piconeros = 0n`, no fee subaddress reserved.
+1. **Established + quota remaining → free.** `piconeros = 0n`, no fee invoice issued.
    The `Item` is created `FEE_NOT_REQUIRED` (live immediately).
-2. **Low-rep user → `PENDING_FEE`.** A rewards-wallet posting-fee subaddress is reserved
+2. **Low-rep user → `PENDING_FEE`.** A rewards-wallet posting-fee invoice is issued
    and a `monero:` URI is built for the floor fee. The `Item` is created `PENDING_FEE`
-   (invisible) until `rewardsWalletObserver` observes the fee and flips it to `FEE_PAID`.
+   (invisible) until the fee is observed and flipped to `FEE_PAID`.
 3. **Established + quota exhausted → `PENDING_FEE`.** Same as low-rep: the 6th+ post in the
    month reserves a fee subaddress and goes `PENDING_FEE`. (Previously established users
    could post for free with no monthly cap.)
@@ -190,9 +237,10 @@ immediately-live items fire them at `onPaid`/`onPaidSideEffects` as before.
 
 **Abandonment:** a `PENDING_FEE` item whose fee is never observed is soft-deleted
 by the cron-owned `abandonFeeItems` worker (`FEE_ITEM_ABANDON_DAYS` = 1 day from
-`Item.created_at`); its fee PayIn is deleted (the subaddress pool is
-ASSIGN-never-freed, so no reuse/misattribution — a late payment to the abandoned
-subaddress finds no pending PayIn and is ignored). The author's thread view shows
+`Item.created_at`); its fee PayIn is deleted (destinations are never reused: a late payment to an
+abandoned legacy subaddress finds no pending PayIn and is ignored; one to an
+abandoned integrated invoice is recorded as cash against its retained intent
+and alerted, never publishing the item). The author's thread view shows
 the abandoned comment as deleted.
 
 **ITEM_UPDATE upload fees are deferred, not honor-system (2026-09-17):** an edit that

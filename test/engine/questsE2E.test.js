@@ -9,6 +9,11 @@ import { PrismaClient } from '@prisma/client'
 import { getInitial } from '@/api/payIn/types/itemCreate'
 import { moneroUriAmountPiconeros } from '@/lib/format'
 
+// Fee legs register an lws webhook at issuance; never reach the real lws.
+jest.mock('../../api/monero/lwsClient', () => ({
+  __esModule: true, lwsClient: { addWebhook: jest.fn(async () => ({ event_id: 'test-fee-hook' })) }
+}))
+
 jest.mock('../../lib/lexical/server/mentions', () => ({
   __esModule: true,
   extractMentions: () => ({ userNames: [], itemIds: [] })
@@ -16,6 +21,8 @@ jest.mock('../../lib/lexical/server/mentions', () => ({
 jest.mock('../../api/resolvers/item', () => ({ __esModule: true, getItem: jest.fn() }))
 jest.mock('../../api/monero/feePool', () => ({
   __esModule: true,
+  throttleFeeIssuance: jest.fn(),
+  resolvePlatformFeeRecipient: jest.fn(models => require('../../test/helpers/platformFeeRecipient').testPlatformFeeRecipient(models)),
   reserveFeeSubaddress: jest.fn(async () => ({ id: 1, major: 1, minor: 1, address: 'A'.repeat(95) }))
 }))
 

@@ -13,6 +13,8 @@ import { denormalizeComment, runItemLiveSideEffects } from '@/lib/itemLiveEffect
 import { alert } from '@/lib/alert'
 import { logError } from '@/lib/logger'
 import { consumeQuotaForFlippedItem, consumeStreakReward } from '@/api/payIn/lib/freebie'
+import { applyFeeReceipt, excludeProvisionalFeeReceipt } from '@/api/monero/feeObservation'
+import { isSelfSend } from '@/api/monero/selfTip'
 
 const TRANSACTION_OPTIONS = { maxWait: 5000, timeout: 15000 }
 
@@ -71,6 +73,11 @@ async function attributeOutput (models, tx, account) {
   // the rewards wallet books its receipt. Escrow payouts carry no payment_id,
   // so this is checked before (and independently of) the payment_id branches.
   if (await attributeBountyReceipt({ models, account, tx })) return
+  // Integrated platform fees (posting/turf/boost invoices since the
+  // integrated-address migration) arrive on the PRIMARY address carrying a
+  // "fee:"-namespace payment_id. Checked before the downvote/tip pid branches:
+  // a pid that names a fee intent is never reinterpreted as anything else.
+  if (tx.payment_id && await attributeIntegratedFee(models, tx, account)) return
   // PHASE 4: downvotes arrive on the PRIMARY address (major 0) carrying a
   // decrypted payment_id that encodes (postId, nonce) via the DownvotePidMap.
   if (tx.payment_id && await attributeDownvoteByPaymentId(models, tx)) return
@@ -151,6 +158,54 @@ async function attributeFeeBySubaddress (models, tx) {
   // short-circuit); re-poll -> null, so attributeOutput falls through to the
   // payment_id branches (a fee subaddress carries no payment_id, so no-op).
   return fresh ? rows[0].id : null
+}
+
+// Attribute a primary-address output whose payment_id names an integrated
+// platform fee intent. The rewards account's own lws row is the verified
+// recipient-side evidence (amount + mined height), so it feeds the shared
+// applier directly — the same path as the webhook and the reconciler, with no
+// time window (legacy subaddress attribution parity: a late payment is still
+// booked). Returns true when the pid belongs to a fee intent (handled or
+// refused), so the dispatcher never falls through to the downvote/tip branches;
+// false for every other pid, which keeps its existing classification
+// (wallet change carries a random dummy pid that matches no intent).
+async function attributeIntegratedFee (models, tx, account) {
+  const feeMap = await models.subFeePidMap.findUnique({ where: { paymentId: String(tx.payment_id).toLowerCase() } })
+  if (!feeMap) return false
+  // Owner intents pay the owner's wallet; one surfacing here is not ours.
+  if (feeMap.feeType == null) return true
+  if (feeMap.recipientAccountId !== account.id || feeMap.recipientAddress !== account.address) {
+    alert('critical', 'integrated fee pid seen on a non-recipient account',
+      `fee intent ${feeMap.id} (recipient account ${feeMap.recipientAccountId}) matched tx ${tx.hash} on account ${account.id}; not credited`,
+      { dedupeKey: `fee-wrong-account-${feeMap.id}-${tx.hash}` })
+    return true
+  }
+  if ((tx.recipient?.maj_i ?? 0) !== 0 || (tx.recipient?.min_i ?? 0) !== 0) return true
+  // Exact monetary-closure self-send refusal (never credit rewards-wallet
+  // change as an external fee). Subaddresses load only on a fee-pid hit.
+  const subaddresses = await models.subaddressIndex.findMany({
+    where: { accountId: account.id },
+    select: { majorIndex: true, minorIndex: true }
+  })
+  if (isSelfSend({ ...account, subaddresses }, tx)) {
+    const excluded = await excludeProvisionalFeeReceipt(models, feeMap, tx.hash)
+    if (excluded > 0) {
+      alert('warn', 'platform fee self-payment refused',
+        `fee intent ${feeMap.id} tx ${tx.hash}: payer shares the rewards account (change-inflated); provisional receipt excluded`,
+        { dedupeKey: `fee-selfpay-${feeMap.id}-${tx.hash}` })
+    }
+    return true
+  }
+  const feePayIn = await models.payIn.findUnique({ where: { moneroPaymentId: feeMap.paymentId } })
+  await applyFeeReceipt(models, {
+    feeMap,
+    feePayIn,
+    txHash: tx.hash,
+    piconeros: tx.piconeros,
+    height: tx.height ?? null,
+    confirmations: 0 // never fabricated — confirmFinalizer matures height-bearing rows
+  })
+  return true
 }
 
 // Apply the boost ranking bump (A-14): increment the item's persistent boost

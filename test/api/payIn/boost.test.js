@@ -1,6 +1,19 @@
 /* eslint-env jest */
+import { expectPlatformFeeLeg } from '../../../test/helpers/platformFeeRecipient'
 import { PrismaClient } from '@prisma/client'
 import pay from '@/api/payIn'
+
+// Integrated platform fee legs: a real test recipient row (FK), throttle and
+// subaddress pool untouched.
+jest.mock('../../../api/monero/feePool', () => ({
+  __esModule: true,
+  ...jest.requireActual('../../../api/monero/feePool'),
+  resolvePlatformFeeRecipient: jest.fn(models => require('../../../test/helpers/platformFeeRecipient').testPlatformFeeRecipient(models))
+}))
+// Fee legs register an lws webhook at issuance; never reach the real lws.
+jest.mock('../../../api/monero/lwsClient', () => ({
+  __esModule: true, lwsClient: { addWebhook: jest.fn(async () => ({ event_id: 'test-fee-hook' })) }
+}))
 
 // `pay` imports the full payIn type barrel, which pulls in itemCreate →
 // @/lib/lexical/server/mentions (ESM-only mdast-util-from-markdown, not
@@ -78,12 +91,13 @@ afterAll(async () => {
   await prisma.$disconnect()
 })
 
-test('BOOST payIn returns a monero URI to a major-5 subaddress', async () => {
+test('BOOST payIn returns an integrated-address platform invoice bound to the boosted item', async () => {
   const payIn = await pay('BOOST', { id: post, piconeros: 1_000_000_000n }, { me: { id: user } })
   expect(payIn.moneroUri).toMatch(/^monero:/)
   expect(payIn.payInType).toBe('BOOST')
   expect(payIn.piconeros).toBe(0n)
-  expect(payIn.moneroSubaddressMajor).toBe(5)
+  const feeMap = await expectPlatformFeeLeg(prisma, payIn, 'BOOST')
+  expect(feeMap.postId).toBe(post)
 })
 
 // regression: onBegin must read Item.path via getItemResult (raw SQL +

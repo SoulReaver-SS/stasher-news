@@ -1,13 +1,12 @@
 import { PAID_ACTION_PAYMENT_METHODS, TERRITORY_PERIOD_COST } from '@/lib/constants'
 import { nextBilling } from '@/lib/territory'
 import { territoryFeePiconeros } from '@/api/monero/territoryFee'
-import { reserveFeeSubaddress } from '@/api/monero/feePool'
-import { buildMoneroUri } from '@/api/monero/uri'
+import { createPlatformFeeLeg } from '@/api/monero/ownerFeeLeg'
 import { scheduleTerritoryBilling } from '../lib/scheduleTerritoryBilling'
 import { subOccWhere } from '../lib/territory'
 
 // StasherNews territory billing/renewal (spec §6.2). Same shape as territoryCreate
-// but for an existing Sub at renewal: reserves a major-2 fee subaddress, emits the
+// but for an existing Sub at renewal: issues an integrated fee invoice, emits the
 // fee URI, and sets billingStatus=PENDING_FEE until the rewardsWalletObserver observes the
 // fee. ONCE territories are never billed.
 
@@ -23,18 +22,20 @@ export async function getInitial (models, { name }, { me }) {
   const sub = await models.sub.findUnique({ where: { name } })
   const config = await models.platformFeeConfig.findUnique({ where: { id: 1 } })
   const fee = territoryFeePiconeros(sub.billingType, config)
-  const reserved = await reserveFeeSubaddress(models, 'TERRITORY_BILLING', { me }) // major 2
-  const moneroUri = buildMoneroUri(
-    [{ address: reserved.address, amount: fee }],
-    { description: `StasherNews territory ${name} renewal (${sub.billingType})` }
-  )
+  // A NEW invoice (and pid) per renewal — never a reused per-turf pid.
+  const leg = await createPlatformFeeLeg(models, undefined, {
+    me,
+    feeType: 'TERRITORY_BILLING',
+    amountPiconeros: fee,
+    description: `StasherNews territory ${name} renewal (${sub.billingType})`,
+    subName: name
+  })
   return {
     payInType: 'TERRITORY_BILLING',
     userId: me?.id,
     piconeros: 0n,
-    moneroUri,
-    moneroSubaddressMajor: reserved.major,
-    moneroSubaddressMinor: reserved.minor
+    moneroUri: leg.moneroUri,
+    moneroPaymentId: leg.paymentId
   }
 }
 

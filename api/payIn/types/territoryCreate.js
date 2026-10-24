@@ -2,15 +2,14 @@ import { PAID_ACTION_PAYMENT_METHODS, TERRITORY_PERIOD_COST } from '@/lib/consta
 import { nextBilling } from '@/lib/territory'
 import { initialTrust } from '../lib/territory'
 import { discountedTerritoryFee, territoryFeePiconeros } from '@/api/monero/territoryFee'
-import { reserveFeeSubaddress } from '@/api/monero/feePool'
-import { buildMoneroUri } from '@/api/monero/uri'
+import { createPlatformFeeLeg } from '@/api/monero/ownerFeeLeg'
 import { scheduleTerritoryBilling } from '../lib/scheduleTerritoryBilling'
 import { assertUploadsWithinFreeSize, throwOnExpiredUploads } from '@/api/resolvers/upload'
 
 // StasherNews territory creation (spec §6.2). The founder pays a territory fee to
-// the platform rewards wallet via a dedicated major-2 subaddress; the territory is
-// created billingStatus=PENDING_FEE (invisible/inactive) until the rewardsWalletObserver
-// observes the fee and flips it to PAID. piconeros=0 (no custodial sats) so the SN
+// the platform rewards wallet via an integrated-address invoice (legacy:
+// a major-2 subaddress); the territory is created billingStatus=PENDING_FEE
+// (invisible/inactive) until the fee is observed and flipped to PAID. piconeros=0 (no custodial sats) so the SN
 // payIn engine yields payInState=PAID; the fee itself is on-chain.
 
 export const anonable = false
@@ -38,18 +37,19 @@ export async function getInitial (models, { billingType, name, uploadIds = [] },
     select: { id: true }
   }))
   const amount = discountedTerritoryFee(fee, discountHeld)
-  const sub = await reserveFeeSubaddress(models, 'TERRITORY_CREATE', { me }) // major 2
-  const moneroUri = buildMoneroUri(
-    [{ address: sub.address, amount }],
-    { description: `StasherNews territory ${name} (${billingType})` }
-  )
+  const leg = await createPlatformFeeLeg(models, undefined, {
+    me,
+    feeType: 'TERRITORY_CREATE',
+    amountPiconeros: amount,
+    description: `StasherNews territory ${name} (${billingType})`,
+    subName: name
+  })
   return {
     payInType: 'TERRITORY_CREATE',
     userId: me?.id,
     piconeros: 0n,
-    moneroUri,
-    moneroSubaddressMajor: sub.major,
-    moneroSubaddressMinor: sub.minor
+    moneroUri: leg.moneroUri,
+    moneroPaymentId: leg.paymentId
   }
 }
 

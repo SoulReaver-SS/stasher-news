@@ -23,6 +23,11 @@ import { runAbandonFeeItemsOnce } from '@/worker/abandonFeeItems'
 import { postingFeePrivatesFor } from '@/api/monero/postingFee'
 import { moneroUriAmountPiconeros } from '@/lib/format'
 
+// Fee legs register an lws webhook at issuance; never reach the real lws.
+jest.mock('../../api/monero/lwsClient', () => ({
+  __esModule: true, lwsClient: { addWebhook: jest.fn(async () => ({ event_id: 'test-fee-hook' })) }
+}))
+
 // itemCreate.js statically imports the ESM-only lexical mention parser and
 // the heavy getItem resolver chain — stub both (mirrors payInItemCreate.test.js).
 jest.mock('../../lib/lexical/server/mentions', () => ({
@@ -38,6 +43,8 @@ jest.mock('../../api/resolvers/item', () => ({
 // reused in payInItemCreate.test.js).
 jest.mock('../../api/monero/feePool', () => ({
   __esModule: true,
+  throttleFeeIssuance: jest.fn(),
+  resolvePlatformFeeRecipient: jest.fn(models => require('../../test/helpers/platformFeeRecipient').testPlatformFeeRecipient(models)),
   reserveFeeSubaddress: jest.fn(async () => ({
     id: 1,
     major: 1,

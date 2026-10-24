@@ -46,3 +46,43 @@ describe('PayIn.feeObserved (owner legs)', () => {
     expect(await resolvers.PayIn.feeObserved({ id: 5 }, {}, { models })).toBe(false)
   })
 })
+
+describe('PayIn.feeCovered (integrated payment-id invoices)', () => {
+  // URI quotes 0.001 XMR = 1e9 piconeros
+  const payIn = { id: 5, moneroPaymentId: 'a1b2c3d4e5f60718', moneroUri: 'monero:4INT?tx_amount=0.001' }
+  // Aggregates honour the where clause the resolver sends: provisional
+  // (height NULL) money is only counted when the query does not exclude it.
+  const modelsWith = ({ verified = 0n, provisional = 0n }) => {
+    const sum = where => ({ _sum: { piconeros: where.height ? verified : verified + provisional } })
+    return {
+      feeObservation: { aggregate: jest.fn(async ({ where }) => sum(where)) },
+      observedSubFee: { aggregate: jest.fn(async () => ({ _sum: { piconeros: 0n } })) }
+    }
+  }
+
+  it('does not report coverage from provisional (unverified) money', async () => {
+    const resolvers = (await import('../../api/resolvers/payIn')).default
+    const models = modelsWith({ provisional: 5_000_000_000n })
+    expect(await resolvers.PayIn.feeCovered(payIn, {}, { models })).toBe(false)
+    // and only live-state receipts are counted, matching the settle gate
+    expect(models.feeObservation.aggregate).toHaveBeenCalledWith({
+      _sum: { piconeros: true },
+      where: { payInId: 5, state: { in: ['DETECTED', 'CONFIRMED'] }, height: { not: null } }
+    })
+  })
+
+  it('reports coverage once verified receipts reach the full quote', async () => {
+    const resolvers = (await import('../../api/resolvers/payIn')).default
+    expect(await resolvers.PayIn.feeCovered(payIn, {}, { models: modelsWith({ verified: 1_000_000_000n }) })).toBe(true)
+  })
+})
+
+describe('PayIn.feeObserved (owner receipt states)', () => {
+  it('ignores refused/reversed owner receipts', async () => {
+    const findFirst = jest.fn(async () => null)
+    const models = { feeObservation: { findFirst: async () => null }, observedSubFee: { findFirst } }
+    const resolvers = (await import('../../api/resolvers/payIn')).default
+    expect(await resolvers.PayIn.feeObserved({ id: 5 }, {}, { models })).toBe(false)
+    expect(findFirst).toHaveBeenCalledWith({ where: { payInId: 5, state: { in: ['DETECTED', 'CONFIRMED'] } } })
+  })
+})

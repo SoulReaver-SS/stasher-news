@@ -2,8 +2,7 @@ import { PAID_ACTION_PAYMENT_METHODS, TERRITORY_PERIOD_COST } from '@/lib/consta
 import { nextBilling } from '@/lib/territory'
 import { initialTrust, subOccWhere } from '../lib/territory'
 import { territoryFeePiconeros } from '@/api/monero/territoryFee'
-import { reserveFeeSubaddress } from '@/api/monero/feePool'
-import { buildMoneroUri } from '@/api/monero/uri'
+import { createPlatformFeeLeg } from '@/api/monero/ownerFeeLeg'
 import { GqlInputError } from '@/lib/error'
 import { scheduleTerritoryBilling } from '../lib/scheduleTerritoryBilling'
 import { assertUploadsWithinFreeSize, throwOnExpiredUploads } from '@/api/resolvers/upload'
@@ -16,7 +15,7 @@ export const paymentMethods = [
   PAID_ACTION_PAYMENT_METHODS.PESSIMISTIC
 ]
 
-export async function getInitial (models, { billingType, uploadIds = [] }, { me }) {
+export async function getInitial (models, { name, billingType, uploadIds = [] }, { me }) {
   // StasherNews: turf descriptions cannot carry >10MB media (there is no
   // upload-fee path for turfs) and stale/deleted upload ids must fail with the
   // actionable "expired" error rather than saving a dead URL. Both checks run
@@ -27,20 +26,20 @@ export async function getInitial (models, { billingType, uploadIds = [] }, { me 
   const config = await models.platformFeeConfig.findUnique({ where: { id: 1 } })
   if (!config) throw new GqlInputError('fee config not initialized')
   const fee = territoryFeePiconeros(billingType, config)
-  const reserved = await reserveFeeSubaddress(models, 'TERRITORY_UNARCHIVE', { me }) // major 2
-
-  const moneroUri = buildMoneroUri(
-    [{ address: reserved.address, amount: fee }],
-    { description: `StasherNews turf reactivation (${billingType})` }
-  )
+  const leg = await createPlatformFeeLeg(models, undefined, {
+    me,
+    feeType: 'TERRITORY_UNARCHIVE',
+    amountPiconeros: fee,
+    description: `StasherNews turf reactivation (${billingType})`,
+    subName: name ?? null
+  })
 
   return {
     payInType: 'TERRITORY_UNARCHIVE',
     userId: me?.id,
     piconeros: 0n,
-    moneroUri,
-    moneroSubaddressMajor: reserved.major,
-    moneroSubaddressMinor: reserved.minor
+    moneroUri: leg.moneroUri,
+    moneroPaymentId: leg.paymentId
   }
 }
 
