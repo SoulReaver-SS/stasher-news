@@ -351,7 +351,26 @@ Currently, SN runs and maintains two significant services and one microservice:
 2. the worker service, found in `./worker`, which runs periodic jobs and jobs sent to it by the web app
 3. a screenshot microservice, found in `./capture`, which takes screenshots of SN for social previews
 
-In addition, we run other critical services the above services interact with like `monerod`, `monero-lws`, `postgres`, `opensearch`, and `minio`.
+In addition, we run other critical services the above services interact with like `monerod`, `monero-lws`, `postgres`, `opensearch`, and `media`/`seaweedfs` (the S3-compatible media store: an HTTP-only Caddy proxy in front of a SeaweedFS backend — the `media` service carries the legacy `minio` network alias so old internal `http://minio:9000/uploads/...` URLs keep resolving).
+
+### Media store configuration
+
+The SeaweedFS backend boots only with a rendered, secret-bearing `s3.config.json`
+(admin identity from `MEDIA_AWS_*`, plus anonymous `Read:<bucket>` — nothing
+else). Before the first `up` with the `images` profile — render from the
+EFFECTIVE environment (local `.env.local` overrides win over tracked
+defaults):
+
+```sh
+mkdir -p .media-runtime && chmod 700 .media-runtime
+set -a; source .env.development; [ -f .env.local ] && source .env.local; set +a
+node scripts/render-media-config.cjs .media-runtime/s3.config.json
+docker compose --profile images up -d media seaweedfs
+docker compose exec -w /app app node scripts/ensure-media-bucket.cjs
+```
+
+`.media-runtime/` is gitignored and must never be committed. The backend fails
+closed if the config is missing.
 
 <br>
 

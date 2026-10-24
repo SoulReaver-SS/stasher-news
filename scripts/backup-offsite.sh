@@ -14,10 +14,12 @@
 # rclone remotes required (configure once via `rclone config`; see the ops
 # ops handoff):
 #   b2-stasher — Backblaze B2, application key scoped to stashernews-backups
-#   minio      — S3-compatible remote for the `minio` container
-#                (endpoint http://localhost:4566, path style, the machine's
-#                AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY pair — the same
-#                creds minio interpolates as MINIO_ROOT_*)
+#   minio      — S3-compatible remote for the `media` endpoint (the name is a
+#                legacy label from the MinIO era; the endpoint now serves
+#                SeaweedFS behind the media proxy — http://localhost:4566,
+#                path style, the machine's MEDIA_AWS_ACCESS_KEY_ID/
+#                MEDIA_AWS_SECRET_ACCESS_KEY pair, the same creds the media
+#                store's rendered s3.config carries)
 #
 # Legs:
 #   1. GPG-encrypted DB dumps        $BACKUPS_DIR    -> backups/

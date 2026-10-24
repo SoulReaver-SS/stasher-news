@@ -5,8 +5,9 @@
 # Regression test for the 2026-08-16 incident class: localstack community
 # edition stores S3 objects in container-ephemeral storage (persistence is a
 # paid-tier feature), so every `aws` container restart silently wiped ALL
-# user uploads. The S3 backend is now MinIO with its data dir on a docker
-# volume, which must survive `docker compose restart` and recreation.
+# user uploads. The S3 backend is SeaweedFS (since 2026-10-24; previously
+# MinIO) with its data dir on an external docker volume, which must survive
+# `docker compose restart` and recreation.
 #
 # Phases:
 #   1. presigned-POST upload through the same AWS SDK code path the app uses
@@ -16,12 +17,20 @@
 #   4. GET again — the object must still exist
 #
 # Usage: ./scripts/verify-s3-durability.sh [service-name]
-#   service-name defaults to `minio`; pass `aws` to test the old localstack
-#   backend (expected to FAIL phase 4).
+#   service-name defaults to `media` (the media stack): the DURABLE component
+#   is the `seaweedfs` backend, so that is what gets restarted — restarting
+#   only the stateless `media` proxy would false-PASS phase 4 without ever
+#   testing persistence. Pass `aws` to test the old localstack backend
+#   (expected to FAIL phase 4).
 
 set -euo pipefail
 
-SERVICE="${1:-minio}"
+SERVICE="${1:-media}"
+case "$SERVICE" in
+  media)    RESTART_TARGET="seaweedfs" ;;
+  aws)      RESTART_TARGET="aws" ;;
+  *) echo "FAIL: unknown service '$SERVICE' (expected 'media' or 'aws')" >&2; exit 1 ;;
+esac
 KEY="durability-probe-$(date +%s)"
 PROBE_FILE="$(mktemp)"
 trap 'rm -f "$PROBE_FILE"' EXIT
@@ -111,12 +120,22 @@ presign_and_post
 echo "== phase 2: anonymous GET (public-read contract) =="
 anon_get
 
-echo "== phase 3: restarting ${SERVICE} =="
-docker compose -p stashernews restart "$SERVICE" >/dev/null
-sleep 8
+echo "== phase 3: restarting ${SERVICE} (durable component: ${RESTART_TARGET}) =="
+docker compose -p stashernews restart "$RESTART_TARGET" >/dev/null
 
 echo "== phase 4: anonymous GET after restart (durability contract) =="
-anon_get
+# Bounded readiness wait: the media backend can take well over the old fixed
+# 8s to come back (SeaweedFS master raft re-election measured ~60s after an
+# unclean stop). Success requires the REAL object GET, not just a listener.
+ready=0
+for _ in $(seq 1 60); do
+  if anon_get; then ready=1; break; fi
+  sleep 2
+done
+if [ "$ready" -ne 1 ]; then
+  echo "FAIL: ${SERVICE} (restarted: ${RESTART_TARGET}) did not serve the object within 120s" >&2
+  exit 1
+fi
 
 echo
 echo "PASS: ${SERVICE} preserves S3 objects across a container restart"

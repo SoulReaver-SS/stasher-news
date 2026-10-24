@@ -1,0 +1,17 @@
+# HTTP-only front door for the SeaweedFS media backend (stasher.news media
+# uploads). Deliberately minimal:
+#   - admin off      — Caddy's admin API (default localhost:2019) is disabled
+#   - auto_https off — TLS terminates at the public edge (Caddyfile.prod) or
+#                      not at all (dev loopback); this proxy is plain HTTP
+# Only the S3 HTTP port is forwarded. The SeaweedFS master/filer/volume/gRPC
+# interfaces are unreachable by construction: the backend sits alone with
+# this proxy on the internal media-backend network, and nothing else is
+# proxied.
+{
+	admin off
+	auto_https off
+}
+
+:9000 {
+	reverse_proxy seaweedfs:8333
+}

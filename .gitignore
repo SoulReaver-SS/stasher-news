@@ -100,6 +100,10 @@ ADMIN-GUIDE.md
 # SOPS-encrypted runtime secrets (live at /etc/stashernews/secrets.env on the VPS)
 /secrets.env
 
+# rendered SeaweedFS s3.config.json (secret-bearing, never committed;
+# per-host file created by scripts/render-media-config.cjs)
+/.media-runtime/
+
 # dev docs (kept locally in ~/Stasher-local/ops-docs)
 docs/plans/
 docs/specs/

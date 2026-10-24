@@ -2,7 +2,7 @@
 # Asserts the uploads bucket refuses anonymous listing (ListBucket) while
 # still serving objects (GetObject). Usage:
 #   ./scripts/verify-upload-bucket-policy.sh [base_url] [existing_key]
-# Defaults: http://minio:9000  (run inside the compose network, e.g.
+# Defaults: http://media:9000  (run inside the compose network, e.g.
 #   docker run --rm --network stashernews_default curlimages/curl ...)
 set -euo pipefail
 BASE="${1:-http://minio:9000}"

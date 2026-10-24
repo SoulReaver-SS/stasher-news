@@ -15,17 +15,18 @@
 stasher.news {
 	encode zstd gzip
 
-	# Media uploads: same-origin /uploads is reverse-proxied to the minio S3
-	# service so browsers can POST presigned uploads and GET objects over TLS
-	# without a second host (no mixed content, no extra DNS). S3 presigned POSTs
-	# target the bucket root (https://stasher.news/uploads) — the key rides in the
-	# multipart form fields, not the URL — so the matcher must include bare
-	# /uploads as well as /uploads/<key>; otherwise the POST falls through to the
-	# app and the invite gate. The bucket name `uploads` is the s3 path-style
-	# prefix, so /uploads/<key> maps 1:1 to minio:9000/uploads/<key>.
+	# Media uploads: same-origin /uploads is reverse-proxied to the media S3
+	# service (SeaweedFS behind an HTTP-only proxy) so browsers can POST
+	# presigned uploads and GET objects over TLS without a second host (no
+	# mixed content, no extra DNS). S3 presigned POSTs target the bucket root
+	# (https://stasher.news/uploads) — the key rides in the multipart form
+	# fields, not the URL — so the matcher must include bare /uploads as well
+	# as /uploads/<key>; otherwise the POST falls through to the app and the
+	# invite gate. The bucket name `uploads` is the s3 path-style prefix, so
+	# /uploads/<key> maps 1:1 to media:9000/uploads/<key>.
 	@uploads path /uploads /uploads/*
 	handle @uploads {
-		reverse_proxy minio:9000
+		reverse_proxy media:9000
 	}
 
 	# lws confirmation webhook: internal-only. lws delivers container-to-container

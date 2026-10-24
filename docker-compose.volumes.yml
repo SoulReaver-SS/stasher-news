@@ -9,9 +9,16 @@
 # pre-existing. caddy_data/caddy_config stay unguarded deliberately (TLS certs
 # are re-issuable by Let's Encrypt).
 #
-# `stashernews_os` (search profile) is the one exception to "already exists":
-# it must be created manually before the first guarded `up` with the search
-# profile active — docker volume create stashernews_os (minio precedent).
+# `stashernews_os` (search profile) and `stashernews_seaweedfs` (images
+# profile) are the exceptions to "already exists": they must be created
+# manually before the first guarded `up` with that profile active —
+# docker volume create stashernews_os / stashernews_seaweedfs
+# (the retired stashernews_minio volume is the naming precedent).
+#
+# `stashernews_minio` stays declared here DELIBERATELY: the retired MinIO
+# volume is the rollback storage for the 2026-10-24 SeaweedFS migration. It
+# holds the pre-migration media objects and must never be pruned or removed
+# by compose tooling while rollback is possible.
 #
 # Dev-mode hotswap note: the base docker-compose.yml alone runs dev watch
 # commands and has NO wipe guard — always include this fragment on the VPS,
@@ -19,6 +26,9 @@
 volumes:
   db:
     name: stashernews_db
+    external: true
+  seaweedfs:
+    name: stashernews_seaweedfs
     external: true
   minio:
     name: stashernews_minio

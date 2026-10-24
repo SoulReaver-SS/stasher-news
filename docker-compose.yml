@@ -168,69 +168,84 @@ services:
     labels:
       - "CONNECT=localhost:3001"
     cpu_shares: "${CPU_SHARES_LOW}"
-  # Media uploads (S3): MinIO with its data dir on a docker volume.
-  # Replaced localstack S3 on 2026-08-16: localstack community edition keeps
-  # S3 objects in container-ephemeral storage (persistence is a paid-tier
-  # feature), so every container restart silently wiped ALL user uploads.
-  # MinIO root creds track the app's MEDIA_AWS_* env via interpolation
-  # (falling back to the legacy AWS_* pair for pre-migration .env.locals),
-  # so the presigned-POST signer and the server always agree per machine.
-  minio:
-    container_name: minio
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-    command: server /data --console-address ":9001"
+  # Media uploads (S3): SeaweedFS 4.48 all-in-one backend (master+volume+filer+
+  # S3 in one process) reached ONLY through the `media` HTTP proxy below, on the
+  # dedicated media-backend network. Replaced MinIO on 2026-10-24: MinIO
+  # withdrew community distribution (the minio/minio Docker Hub repository was
+  # removed, discovered 2026-10-22), leaving no trusted artifact and no
+  # security-patch path. Backend credentials come from a rendered s3.config
+  # (scripts/render-media-config.cjs) mounted read-only; the entrypoint fails
+  # closed if it is missing. Pin: version tag + immutable index digest.
+  seaweedfs:
+    container_name: seaweedfs
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
     restart: unless-stopped
     profiles:
       - images
-    env_file: *env_file
-    environment:
-      MINIO_ROOT_USER: ${MEDIA_AWS_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-minioadmin}}
-      MINIO_ROOT_PASSWORD: ${MEDIA_AWS_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-minioadmin}}
-      # browser presigned-POST origins (dev is cross-origin; VPS uploads are
-      # same-origin through the caddy /uploads proxy and never hit this)
-      MINIO_API_CORS_ALLOW_ORIGIN: http://localhost:3000,https://stasher.news
+    entrypoint: ["/custom-entrypoint.sh"]
+    volumes:
+      - ./docker/seaweedfs/entrypoint.sh:/custom-entrypoint.sh:ro
+      # Rendered before `up` (mkdir -p .media-runtime && chmod 700 &&
+      # scripts/render-media-config.cjs .media-runtime/s3.config.json).
+      # VPS: point MEDIA_S3_CONFIG at the operator path instead.
+      - ${MEDIA_S3_CONFIG:-./.media-runtime/s3.config.json}:/run/seaweedfs-src/s3.config.json:ro
+      - seaweedfs:/data
+    healthcheck:
+      # Any HTTP answer (including the unauthenticated 403 on /) proves the S3
+      # API is serving; the start_period covers master raft re-election after
+      # an unclean stop (~60s observed).
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:8333/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 90s
+    stop_grace_period: 30s
+    networks:
+      - media-backend
+    cpu_shares: "${CPU_SHARES_LOW}"
+  # HTTP-only front door for the media backend. Keeps the app-facing S3
+  # endpoint exactly where it was (host 127.0.0.1:4566, container media:9000)
+  # and carries the legacy `minio` network alias so stored internal URLs of
+  # the form http://minio:9000/uploads/<key> keep resolving — it runs no MinIO
+  # software. Only HTTP S3 traffic is forwarded: master/filer/volume/gRPC
+  # admin interfaces stay unreachable behind the media-backend network.
+  media:
+    container_name: media
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    profiles:
+      - images
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+        restart: true
+    read_only: true
+    tmpfs:
+      - /data
+      - /config
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./docker/media/Caddyfile:/etc/caddy/Caddyfile:ro
     ports:
       # keeps the historical dev upload URL host/port (NEXT_PUBLIC_MEDIA_URL)
       - "127.0.0.1:4566:9000"
-      # admin console, loopback only
-      - "127.0.0.1:9001:9001"
-    volumes:
-      - minio:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/ready || exit 1"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6
       start_period: 10s
+    networks:
+      default:
+        aliases:
+          - minio
+      media-backend: {}
     labels:
       - "CONNECT=localhost:4566"
     cpu_shares: "${CPU_SHARES_LOW}"
-  # one-shot: create the uploads bucket + anonymous-download policy (the
-  # app's GET path serves objects publicly, mirroring the old
-  # acl:public-read + localstack anonymous GET behavior)
-  minio-init:
-    container_name: minio-init
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
-    depends_on:
-      minio:
-        condition: service_healthy
-    restart: "no"
-    profiles:
-      - images
-    env_file: *env_file
-    environment:
-      MINIO_ROOT_USER: ${MEDIA_AWS_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-minioadmin}}
-      MINIO_ROOT_PASSWORD: ${MEDIA_AWS_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-minioadmin}}
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set sn http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\" &&
-      mc mb --ignore-existing sn/$${NEXT_PUBLIC_AWS_UPLOAD_BUCKET:-uploads} &&
-      printf '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::%s/*\"]}]}' \"$${NEXT_PUBLIC_AWS_UPLOAD_BUCKET:-uploads}\" > /tmp/anon-get.json &&
-      mc anonymous set-json /tmp/anon-get.json sn/$${NEXT_PUBLIC_AWS_UPLOAD_BUCKET:-uploads} &&
-      echo 'minio uploads bucket ready (anonymous GET only, no listing)'
-      "
-  # ACM emulation only (custom-domains dev flow). S3 moved to the minio
-  # service above; localstack keeps no host port.
+  # ACM emulation only (custom-domains dev flow). S3 moved to the media/
+  # seaweedfs services above; localstack keeps no host port.
   aws:
     container_name: aws
     image: localstack/localstack:4.12
@@ -428,7 +443,7 @@ services:
 volumes:
   db:
   os:
-  minio:
+  seaweedfs:
   backups:
   masterkey_backups:
   wal_archive:
@@ -442,6 +457,11 @@ volumes:
 
 networks:
   default: {}
+  # Dedicated network for the media backend; only the `media` proxy is a peer,
+  # so app-network containers can never reach SeaweedFS control/gRPC ports.
+  media-backend:
+    name: media-backend
+    internal: true
   domains-network:
     name: domains-network
     driver: bridge
