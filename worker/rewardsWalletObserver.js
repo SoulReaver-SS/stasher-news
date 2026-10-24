@@ -15,6 +15,9 @@ import { logError } from '@/lib/logger'
 import { consumeQuotaForFlippedItem, consumeStreakReward } from '@/api/payIn/lib/freebie'
 import { applyFeeReceipt, excludeProvisionalFeeReceipt } from '@/api/monero/feeObservation'
 import { isSelfSend } from '@/api/monero/selfTip'
+import { daemonClient } from '@/api/monero/daemonClient'
+import { getReconciliationRawReader } from '@/worker/reconciliationRawTransactions'
+import { recoverPlatformFeePids } from '@/worker/platformFeePidRecovery'
 
 const TRANSACTION_OPTIONS = { maxWait: 5000, timeout: 15000 }
 
@@ -526,7 +529,7 @@ export async function findRewardsAccount (models) {
   })
 }
 
-export async function rewardsWalletObserver ({ models, lws = lwsClient, detectReorg: detect = detectReorg }) {
+export async function rewardsWalletObserver ({ models, lws = lwsClient, detectReorg: detect = detectReorg, rawReader = getReconciliationRawReader(daemonClient) }) {
   // Recurrence is cron-owned (pgboss.schedule row rewardsWalletObserver); no
   // self-requeue. A failed run is retried per the schedule options and the
   // next cron tick re-creates the run either way.
@@ -553,8 +556,9 @@ export async function rewardsWalletObserver ({ models, lws = lwsClient, detectRe
     // oldest-first inside reconcileBountyReceipts. Best-effort: a recovery
     // failure must not wedge ordinary fee/downvote/tip attribution (the
     // 2026-08-10 incident class) — it is alerted and retried next tick.
+    let recoveryTxs = null
     try {
-      const recoveryTxs = account.lastTxId == null || lws.addressTxsMode === 'full'
+      recoveryTxs = account.lastTxId == null || lws.addressTxsMode === 'full'
         ? txs // the incremental fetch was already a full scan
         : (((await lws.getAddressTxs(account, 0, null)) || {}).transactions || [])
       await reconcileBountyReceipts({ models, account, transactions: recoveryTxs })
@@ -563,6 +567,22 @@ export async function rewardsWalletObserver ({ models, lws = lwsClient, detectRe
       alert('critical', 'bounty receipt recovery failed',
         `rewards wallet account ${account.id}: ${err?.message || err} — ordinary attribution continues; recovery retries next tick`,
         { dedupeKey: 'bounty-receipt-recovery-failed' })
+    }
+
+    // Integrated platform fee raw-pid recovery over the same full-history
+    // response (worker/platformFeePidRecovery.js): books fee receipts whose
+    // lws row carries a wrong (payer-side) decrypted pid. Same best-effort
+    // isolation as the bounty pass — it is independent of the cursor (full
+    // history every tick), so a failed run simply retries next minute.
+    if (recoveryTxs) {
+      try {
+        await recoverPlatformFeePids({ models, account, transactions: recoveryTxs, rawReader })
+      } catch (err) {
+        logError('rewardsWalletObserver: platform fee pid recovery failed', err)
+        alert('critical', 'platform fee pid recovery failed',
+          `rewards wallet account ${account.id}: ${err?.message || err} — ordinary attribution continues; recovery retries next tick`,
+          { dedupeKey: 'platform-fee-pid-recovery-failed' })
+      }
     }
 
     // The candidate watermark counts MINED rows only (mempool IDs are

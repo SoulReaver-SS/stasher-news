@@ -152,8 +152,9 @@ now means the invoice destination stored in the PayIn's `moneroUri`.
 
 - **One issuer.** `api/monero/ownerFeeLeg.js` `createFeeLeg` mints a `fee:` HMAC
   pid, folds it into the recipient's primary as an integrated address, quotes
-  the FULL amount, registers an lws webhook and writes a `SubFeePidMap` intent
-  (the table keeps its historical name). Platform legs (`createPlatformFeeLeg`,
+  the FULL amount and writes a `SubFeePidMap` intent (the table keeps its
+  historical name). Only owner-routed legs register an lws webhook; platform
+  legs need none (see Observation paths). Platform legs (`createPlatformFeeLeg`,
   `feeType` set) pay the rewards wallet primary `(0,0)`; owner-routed legs pay
   the turf owner as before. The PayIn carries `moneroPaymentId` and no
   subaddress coordinates. Every issuer shares the per-user `throttleFeeIssuance`.
@@ -171,13 +172,17 @@ now means the invoice destination stored in the PayIn's `moneroUri`.
   count only height-bearing DETECTED/CONFIRMED receipts against a positive full
   quote that agrees with the intent. A boost bumps by the actual amount exactly
   once, at that transition (no quote gate).
-- **Observation paths.** The lws webhook is primary (platform legs fail closed
-  with 503 when the frozen recipient cannot verify); `rewardsWalletObserver`
-  books served-pid platform receipts with no time window; the hourly
-  `reconcileOwnerFeeLegs` job (legacy name) recovers missed callbacks and
-  wrong-pid lws rows for both destinations during the 7-day intent retention,
-  including PayIn-less (abandoned) platform intents. `confirmFinalizer` never
-  height-stamps a pid-bound receipt.
+- **Observation paths.** Platform fees: `rewardsWalletObserver` (every minute)
+  books served-pid receipts, and `worker/platformFeePidRecovery.js` re-derives
+  the pid from the raw tx with the rewards view key for lws rows carrying a
+  wrong (payer-side) decrypted pid — over the full-history response the
+  observer already fetches, mined primary-address rows only, memoized, no time
+  window. Owner fees: the lws webhook is primary. The hourly
+  `reconcileOwnerFeeLegs` job (legacy name) is the backstop for both during
+  the 7-day intent retention (missed callbacks, failed-flip gate replays,
+  PayIn-less platform intents). A platform callback, if lws ever delivers one,
+  fails closed with 503 when the frozen recipient cannot verify.
+  `confirmFinalizer` never height-stamps a pid-bound receipt.
 - **Late payments.** `SubFeePidMap.expiresAt` is webhook retention, not address
   validity; intents are never deleted. A payment after abandonment is recorded
   as cash with `payInId NULL` and alerted — it never revives deleted content or

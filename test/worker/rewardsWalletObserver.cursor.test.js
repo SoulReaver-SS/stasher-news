@@ -93,11 +93,11 @@ describe('the deployment blocker regression (pending IDs vs mined watermark)', (
     const lws = { getAddressTxs: jest.fn(async () => response) }
     const detectReorg = jest.fn()
 
-    await rewardsWalletObserver({ models, lws, detectReorg })
+    await rewardsWalletObserver({ models, lws, detectReorg, rawReader: null })
     expect(account.lastTxId).toBe(9n) // pending IDs must not advance the watermark
 
     response = { blockchain_height: 101, transactions: [minedFee(10)] }
-    await rewardsWalletObserver({ models, lws, detectReorg })
+    await rewardsWalletObserver({ models, lws, detectReorg, rawReader: null })
 
     // The mined fee (ID 10, BELOW the pending IDs) was still attributed.
     expect(models.payIn.findFirst).toHaveBeenCalledWith(expect.objectContaining({
@@ -119,14 +119,14 @@ describe('failure, replay and concurrency guards', () => {
     const response = { blockchain_height: 101, transactions: [minedFee(10)] }
     const lws = { getAddressTxs: jest.fn(async () => response) }
 
-    await expect(rewardsWalletObserver({ models, lws, detectReorg: jest.fn() }))
+    await expect(rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null }))
       .rejects.toThrow('insert failed')
     expect(models.moneroAccount.updateMany).not.toHaveBeenCalled()
     expect(account.lastTxId).toBe(9n)
 
     // Retry succeeds; the (idempotent) attribution runs once more, then the
     // cursor persists exactly once.
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(models.$queryRaw).toHaveBeenCalledTimes(2)
     expect(account.lastTxId).toBe(10n)
   })
@@ -136,7 +136,7 @@ describe('failure, replay and concurrency guards', () => {
     const response = { blockchain_height: 101, transactions: [minedFee(10)] }
     const lws = { getAddressTxs: jest.fn(async () => response) }
 
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() }) // filtered by cursor
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null }) // filtered by cursor
     expect(models.$queryRaw).not.toHaveBeenCalled()
     expect(models.moneroAccount.updateMany).not.toHaveBeenCalled()
     expect(account.lastTxId).toBe(10n)
@@ -151,8 +151,8 @@ describe('failure, replay and concurrency guards', () => {
 
     // Run A (slow) computes its proposal from the small response; run B (fast)
     // commits 12n before A's guarded write lands.
-    const runA = rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    const runA = rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     await runA
 
     expect(account.lastTxId).toBe(12n)
@@ -168,7 +168,7 @@ describe('failure, replay and concurrency guards', () => {
     const { account, models } = buildFixture({ initialCursor: null })
     const response = { blockchain_height: 101, transactions: [{ ...minedFee(0, 6), hash: 'fee-0' }] }
     const lws = { getAddressTxs: jest.fn(async () => response) }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(models.moneroAccount.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       data: { lastTxId: 0n }
     }))
@@ -182,7 +182,7 @@ describe('failure, replay and concurrency guards', () => {
       transactions: [minedFee(10), { id: 11, height: 100, mempool: true }]
     }
     const lws = { getAddressTxs: jest.fn(async () => response) }
-    await expect(rewardsWalletObserver({ models, lws, detectReorg: jest.fn() }))
+    await expect(rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null }))
       .rejects.toThrow(TypeError)
     expect(models.$queryRaw).not.toHaveBeenCalled()
     expect(models.moneroAccount.updateMany).not.toHaveBeenCalled()
@@ -192,7 +192,7 @@ describe('failure, replay and concurrency guards', () => {
   test('an empty response writes nothing', async () => {
     const { account, models } = buildFixture()
     const lws = { getAddressTxs: jest.fn(async () => ({ blockchain_height: 101, transactions: [] })) }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(models.moneroAccount.updateMany).not.toHaveBeenCalled()
     expect(account.lastTxId).toBe(9n)
   })
@@ -204,7 +204,7 @@ describe('failure, replay and concurrency guards', () => {
         blockchain_height: 101, transactions: [pendingRow(4)]
       }))
     }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(models.moneroAccount.updateMany).not.toHaveBeenCalled()
     expect(account.lastTxId).toBeNull()
   })
@@ -227,11 +227,11 @@ describe('other dispatcher branches stay routed through the fresh slice', () => 
         transactions: [minedFee(1, 7), minedFee(2, 7)]
       }))
     }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(inserts).toHaveLength(2)
 
     // Replay: both rows are behind the cursor -> no third insert attempt.
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(inserts).toHaveLength(2)
     expect(account.lastTxId).toBe(2n)
   })
@@ -255,7 +255,7 @@ describe('other dispatcher branches stay routed through the fresh slice', () => 
         transactions: [{ id: 3, hash: 'dv-3', height: 50, mempool: false, piconeros: 1n, recipient: { maj_i: 0, min_i: 0 }, payment_id: 'dv0000000000001' }]
       }))
     }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(models.downvotePidMap.findUnique).toHaveBeenCalled()
     expect(account.lastTxId).toBe(3n)
   })
@@ -265,9 +265,26 @@ describe('other dispatcher branches stay routed through the fresh slice', () => 
     const { account, models } = buildFixture({ initialCursor: 9n })
     const txs = [minedFee(10)]
     const lws = { addressTxsMode: 'full', getAddressTxs: jest.fn(async () => ({ blockchain_height: 101, transactions: txs })) }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(lws.getAddressTxs).toHaveBeenCalledTimes(1)
     expect(reconcileBountyReceipts).toHaveBeenCalledWith(expect.objectContaining({ transactions: txs }))
+    expect(account.lastTxId).toBe(10n)
+  })
+
+  test('platform fee raw-pid recovery runs on the same full-history response and cannot block the cursor', async () => {
+    const { account, models } = buildFixture({ initialCursor: 9n })
+    account.viewKey = { ciphertext: Buffer.alloc(0) }
+    models.feeObservation.findMany = jest.fn().mockResolvedValue([])
+    models.observedDownvote = { findMany: jest.fn().mockResolvedValue([]) }
+    const primary = { id: 10, hash: 'pr-10', height: 50, mempool: false, piconeros: 1n, recipient: { maj_i: 0, min_i: 0 } }
+    const lws = { addressTxsMode: 'full', getAddressTxs: jest.fn(async () => ({ blockchain_height: 101, transactions: [primary] })) }
+    // a failing daemon read: the pass alerts and the tick still completes
+    const rawReader = { read: jest.fn(async () => { throw new Error('monerod down') }) }
+    const { alert } = require('../../lib/alert')
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader })
+    expect(lws.getAddressTxs).toHaveBeenCalledTimes(1) // no extra lws request
+    expect(rawReader.read).toHaveBeenCalledWith(['pr-10'])
+    expect(alert).toHaveBeenCalledWith('critical', 'platform fee pid recovery failed', expect.any(String), expect.anything())
     expect(account.lastTxId).toBe(10n)
   })
 
@@ -284,7 +301,7 @@ describe('other dispatcher branches stay routed through the fresh slice', () => 
           : { blockchain_height: 101, transactions: recovery }
       })
     }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(lws.getAddressTxs).toHaveBeenCalledTimes(2)
     expect(reconcileBountyReceipts).toHaveBeenCalledWith(expect.objectContaining({ transactions: recovery }))
     expect(account.lastTxId).toBe(10n)
@@ -295,7 +312,7 @@ describe('other dispatcher branches stay routed through the fresh slice', () => 
     const { models } = buildFixture({ initialCursor: null })
     const txs = [minedFee(1, 8)]
     const lws = { getAddressTxs: jest.fn(async () => ({ blockchain_height: 101, transactions: txs })) }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(lws.getAddressTxs).toHaveBeenCalledTimes(1)
     expect(reconcileBountyReceipts).toHaveBeenCalledWith(expect.objectContaining({ transactions: txs }))
   })
@@ -311,7 +328,7 @@ describe('other dispatcher branches stay routed through the fresh slice', () => 
         blockchain_height: 101, transactions: [minedFee(10)]
       }))
     }
-    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn() })
+    await rewardsWalletObserver({ models, lws, detectReorg: jest.fn(), rawReader: null })
     expect(logError).toHaveBeenCalled()
     expect(alert).toHaveBeenCalledWith('critical', 'bounty receipt recovery failed', expect.any(String), expect.anything())
     expect(account.lastTxId).toBe(10n)

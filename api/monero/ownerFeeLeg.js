@@ -18,9 +18,14 @@ export const FEE_PID_TTL_MS = 7 * 86_400_000
 /**
  * Build an integrated-address fee leg paying `recipientAccount`: HMAC fee:
  * payment id, integrated address derived from the recipient's registered
- * primary, a monero: URI quoting the FULL amount, an lws tx-confirmation
- * webhook on (recipient address, pid), and a SubFeePidMap row freezing the
- * recipient (account id + address snapshot) and the attribution receipts copy.
+ * primary, a monero: URI quoting the FULL amount, and a SubFeePidMap row
+ * freezing the recipient (account id + address snapshot) and the attribution
+ * receipts copy. OWNER legs also register an lws tx-confirmation webhook on
+ * (recipient address, pid): nothing else watches an owner wallet promptly.
+ * PLATFORM legs register none — rewardsWalletObserver scans the rewards
+ * wallet every minute (served pids, plus raw-pid recovery for lws's
+ * wrong-pid rows) and gates only open on mined receipts, so a webhook would
+ * add lws load without adding speed.
  * Called from payIn getInitial (before the PayIn exists — the URI is only
  * returned to the client after begin() commits, so a payment can never
  * precede the PayIn). A failed webhook or map write fails issuance, so no
@@ -41,14 +46,16 @@ export async function createFeeLeg (models, monero = lwsClient, {
     { description }
   )
 
-  const webhook = await monero.addWebhook({
-    type: 'tx-confirmation',
-    url: process.env.LWS_WEBHOOK_URL,
-    address: recipientAccount.address,
-    paymentId,
-    token: process.env.LWS_WEBHOOK_TOKEN || '',
-    confirmations: REQUIRED_CONFIRMATIONS
-  })
+  const webhook = feeType != null
+    ? null
+    : await monero.addWebhook({
+      type: 'tx-confirmation',
+      url: process.env.LWS_WEBHOOK_URL,
+      address: recipientAccount.address,
+      paymentId,
+      token: process.env.LWS_WEBHOOK_TOKEN || '',
+      confirmations: REQUIRED_CONFIRMATIONS
+    })
 
   await models.subFeePidMap.create({
     data: {
@@ -56,7 +63,7 @@ export async function createFeeLeg (models, monero = lwsClient, {
       subName,
       ownerUserId,
       amountPiconeros,
-      webhookEventId: webhook.event_id ?? null,
+      webhookEventId: webhook?.event_id ?? null,
       expiresAt: new Date(now.getTime() + FEE_PID_TTL_MS),
       recipientAccountId: recipientAccount.id,
       recipientAddress: recipientAccount.address,

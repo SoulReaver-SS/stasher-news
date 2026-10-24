@@ -741,8 +741,10 @@ export async function handleWebhook (req, res, models = prisma, monero = lwsClie
     const platform = feeMapRow?.feeType != null
     const feeAccount = await resolveFeeAccount(models, feeMapRow)
     const context = feePayIn ? `fee ${feePayIn.id}` : `abandoned fee ${paymentId}`
-    // Platform receipts fund rewards and unlock content, so they never take
-    // the documented legacy owner fail-open: an unscannable (or no longer
+    // Platform legs register no webhook (rewardsWalletObserver is their
+    // per-minute path), so this only runs for a callback lws delivers anyway;
+    // it must still be safe. Platform receipts fund rewards and unlock
+    // content, so they never take the documented legacy owner fail-open: an unscannable (or no longer
     // snapshot-matching) recipient defers with 503 so lws retries, and the
     // hourly reconciler recovers once it is scannable again.
     if (platform && (!feeAccount?.viewKey || feeAccount.status !== 'ACTIVE')) {

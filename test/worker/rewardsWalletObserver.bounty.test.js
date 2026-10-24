@@ -407,7 +407,7 @@ function lwsIncoming ({ hash, piconeros, height = 700, id = 1, major = 0, minor 
     await prisma.moneroAccount.update({ where: { id: rewardsWallet.id }, data: { lastTxId: 50n } })
     const lws = { getAddressTxs: jest.fn().mockResolvedValue({ transactions: [incoming], blockchain_height: 800 }) }
 
-    await rewardsWalletObserver({ models: prisma, lws })
+    await rewardsWalletObserver({ models: prisma, lws, rawReader: null })
 
     expect(await prisma.feeObservation.count({ where: { txHash: hash } })).toBe(0)
     expect(alert).toHaveBeenCalledWith(
@@ -420,7 +420,7 @@ function lwsIncoming ({ hash, piconeros, height = 700, id = 1, major = 0, minor 
     // Metadata lands; the next poll's full-history recovery pass books the
     // receipt even though the cursor stays past the output.
     await prisma.bountyPayment.update({ where: { id: payout.id }, data: { recipientReceivedPiconeros: 139n } })
-    await rewardsWalletObserver({ models: prisma, lws })
+    await rewardsWalletObserver({ models: prisma, lws, rawReader: null })
 
     const rows = await prisma.feeObservation.findMany({ where: { txHash: hash } })
     expect(rows).toHaveLength(1)

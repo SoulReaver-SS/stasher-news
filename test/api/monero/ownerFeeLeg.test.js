@@ -96,7 +96,8 @@ describe('createPlatformFeeLeg', () => {
     expect(moneroUriAddress(leg.moneroUri)).toHaveLength(106)
     expect(leg.moneroUri).not.toContain('tx_payment_id')
     expect(moneroUriAmountPiconeros(leg.moneroUri)).toBe(2_000_000_000n)
-    expect(monero.hooks[0]).toMatchObject({ address: PLATFORM, paymentId: leg.paymentId })
+    // no lws webhook: the per-minute rewards-wallet observer is the platform path
+    expect(monero.hooks).toHaveLength(0)
     expect(models.created[0]).toEqual(expect.objectContaining({
       paymentId: leg.paymentId,
       feeType: 'TERRITORY_BILLING',
@@ -106,7 +107,7 @@ describe('createPlatformFeeLeg', () => {
       amountPiconeros: 2_000_000_000n,
       recipientAccountId: 91,
       recipientAddress: PLATFORM,
-      webhookEventId: '555',
+      webhookEventId: null,
       expiresAt: new Date(now.getTime() + FEE_PID_TTL_MS)
     }))
   })
@@ -130,11 +131,13 @@ describe('createPlatformFeeLeg', () => {
     expect(monero.hooks).toHaveLength(0)
   })
 
-  it('exposes no invoice when the webhook or the intent write fails', async () => {
+  it('exposes no invoice when the owner webhook or the intent write fails', async () => {
     const failingHook = { addWebhook: async () => { throw new Error('lws down') } }
     const models = mockModels()
-    await expect(createPlatformFeeLeg(models, failingHook, { me: { id: 7 }, feeType: 'POSTING', amountPiconeros: 1n, description: 'x' })).rejects.toThrow('lws down')
+    await expect(createOwnerFeeLeg(models, failingHook, { me: { id: 7 }, ownerAccount: { id: 9, address: PRIMARY, ownerUserId: 42 }, subName: 't', amountPiconeros: 1n, description: 'x' })).rejects.toThrow('lws down')
     expect(models.created).toHaveLength(0)
+    // a platform leg never depends on lws at issuance
+    await expect(createPlatformFeeLeg(mockModels(), failingHook, { me: { id: 7 }, feeType: 'POSTING', amountPiconeros: 1n, description: 'x' })).resolves.toMatchObject({ paymentId: expect.any(String) })
     const brokenMap = { ...mockModels(), subFeePidMap: { create: async () => { throw new Error('db down') } } }
     await expect(createPlatformFeeLeg(brokenMap, mockMonero(), { me: { id: 7 }, feeType: 'POSTING', amountPiconeros: 1n, description: 'x' })).rejects.toThrow('db down')
   })
@@ -147,12 +150,12 @@ describe('createPlatformFeeLeg', () => {
     await expect(createPlatformFeeLeg(models, monero, args)).rejects.toThrow(/too many fee reservations/)
     // owner legs draw from the same budget
     await expect(createOwnerFeeLeg(models, monero, { me: { id: 7 }, ownerAccount: { id: 9, address: PRIMARY, ownerUserId: 42 }, subName: 't', amountPiconeros: 1n, description: 'x' })).rejects.toThrow(/too many fee reservations/)
-    expect(monero.hooks).toHaveLength(FEE_RESERVE_ATTEMPTS_PER_USER)
+    expect(monero.hooks).toHaveLength(0)
     expect(models.created).toHaveLength(FEE_RESERVE_ATTEMPTS_PER_USER)
   })
 
   it('is the only caller of resolvePlatformFeeRecipient (one place picks the receiving wallet)', () => {
-    const hits = execSync("grep -rln 'resolvePlatformFeeRecipient' api worker pages lib", { encoding: 'utf8' })
+    const hits = execSync("grep -rln --include=*.js 'resolvePlatformFeeRecipient' api worker pages lib", { encoding: 'utf8' })
       .trim().split('\n').sort()
     expect(hits).toEqual(['api/monero/feePool.js', 'api/monero/ownerFeeLeg.js'])
   })
