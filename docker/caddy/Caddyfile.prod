@@ -15,6 +15,23 @@
 stasher.news {
 	encode zstd gzip
 
+	# Maintenance switch: while the flag file exists, the site serves the static
+	# maintenance page (503 + Retry-After) for every path — even when the app and
+	# db are down. Toggling is instant; no caddy reload or restart is needed:
+	#   ON:  touch docker/caddy/maintenance/enabled
+	#   OFF: rm docker/caddy/maintenance/enabled
+	# Try-paths resolve against Caddy's working directory (/srv in the official
+	# image), where docker-compose.yml mounts ./docker/caddy/maintenance.
+	@maintenance file maintenance/enabled
+	handle @maintenance {
+		root * /srv/maintenance
+		rewrite * /index.html
+		file_server {
+			status 503
+		}
+		header Retry-After 3600
+	}
+
 	# Media uploads: same-origin /uploads is reverse-proxied to the media S3
 	# service (SeaweedFS behind an HTTP-only proxy) so browsers can POST
 	# presigned uploads and GET objects over TLS without a second host (no

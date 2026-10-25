@@ -117,3 +117,6 @@ docs/presentation/
 # local review screenshots / mockups (never commit)
 /*.png
 /.playwright-mcp/
+
+# maintenance switch runtime flag (created/removed by the operator; see docker/caddy/maintenance)
+docker/caddy/maintenance/enabled

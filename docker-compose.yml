@@ -376,6 +376,8 @@ services:
     volumes:
       # dev default; prod deploys set CADDYFILE=./docker/caddy/Caddyfile.prod
       - ${CADDYFILE:-./docker/caddy/Caddyfile}:/etc/caddy/Caddyfile:ro
+      # maintenance switch: static page + flag file (see docker/caddy/maintenance)
+      - ./docker/caddy/maintenance:/srv/maintenance:ro
       - caddy_data:/data
       - caddy_config:/config
     cpu_shares: "${CPU_SHARES_LOW}"
