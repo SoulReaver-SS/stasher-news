@@ -124,9 +124,21 @@ describe('CLI', () => {
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
+  // The CI job sets NEXT_PUBLIC_AWS_UPLOAD_BUCKET job-wide for the upload
+  // suites; inherited, it completes the half-set credential cases below
+  // instead of failing them. Strip the renderer's inputs so each case sees
+  // exactly the environment it declares.
+  const MEDIA_ENV_KEYS = [
+    'MEDIA_AWS_ACCESS_KEY_ID',
+    'MEDIA_AWS_SECRET_ACCESS_KEY',
+    'NEXT_PUBLIC_AWS_UPLOAD_BUCKET'
+  ]
+
   function runCli (env) {
+    const inherited = { ...process.env }
+    for (const key of MEDIA_ENV_KEYS) delete inherited[key]
     return execFileSync(process.execPath, [SCRIPT, path.join(dir, 's3.config.json')], {
-      env: { ...process.env, ...env },
+      env: { ...inherited, ...env },
       stdio: ['ignore', 'pipe', 'pipe']
     }).toString()
   }

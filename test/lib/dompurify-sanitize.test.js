@@ -34,10 +34,12 @@ test('server sanitizer strips hostile markup, keeps reader markup, stays stable'
   expect(out.sample).toBe('<img src="x"><p>safe</p>')
 })
 
-test('per-call cost on an item-sized document stays single-digit milliseconds', () => {
+test('per-call cost on an item-sized document stays interactive on shared runners', () => {
   const out = runSanitizerChild()
-  // informational guard, not a hard perf contract: catches order-of-
-  // magnitude regressions (a jsdom path falling back to something quadratic)
+  // Magnitude guard, not a hard perf contract: catches order-of-magnitude
+  // regressions (a jsdom path falling back to something quadratic). CI's
+  // 2-core shared runners measured 57-104ms for this same code (2026-10-25),
+  // so the ceiling must tolerate that noise or it fails on every run.
   expect(out.itemSizedBytes).toBeGreaterThan(50000)
-  expect(out.itemSizedMs).toBeLessThan(50)
+  expect(out.itemSizedMs).toBeLessThan(500)
 })

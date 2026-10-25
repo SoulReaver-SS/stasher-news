@@ -434,14 +434,17 @@ test('a reader that waited past its scan budget defers without another RPC', asy
 
   const firstRead = reader.read(hashes)
   await new Promise(resolve => setImmediate(resolve))
-  const waitingRead = reader.read(hashes)
+  // Attach the catch at creation: the deferred read may reject while the test
+  // is still awaiting firstRead, and an unhandled rejection fails the test on
+  // loaded CI runners even though production always awaits read() directly.
+  const waitingRead = reader.read(hashes).catch(e => e)
   clock = 100
   releaseFirstBatch()
 
   const first = await firstRead
   expect(first.missingHashes).toEqual([])
 
-  const err = await waitingRead.catch(e => e)
+  const err = await waitingRead
   expect(err.code).toBe('RAW_SCAN_BUDGET_EXHAUSTED')
   expect(daemon.getTransactions).toHaveBeenCalledTimes(1)
 })
