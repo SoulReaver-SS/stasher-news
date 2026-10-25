@@ -880,6 +880,18 @@ sndev__monero__requeue() {
   docker__compose exec -T -u apprunner app npx tsx --tsconfig jsconfig.json scripts/requeue-failed-payouts.js "$@"
 }
 
+sndev__monero__makeup() {
+  __sndev_monero_ensure_up
+  echo "Approving a breaker make-up (dry-run unless --confirm)..."
+  docker__compose exec -T -u apprunner app npx tsx --tsconfig jsconfig.json scripts/approve-curator-makeup.js "$@"
+}
+
+sndev__monero__backfill_budget() {
+  __sndev_monero_ensure_up
+  echo "Backfilling curator budget history (dry-run unless --confirm)..."
+  docker__compose exec -T -u apprunner app npx tsx --tsconfig jsconfig.json scripts/backfill-curator-budget-history.js "$@"
+}
+
 sndev__monero__rotate_master_key() {
   __sndev_monero_ensure_up
   if [ -z "${VIEWKEY_NEW_MASTER_KEY:-}" ]; then
@@ -898,7 +910,7 @@ sndev__monero__rotate_master_key() {
 sndev__monero() {
   shift
   if [ $# -eq 0 ]; then
-    echo "Usage: sndev monero {status|accounts|add_account|faucet|rescan|register-rewards-wallet|register-bounty-escrow-wallet|derive-fee-pool|distribute|requeue|rotate-master-key}" >&2
+    echo "Usage: sndev monero {status|accounts|add_account|faucet|rescan|register-rewards-wallet|register-bounty-escrow-wallet|derive-fee-pool|distribute|requeue|makeup|backfill-budget|rotate-master-key}" >&2
     return 1
   fi
   sub="$1"; shift
@@ -913,6 +925,8 @@ sndev__monero() {
     derive-fee-pool)         sndev__monero__derive_fee_pool "$@" ;;
     distribute)              sndev__monero__distribute "$@" ;;
     requeue)                  sndev__monero__requeue "$@" ;;
+    makeup)                   sndev__monero__makeup "$@" ;;
+    backfill-budget)          sndev__monero__backfill_budget "$@" ;;
     rotate-master-key)       sndev__monero__rotate_master_key "$@" ;;
     *) echo "Unknown subcommand: monero $sub" >&2; return 1 ;;
   esac
@@ -933,6 +947,9 @@ COMMANDS
   rescan <addr> <height>         rescan an account from <height>
   distribute                    run one weekly rewards distribution now
   requeue <id> [flags]        requeue stranded rewards payouts (dry-run default; --confirm --no-send)
+  makeup <id> [--confirm]      approve a breaker make-up for the following weekly run (dry-run default)
+  backfill-budget [--periods N] [--confirm]
+                                fill recent curator budget history (dry-run default; N defaults to 12)
   rotate-master-key             re-wrap MoneroViewKey rows under the new master key
                                 (set VIEWKEY_NEW_MASTER_KEY; see scripts/rotate-master-key.js)
 "

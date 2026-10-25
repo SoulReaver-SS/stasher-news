@@ -5,6 +5,7 @@ import Layout from '@/components/layout'
 import { useQuery } from '@apollo/client/react'
 import Link from 'next/link'
 import { piconerosToXmr, piconerosToMXmr } from '@/lib/format'
+import { copyDrawdownWeeks, formatMultiple } from '@/lib/curatorBudgetCopy'
 import PageLoading from '@/components/page-loading'
 import { useShowModal } from '@/components/modal'
 import dynamic from 'next/dynamic'
@@ -16,7 +17,6 @@ import { useMemo } from 'react'
 import { CompactLongCountdown } from '@/components/countdown'
 import { payTypeShortName } from '@/lib/pay-in'
 import DonateModal from '@/components/donate-modal'
-import { CURATOR_FALLBACK_CAP_PICONEROS } from '@/lib/rewardsAccounting'
 
 const GrowthPieChart = dynamic(() => import('@/components/charts').then(mod => mod.GrowthPieChart), {
   loading: () => <GrowthPieChartSkeleton />
@@ -31,6 +31,21 @@ const REWARDS_FULL = gql`
       name
       value
     }
+  }
+  curatorBudget {
+    mode
+    fallbackBudgetPiconeros
+    projectedPiconeros
+    multBps
+    targetMultBps
+    t4Piconeros
+    targetPiconeros
+    reservePiconeros
+    spendLimitPiconeros
+    drawdownWeeks
+    dynamicBudgetMode
+    windingDown
+    breakerTripped
   }
 }
 `
@@ -54,6 +69,83 @@ export function RewardLine ({ total, time, xmr }) {
   )
 }
 
+function toBigInt (value) {
+  return typeof value === 'bigint' ? value : BigInt(value)
+}
+
+export { DEFAULT_DRAWDOWN_WEEKS } from '@/lib/curatorBudgetCopy'
+
+// This week's spending-limit sentence (spec §10, amended 2026-10-21). The
+// projection's outcome names the binding cap: FULL — the limit
+// sits above the target; DRAWDOWN — the limit binds and sets the effective
+// multiple; POOL_SHORT — the pool itself, not the drawdown, is the binding cap.
+export function limitSentence (budget) {
+  if (budget?.spendLimitPiconeros == null || budget?.projectedPiconeros == null) return null
+  const limit = piconerosToXmr(toBigInt(budget.spendLimitPiconeros))
+  if (budget.dynamicBudgetMode === 'POOL_SHORT') {
+    return `the pool itself bounds this week's spending to ${piconerosToXmr(toBigInt(budget.projectedPiconeros))}`
+  }
+  if (budget.dynamicBudgetMode === 'DRAWDOWN') {
+    return `the pool can spend up to ${limit} this week (income plus 1/${copyDrawdownWeeks(budget)} of its reserve), ` +
+      `so the multiple is ${formatMultiple(budget.multBps) ?? '0×'}`
+  }
+  return `the pool can spend up to ${limit} this week, more than the budget needs`
+}
+
+export function CuratorBudgetCopy ({ budget }) {
+  const mode = budget?.mode ?? 'LEGACY'
+  const fallback = toBigInt(budget?.fallbackBudgetPiconeros ?? 0)
+  const projected = budget?.projectedPiconeros
+  // The EFFECTIVE multiple only. When T4 = 0 the budget is 0 and no effective
+  // multiple exists (0/0) — render 0×, never the configured target k.
+  const multiple = formatMultiple(budget?.multBps) ?? '0×'
+
+  if (mode === 'ACTIVE' && projected != null) {
+    const multipleText = budget.windingDown ? `${multiple}: pool winding down` : `${multiple} recent curator tips`
+    return (
+      <>
+        <p className='text-center text-muted mb-0'>
+          Projected curator budget this week: {piconerosToXmr(toBigInt(projected))}
+          {multipleText && <span> ({multipleText})</span>}
+        </p>
+        <p className='text-center text-muted'>
+          <small>
+            {budget.t4Piconeros != null && <>T4 {piconerosToXmr(toBigInt(budget.t4Piconeros))} · </>}
+            {limitSentence(budget)}
+          </small>
+          <br />
+          <small><small>This is a projection; it is final at Monday 00:00 UTC.</small></small>
+        </p>
+      </>
+    )
+  }
+
+  let shadowLine = null
+  if (mode === 'SHADOW' && projected != null) {
+    shadowLine = `Under the proposed dynamic budget this would be about ${piconerosToXmr(toBigInt(projected))}` +
+      ` (${multiple} recent curator tips).`
+  }
+
+  return (
+    <>
+      <p className='text-center text-muted'>
+        Up to {piconerosToXmr(fallback)} for curators at the next weekly distribution.
+        Remaining funds roll over to the following week.
+      </p>
+      {shadowLine && (
+        <p className='text-center text-muted fst-italic mb-0'>
+          <small>{shadowLine}</small>
+        </p>
+      )}
+      {mode === 'ACTIVE' && (
+        <p className='text-center text-muted mb-0'>
+          <small>The live projection is temporarily unavailable, please check back shortly. Payouts are unaffected: curators receive the dynamic budget calculated at Monday's distribution, or the fallback cap above only if that calculation cannot run.</small>
+        </p>
+      )}
+    </>
+  )
+}
+
 export default function Rewards ({ ssrData }) {
   // only poll for updates to rewards
   const { data } = useQuery(
@@ -73,7 +165,6 @@ export default function Rewards ({ ssrData }) {
   }, [dat])
 
   if (!dat) return <PageLoading />
-  const curatorBudget = BigInt(total) < CURATOR_FALLBACK_CAP_PICONEROS ? BigInt(total) : CURATOR_FALLBACK_CAP_PICONEROS
 
   return (
     <Layout footerLinks>
@@ -94,10 +185,7 @@ export default function Rewards ({ ssrData }) {
                 <small><small><small>wallet transparency</small></small></small>
               </Link>
             </h3>
-            <p className='text-center text-muted'>
-              Up to {piconerosToXmr(curatorBudget)} for curators at the next weekly distribution.
-              Remaining funds roll over to the following week.
-            </p>
+            <CuratorBudgetCopy budget={dat.curatorBudget} />
             {sources?.length > 0 &&
               <div className='my-3 w-100'>
                 <GrowthPieChart data={sources} />

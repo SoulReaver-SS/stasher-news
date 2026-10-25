@@ -1,6 +1,6 @@
 import { Prisma } from '@prisma/client'
 import createPrisma from '@/lib/create-prisma'
-import { computeCuratorShares, effectiveTrustWeightFloor, resolveExcludedCuratorIds } from './curatorShares'
+import { computeCuratorShares, resolveExcludedCuratorIds } from './curatorShares'
 import { sendPayouts as defaultSendPayouts, getRewardsWallet } from '@/api/monero/rewards'
 import { reconcileWalletTransactions, errorLabel } from '@/api/monero/rewardsTransactions'
 import logger, { logInfo, logError } from '@/lib/logger'
@@ -10,6 +10,7 @@ import { opsCarry, walletScope, CURATOR_FALLBACK_CAP_PICONEROS } from '@/lib/rew
 import { readRewardsInflow } from '@/api/monero/rewardsInflow'
 import { readRewardsWalletLedger } from '@/api/monero/rewardsLedger'
 import { withRewardsPhase } from './rewardsPhase'
+import { incomeFromInflow, planCuratorBudget, readTrustWeighting } from './curatorBudget'
 
 // rewardsDistributor — StasherNews' weekly rewards-pool distribution job
 // (Phase 4 Task 8 / design spec §5, §6.2). Each week it:
@@ -18,9 +19,14 @@ import { withRewardsPhase } from './rewardsPhase'
 //      posting/territory fees) for the period;
 //   2. applies the PlatformFeeConfig allocation split to get the rewards earmark;
 //   3. adds the prior period's rolledOverPiconeros to form the pool;
-//   4. calls computeCuratorShares (Task 7) to apportion up to the 0.2 XMR
-//      fallback cap to the curators (tippers) of the period's top content;
-//   5. writes one RewardDistribution row + one QUEUED RewardPayout per curator
+//   4. plans the week's curator budget (spec 2026-10-19): LEGACY/SHADOW and
+//      every failure path pay min(pool, 0.2 XMR fallback cap), ACTIVE pays
+//      min(target, limit, pool) — target = k × T4 + an approved breaker
+//      make-up, limit = the reserve drawdown limit. Every mode records T, F,
+//      the budget inputs/results and the breaker state;
+//   5. calls computeCuratorShares (Task 7) to apportion that budget across the
+//      curators (tippers) of the period's top content;
+//   6. writes one RewardDistribution row + one QUEUED RewardPayout per curator
 //      who has a registered receiving address. Curators with no address are
 //      excluded — their share joins the rollover.
 //
@@ -42,6 +48,131 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 const DAY_MS = 24 * 60 * 60 * 1000
 
 const DISTRIBUTION_STATUS_GAUGE = { PENDING: 0, SENDING: 1, COMPLETE: 2, FAILED: 3 }
+
+// Serialization/deadlock errors must escape the budget SAVEPOINT: retrying the
+// whole Serializable ledger transaction (the caller's/scheduler's job) is the
+// only safe response. Prisma reports a write conflict as P2034; a raw SQL
+// SERIALIZABLE failure or deadlock is P2010 with meta.code 40001 / 40P01.
+// Shapes verified by forced conflicts on PostgreSQL 16 / Prisma 5.20.0.
+export function isSerializationFailure (err) {
+  if (!err) return false
+  if (err.code === 'P2034') return true
+  const code = String(err.meta?.code ?? err.code ?? '')
+  return code === '40001' || code === '40P01'
+}
+
+// Run `fn` inside a PostgreSQL SAVEPOINT so a planning error can be rolled back
+// without aborting the surrounding Serializable ledger transaction. Static SQL
+// only: these statements are code-owned, never user input.
+export async function withSavepoint (tx, fn) {
+  await tx.$executeRaw`SAVEPOINT curator_budget`
+  try {
+    const result = await fn()
+    await tx.$executeRaw`RELEASE SAVEPOINT curator_budget`
+    return result
+  } catch (err) {
+    try {
+      await tx.$executeRaw`ROLLBACK TO SAVEPOINT curator_budget`
+    } catch { /* the original error wins; the outer transaction aborts anyway */ }
+    throw err
+  }
+}
+
+// Planning-failure fallback: pay min(pool, 0.2 XMR) exactly like LEGACY. The
+// record is deliberately minimal (no fabricated T/F/budget figures); the
+// caller raises a CRITICAL alert after commit.
+function fallbackCapPlan (poolPiconeros, error) {
+  const applied = poolPiconeros < CURATOR_FALLBACK_CAP_PICONEROS
+    ? poolPiconeros
+    : CURATOR_FALLBACK_CAP_PICONEROS
+  return {
+    appliedCuratorBudgetPiconeros: applied,
+    record: {
+      curatorBudgetMode: 'LEGACY',
+      appliedCuratorBudgetPiconeros: applied,
+      curatorBudgetParams: { errors: ['planning_failed'] }
+    },
+    breaker: null,
+    configErrors: [],
+    fallbackError: error
+  }
+}
+
+// The shared logger has no redaction, so a planning failure gets a curated,
+// bounded diagnostic: name/code, the PostgreSQL SQLSTATE (meta.code), the
+// message and a short stack, with credential-shaped text scrubbed. The raw
+// error object and arbitrary properties (meta/cause/config/request) are never
+// logged — a Prisma/SQL error can carry connection details or bound payloads.
+const DIAGNOSTIC_MESSAGE_MAX = 800
+const DIAGNOSTIC_STACK_MAX = 1200
+const CREDENTIAL_ASSIGNMENT_QUOTED = /((?:password|passwd|secret(?:[_-]?key)?|token|auth(?:orization)?|api[_-]?key|private[_-]?key|spend[_-]?key|view[_-]?key|access[_-]?key|session|cookie|mnemonic|seed)["']?\s*[=:]\s*)(["'])([\s\S]*?)\2/gi
+const CREDENTIAL_ASSIGNMENT_BARE = /((?:password|passwd|secret(?:[_-]?key)?|token|auth(?:orization)?|api[_-]?key|private[_-]?key|spend[_-]?key|view[_-]?key|access[_-]?key|session|cookie|mnemonic|seed)["']?\s*[=:]\s*)(?!["']?\[redacted\])["']?[^\s,;"'}]+/gi
+
+function redactDiagnosticText (value, max) {
+  const text = String(value ?? '')
+    .replace(/(\b(?:postgres(?:ql)?|redis|mongodb(?:\+srv)?|https?):\/\/)[^@\s/]+@/gi, '$1[redacted]@')
+    .replace(/(\bbearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[redacted]')
+    .replace(CREDENTIAL_ASSIGNMENT_QUOTED, '$1$2[redacted]$2')
+    .replace(CREDENTIAL_ASSIGNMENT_BARE, '$1[redacted]')
+    .replace(/\b[0-9a-f]{64,}\b/gi, '[redacted-hex]')
+  return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+function budgetPlanningDiagnostic (err) {
+  const code = typeof err?.code === 'string'
+    ? err.code
+    : typeof err?.code === 'number' ? String(err.code) : 'unknown'
+  const metaCode = err?.meta?.code
+  return {
+    name: typeof err?.name === 'string' ? err.name : 'Error',
+    code,
+    metaCode: metaCode == null ? undefined : String(metaCode),
+    message: redactDiagnosticText(err?.message ?? err, DIAGNOSTIC_MESSAGE_MAX),
+    stack: err?.stack == null ? undefined : redactDiagnosticText(err.stack, DIAGNOSTIC_STACK_MAX)
+  }
+}
+
+// Post-commit alerts for the budget plan. NEVER call these inside the ledger
+// transaction: a reused row and an aborted transaction alert nothing.
+function emitCuratorBudgetAlerts ({ breaker, configErrors, fallbackError, mode, distributionId, periodEnd, medianPeriods }) {
+  if (fallbackError) {
+    alert('critical', 'curator budget planning failed — fallback cap paid',
+      `distribution ${distributionId}: the dynamic curator budget could not be planned; the run paid min(pool, 0.2 XMR) and committed normally. ` +
+      'Diagnostic withheld; see the worker log. Investigate before the next weekly run.',
+      { dedupeKey: `curator-budget-fallback-${distributionId}` })
+  }
+  if (configErrors?.length) {
+    alert('critical', 'curator budget config invalid — fallback cap paid',
+      `distribution ${distributionId}: invalid PlatformFeeConfig (${configErrors.join(', ')}); the run failed closed to LEGACY and paid min(pool, 0.2 XMR). ` +
+      'Fix the config before the next weekly run.',
+      { dedupeKey: 'curator-budget-config-invalid' })
+  }
+  if (breaker?.tripped) {
+    const weekStart = new Date(periodEnd)
+    weekStart.setUTCHours(0, 0, 0, 0)
+    weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7))
+    const nextMonday = new Date(weekStart.getTime() + WEEK_MS).toISOString()
+    // A zero threshold identifies a zero recorded average/median baseline (the
+    // breaker ratio is always above 100%), the accepted zero-history/recovery
+    // edge: every capped recovery run records T 0, so the median cannot recover
+    // on its own. A zero median does not prove every period in the configured
+    // window was inactive, and that window is configurable.
+    const windowPeriods = Number.isSafeInteger(medianPeriods) ? medianPeriods : 12
+    const zeroBaselineExplanation = breaker.thresholdPiconeros === 0n
+      ? `This is the accepted zero-history/recovery edge: the prior average/median baseline is zero (the configured ${windowPeriods}-period median window has a zero median, which does not prove every period was inactive), ` +
+        'and a capped run records T 0, so recovery can re-trip the breaker every week while that recorded baseline stays zero and cannot clear on its own — ' +
+        'review the recorded history and breaker configuration. '
+      : ''
+    alert(mode === 'ACTIVE' ? 'critical' : 'warn', 'curator budget spike breaker tripped',
+      `distribution ${distributionId}: T ${breaker.rawTPiconeros.toString()} piconeros exceeded the breaker threshold ` +
+      `${breaker.thresholdPiconeros.toString()} and was capped to ${breaker.tPiconeros.toString()}. ` +
+      zeroBaselineExplanation +
+      'An approved make-up pays (raw − cap) × k ÷ 4 at the configured multiple on the immediately following run only, and only in ACTIVE mode. ' +
+      `Approve before the next Monday 00:00 UTC run (${nextMonday}) with: sndev monero makeup ${distributionId} --confirm (dev) ` +
+      `or the loader-wrapped scripts/approve-curator-makeup.js ${distributionId} --confirm (VPS).`,
+      { dedupeKey: `curator-breaker-${distributionId}` })
+  }
+}
 
 // Allocate the capped referral budget in insertion order. A referrer without a
 // receiving account is skipped without consuming budget (legacy behavior).
@@ -134,7 +265,11 @@ async function distribute (models) {
   //     both create — under Serializable the loser aborts, then either no-ops
   //     (finds the existing distribution on retry) or errors cleanly. No partial
   //     write is ever visible.
-  return await models.$transaction(async (tx) => {
+  // Alerts are captured here inside the transaction but emitted only after it
+  // commits (below). A reused row leaves this null: no allocation happened, so
+  // no budget alert may fire.
+  let postCommitBudget = null
+  const result = await models.$transaction(async (tx) => {
     // Idempotency: a distribution whose periodEnd falls in this UTC week (or
     // later) means the week's allocation already happened; return it verbatim
     // instead of double-distributing. Calendar weeks replace the old rolling
@@ -206,10 +341,10 @@ async function distribute (models) {
     // --- Pool: this week's earmark + the prior period's rollover ---
     const rolledOver = toBigInt(lastDistribution?.rolledOverPiconeros)
     const poolPiconeros = rewardsInflow + rolledOver
-    // Keep the FULL pool in the ledger and protected from ops sweeps. Only the
-    // curator budget is capped at the fallback cap; referrals still use the
+    // Keep the FULL pool in the ledger and protected from ops sweeps. The
+    // curator budget is planned below (after the trust heartbeat, because the
+    // stale-trust rule needs the effective floor); referrals still use the
     // full pool's remainder.
-    const curatorBudget = poolPiconeros < CURATOR_FALLBACK_CAP_PICONEROS ? poolPiconeros : CURATOR_FALLBACK_CAP_PICONEROS
 
     // Ops earmark rollover: the prior period's unswept ops carried in, LESS the
     // network costs incurred after that snapshot's checkpoint (and with a
@@ -225,23 +360,44 @@ async function distribute (models) {
     })
     const opsAvailable = opsInflow + opsRolledOver
 
-    // --- Curator trust weighting (#6): config floor + staleness fail-safe.
-    // Weighting keys off the nightly trust walk's DEDICATED heartbeat
-    // (HealthSnapshot.trustCompletedAt, written only after a fully-successful
-    // run). max(UserSubTrust.updated_at) was rejected: territory create/
-    // unarchive also write fresh rows, so a territory event inside the window
-    // would mask a broken walk. Heartbeat missing/stale (> TRUST_STALENESS_MS)
-    // or trust table empty => force 1.0 (weighting disabled) so a broken walk
-    // can never slash payouts. ---
+    // --- Curator trust weighting (#6): shared with the live projection. ---
+    const { trustWeightFloor, trustStale } = await readTrustWeighting(tx, config)
     const configTrustFloor = config.curatorTrustWeightFloor ?? 1.0
-    const heartbeat = await tx.healthSnapshot.findUnique({ where: { id: 1 }, select: { trustCompletedAt: true } })
-    const trustRows = await tx.userSubTrust.count()
-    const trustWeightFloor = trustRows > 0
-      ? effectiveTrustWeightFloor(configTrustFloor, heartbeat?.trustCompletedAt ?? null)
-      : 1.0
     if (trustWeightFloor !== configTrustFloor) {
       logError('rewardsDistributor: trust walk stale or missing (heartbeat) — curator trust weighting disabled for this run')
     }
+
+    // --- Dynamic curator budget (spec 2026-10-19). Planned inside a SAVEPOINT
+    // so a failure here can never abort the Serializable ledger transaction: on
+    // any non-serialization error the run pays the 0.2 XMR fallback cap and
+    // alerts after commit. Serialization/deadlock errors MUST escape so the
+    // whole ledger transaction can be retried. ---
+    const incomePiconeros = incomeFromInflow(inflow)
+    let budgetPlan
+    try {
+      budgetPlan = await withSavepoint(tx, () => planCuratorBudget(tx, {
+        periodStart,
+        periodEnd,
+        poolPiconeros,
+        incomePiconeros,
+        config,
+        excludedCuratorIds,
+        trustWeightFloor,
+        trustStale,
+        previousDistribution: lastDistribution,
+        fallbackCapPiconeros: CURATOR_FALLBACK_CAP_PICONEROS
+      }))
+    } catch (err) {
+      if (isSerializationFailure(err)) throw err
+      const diagnostic = budgetPlanningDiagnostic(err)
+      logError({
+        code: diagnostic.code,
+        phase: 'curator-budget',
+        err: diagnostic
+      }, 'rewardsDistributor: dynamic curator budget planning failed; paying the fallback cap')
+      budgetPlan = fallbackCapPlan(poolPiconeros, err)
+    }
+    const curatorBudget = budgetPlan.appliedCuratorBudgetPiconeros
 
     // --- Curator shares (Task 7). Read-only, so it COULD run outside the tx,
     // but passing tx keeps the reads in the same serializable snapshot as the
@@ -343,7 +499,11 @@ async function distribute (models) {
         // every later fee (Fnow - this) debits the active carry exactly once.
         opsNetworkFeesAccountedPiconeros: ledger.totalNetworkFeesPiconeros,
         payoutCount: payoutRows.length,
-        status: 'PENDING'
+        status: 'PENDING',
+        // Dynamic curator budget record (spec §6). Reconciled every run; the
+        // applied budget is LEGACY/SHADOW fallback or ACTIVE
+        // min(target, limit, pool) (target = k × T4 + approved make-up).
+        ...budgetPlan.record
       }
     })
 
@@ -406,14 +566,36 @@ async function distribute (models) {
       opsAvailable: opsAvailable.toString(),
       payouts: payoutRows.length,
       // Founder + operator-configured exclusions active for this run.
-      excludedCurators: excludedCuratorIds.length
+      excludedCurators: excludedCuratorIds.length,
+      // Dynamic curator budget (all modes record; only ACTIVE pays it).
+      curatorBudgetMode: budgetPlan.record.curatorBudgetMode,
+      curatorBudget: budgetPlan.appliedCuratorBudgetPiconeros.toString(),
+      dynamicBudget: budgetPlan.record.dynamicBudgetPiconeros?.toString() ?? null,
+      trustedTip: budgetPlan.record.trustedTipPiconeros?.toString() ?? null,
+      makeup: budgetPlan.record.makeupPiconeros?.toString() ?? null,
+      breakerTripped: budgetPlan.breaker?.tripped ?? false
     }, 'rewardsDistributor: distribution complete')
 
-    return await tx.rewardDistribution.findUnique({
+    const completed = await tx.rewardDistribution.findUnique({
       where: { id: distribution.id },
       include: { payouts: true }
     })
+    postCommitBudget = {
+      created: true,
+      breaker: budgetPlan.breaker,
+      configErrors: budgetPlan.configErrors,
+      fallbackError: budgetPlan.fallbackError ?? null,
+      mode: budgetPlan.record.curatorBudgetMode,
+      distributionId: distribution.id,
+      periodEnd,
+      medianPeriods: budgetPlan.record.curatorBudgetParams?.breakerFloorMedianPeriods ?? null
+    }
+    return completed
   }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, timeout: 10000 })
+
+  // After commit only. If the transaction rejected, this code is never reached.
+  if (postCommitBudget?.created) emitCuratorBudgetAlerts(postCommitBudget)
+  return result
 }
 
 function toBigInt (v) {

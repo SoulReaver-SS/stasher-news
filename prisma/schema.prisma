@@ -1497,6 +1497,20 @@ enum PayoutState {
   FAILED
 }
 
+// Dynamic curator budget mode (spec 2026-10-19-dynamic-curator-budget-design.md).
+enum CuratorBudgetMode {
+  LEGACY
+  SHADOW
+  ACTIVE
+}
+
+// Outcome recorded for one dynamic budget calculation.
+enum CuratorBudgetOutcome {
+  FULL
+  DRAWDOWN
+  POOL_SHORT
+}
+
 // Hot-wallet ops sweep: whether the ops share of a distribution was swept out.
 enum OpsSweepState {
   NOT_SWEEPED
@@ -1943,6 +1957,27 @@ model RewardDistribution {
   // creation reduce the active carry immediately, exactly once.
   opsNetworkFeesAccountedPiconeros BigInt @default(0)
 
+  // Dynamic curator budget record (spec §6), written every run from Stage 3.
+  rawTipPiconeros               BigInt?
+  eligibleTipStages             Json?
+  trustedTipPiconeros           BigInt?   // final T (after stale fallback + breaker)
+  tipperCount                   Int?
+  breakerTripped                Boolean   @default(false)
+  breakerRawTPiconeros          BigInt?
+  breakerMakeupApproved         Boolean   @default(false)
+  makeupPiconeros               BigInt?   // applied on THIS run from the previous run's trip
+  incomePiconeros               BigInt?   // F: rewards earmark excluding donations
+  tipT4Piconeros                BigInt?
+  incomeF4Piconeros             BigInt?   // I4: median pool income over avgPeriods
+  reservePiconeros              BigInt?   // max(pool - I4, 0)
+  spendLimitPiconeros           BigInt?   // (I4 + reserve / W) * 10000 / 11000
+  multBps                       Int?      // effective: budget * 10000 / T4 (NULL when T4 = 0)
+  dynamicBudgetPiconeros        BigInt?
+  dynamicBudgetMode             CuratorBudgetOutcome?
+  curatorBudgetMode             CuratorBudgetMode?
+  appliedCuratorBudgetPiconeros BigInt?
+  curatorBudgetParams           Json?
+
   payouts            RewardPayout[]
   earns              Earn[]
   walletTransactions RewardsWalletTransaction[]
@@ -2296,6 +2331,19 @@ model PlatformFeeConfig {
   // resolving to a positive integer are ignored with a log line. Read at
   // distribution time, so a SQL edit takes effect on the next weekly run.
   distributionExcludedCuratorIds Int[] @default([])
+  // Dynamic curator budget (spec 2026-10-19-dynamic-curator-budget-design.md).
+  // LEGACY = record only, pay the 0.2 XMR fallback cap; SHADOW = same
+  // payouts, both numbers shown; ACTIVE = pay min(k × T4 + make-up, limit,
+  // pool). Invalid values fail closed to the fallback cap with a CRITICAL
+  // alert. Read at distribution time.
+  curatorBudgetMode                CuratorBudgetMode @default(LEGACY)
+  curatorBudgetMultBps             Int @default(15000) // k
+  curatorBudgetDrawdownWeeks       Int @default(13) // W
+  curatorBudgetAvgPeriods          Int @default(4)
+  curatorTipCapShareBps            Int @default(2500)
+  curatorBreakerRatioBps           Int @default(25000)
+  curatorBreakerFloorMedianPeriods Int @default(12)
+  curatorBreakerArmPeriods         Int @default(4)
 }
 
 // Singleton (id=1) cache of the monerod chain tip, written by the

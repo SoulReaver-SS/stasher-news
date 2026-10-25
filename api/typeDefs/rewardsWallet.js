@@ -129,6 +129,29 @@ export default gql`
     correctedPendingOpsPiconeros: BigInt!
     opsSweepTxHash: String
     opsSweepState: String!
+    # Dynamic curator budget record (spec §6). Nullable because pre-feature
+    # rows and backfilled history may not have these figures. Every tip stage
+    # is a TOTAL; no tipper identity or config exclusion ID is exposed here.
+    rawTipPiconeros: BigInt
+    trustedTipPiconeros: BigInt
+    tipperCount: Int
+    breakerTripped: Boolean
+    breakerRawTPiconeros: BigInt
+    makeupPiconeros: BigInt
+    incomePiconeros: BigInt
+    tipT4Piconeros: BigInt
+    incomeF4Piconeros: BigInt
+    # This run's drawdown reserve and spending limit (spec §3.1). NULL on
+    # pre-feature rows and backfilled history: no dynamic budget ran, so no
+    # limit is invented.
+    reservePiconeros: BigInt
+    spendLimitPiconeros: BigInt
+    multBps: Int
+    dynamicBudgetPiconeros: BigInt
+    dynamicBudgetMode: String
+    curatorBudgetMode: String
+    appliedCuratorBudgetPiconeros: BigInt
+    eligibleTipStages: JSONObject
     payouts: [RewardPayout!]!
   }
 
