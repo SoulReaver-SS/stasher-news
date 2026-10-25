@@ -148,24 +148,26 @@ it('flags video uploads as { video: true } without probing imgproxy or writing d
   expect(fetchMock).not.toHaveBeenCalled()
 })
 
-// 2026-10-24 media-store rename: the endpoint moved to media:9000, but content
-// written before the cutover embeds raw http://minio:9000/uploads/<id> URLs
-// (MEDIA_URL_DOCKER's old value). The legacy origin must keep classifying as
-// an internal upload — otherwise legacy video uploads lose the video-flag skip
-// and re-renders produce permanent-422 imgproxy derivatives. The DNS alias
-// keeps the URLs fetchable; this pins the classification.
-it('still classifies stored legacy minio-origin upload URLs as internal', async () => {
-  process.env.MEDIA_URL_DOCKER = 'http://media:9000/uploads'
+// Stored content embeds raw MEDIA_URL_DOCKER values: http://minio:9000/uploads
+// (long-standing, restored 2026-10-25) and http://media:9000/uploads (dev only,
+// 2026-10-24..25). Both origins must keep classifying as internal whatever the
+// current MEDIA_URL_DOCKER is — otherwise video uploads lose the video-flag
+// skip and re-renders produce permanent-422 imgproxy derivatives.
+it.each([
+  ['http://media:9000/uploads', 'http://minio:9000/uploads/4079'],
+  ['http://minio:9000/uploads', 'http://media:9000/uploads/4079']
+])('with MEDIA_URL_DOCKER=%s still classifies stored %s as internal', async (mediaUrlDocker, storedUrl) => {
+  process.env.MEDIA_URL_DOCKER = mediaUrlDocker
   try {
     const { createImgproxyUrls } = await import('@/worker/imgproxy')
     const fetchMock = jest.spyOn(global, 'fetch')
     fetchMock.mockClear()
 
-    const result = await createImgproxyUrls(8, '![v](http://minio:9000/uploads/4079)', {
+    const result = await createImgproxyUrls(8, `![v](${storedUrl})`, {
       models: uploadModels({ 4079: 'video/mp4' })
     })
 
-    expect(result['http://minio:9000/uploads/4079']).toEqual({ video: true })
+    expect(result[storedUrl]).toEqual({ video: true })
     expect(fetchMock).not.toHaveBeenCalled()
   } finally {
     process.env.MEDIA_URL_DOCKER = 'http://minio:9000/uploads'

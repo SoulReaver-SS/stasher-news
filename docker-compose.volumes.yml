@@ -9,7 +9,7 @@
 # pre-existing. caddy_data/caddy_config stay unguarded deliberately (TLS certs
 # are re-issuable by Let's Encrypt).
 #
-# `stashernews_os` (search profile) and `stashernews_seaweedfs` (images
+# `stashernews_os` (search profile) and `stashernews_seaweedfs` (media
 # profile) are the exceptions to "already exists": they must be created
 # manually before the first guarded `up` with that profile active —
 # docker volume create stashernews_os / stashernews_seaweedfs

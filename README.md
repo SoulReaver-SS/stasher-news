@@ -357,7 +357,7 @@ In addition, we run other critical services the above services interact with lik
 
 The SeaweedFS backend boots only with a rendered, secret-bearing `s3.config.json`
 (admin identity from `MEDIA_AWS_*`, plus anonymous `Read:<bucket>` — nothing
-else). Before the first `up` with the `images` profile — render from the
+else). Before the first `up` with the `media` profile — render from the
 EFFECTIVE environment (local `.env.local` overrides win over tracked
 defaults):
 
@@ -365,7 +365,7 @@ defaults):
 mkdir -p .media-runtime && chmod 700 .media-runtime
 set -a; source .env.development; [ -f .env.local ] && source .env.local; set +a
 node scripts/render-media-config.cjs .media-runtime/s3.config.json
-docker compose --profile images up -d media seaweedfs
+docker compose --profile media up -d media seaweedfs
 docker compose exec -w /app app node scripts/ensure-media-bucket.cjs
 ```
 

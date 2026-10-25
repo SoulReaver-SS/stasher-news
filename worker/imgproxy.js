@@ -47,16 +47,17 @@ const exclude = [
 // (killed by the host exclude). Path-aware: only URLs under the media URL's
 // pathname count, so the site itself is not trusted. Env is read at call time
 // for deterministic tests.
-// LEGACY_MEDIA_URL: content written before the 2026-10-24 media-store rename
-// embeds raw http://minio:9000/uploads/<id> URLs (the old MEDIA_URL_DOCKER
-// value). The legacy origin keeps classifying as internal so stored legacy
-// uploads keep the video-flag skip and the trusted-media carve-out; the
-// `minio` network alias on the media proxy keeps those URLs fetchable.
-const LEGACY_MEDIA_URL = 'http://minio:9000/uploads'
+// KNOWN_MEDIA_URLS: stored content embeds raw MEDIA_URL_DOCKER values —
+// http://minio:9000/uploads/<id> (the long-standing value, restored
+// 2026-10-25) and http://media:9000/uploads/<id> (written on dev while it was
+// the value, 2026-10-24..25). Both origins keep classifying as internal so
+// stored uploads keep the video-flag skip and the trusted-media carve-out
+// whatever MEDIA_URL_DOCKER currently is; the media proxy answers both names.
+const KNOWN_MEDIA_URLS = ['http://minio:9000/uploads', 'http://media:9000/uploads']
 const isInternalUploadUrl = (url) => {
   try {
     const parsed = new URL(url)
-    for (const candidate of [process.env.MEDIA_URL_DOCKER, process.env.NEXT_PUBLIC_MEDIA_URL, LEGACY_MEDIA_URL]) {
+    for (const candidate of [process.env.MEDIA_URL_DOCKER, process.env.NEXT_PUBLIC_MEDIA_URL, ...KNOWN_MEDIA_URLS]) {
       if (!candidate) continue
       const mediaUrl = new URL(candidate)
       if (parsed.origin !== mediaUrl.origin) continue

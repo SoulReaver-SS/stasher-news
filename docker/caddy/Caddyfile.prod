@@ -23,10 +23,13 @@ stasher.news {
 	# fields, not the URL — so the matcher must include bare /uploads as well
 	# as /uploads/<key>; otherwise the POST falls through to the app and the
 	# invite gate. The bucket name `uploads` is the s3 path-style prefix, so
-	# /uploads/<key> maps 1:1 to media:9000/uploads/<key>.
+	# /uploads/<key> maps 1:1 to minio:9000/uploads/<key>. `minio` is the
+	# legacy name: the old minio container answers it until a host migrates,
+	# then the media proxy carries it as a network alias — so this upstream is
+	# correct on both sides of the cutover.
 	@uploads path /uploads /uploads/*
 	handle @uploads {
-		reverse_proxy media:9000
+		reverse_proxy minio:9000
 	}
 
 	# lws confirmation webhook: internal-only. lws delivers container-to-container
