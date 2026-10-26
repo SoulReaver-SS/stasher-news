@@ -86,21 +86,16 @@ jest.mock('@apollo/client', () => {
   const { gql } = require('graphql-tag')
   return { __esModule: true, gql }
 })
-// NavRewards polls the public rewards pool via useQuery; nothing else in the
-// header graph calls useQuery (HasNewNotesProvider is not rendered here), so
-// the mock returns a stubbed result for the whole file.
+// Price/BlockHeight call useQuery in the header graph; @apollo/client/react is
+// ESM-only under jest CJS require, so the whole module is stubbed with no data.
 jest.mock('@apollo/client/react', () => ({
-  useQuery: () => ({
-    data: { rewards: [{ total: mockRewardsTotal, time: mockRewardsTime }] }
-  })
+  useQuery: () => ({ data: undefined })
 }))
 
 // let, not const: reassigned per-test; jest.mock factories reference these
 // lazily (mock*-prefixed per babel-plugin-jest-hoist), so TDZ never applies.
 let mockRouter = { asPath: '/~bitcoin' }
 let mockMe = null
-let mockRewardsTotal = '1200000000000'
-let mockRewardsTime = null
 
 // props shape mirrors what components/nav/index.js builds for DesktopHeader
 const TURF_PROPS = {
@@ -154,8 +149,6 @@ afterAll(() => {
 beforeEach(() => {
   mockRouter = { asPath: '/~bitcoin' }
   mockMe = null
-  mockRewardsTotal = '1200000000000'
-  mockRewardsTime = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString()
 })
 
 afterEach(async () => {
@@ -212,34 +205,25 @@ describe('HeaderMerged zero-removal', () => {
   })
 })
 
-describe('NavRewards', () => {
-  it('renders the rewards amount link and a days/hours countdown in the centered cluster', async () => {
+describe('NavCenterCluster', () => {
+  it('renders the price alone — no rewards readout, countdown, or divider', async () => {
     await renderHeader(TURF_PROPS)
 
     const cluster = container.querySelector('.navCenterCluster')
     expect(cluster).toBeTruthy()
 
-    const amount = cluster.querySelector('a[href="/rewards"]')
-    expect(amount).toBeTruthy()
-    expect(amount.textContent).toMatch(/^1\.2 XMR in \d+d \d{1,2}h$/)
+    // the reward-pool readout (amount + days/hours countdown) lives only in
+    // the footer now; the top bar's centered cluster is price-only
+    expect(cluster.querySelector('a[href="/rewards"]')).toBeNull()
+    expect(cluster.querySelector('.navRewards')).toBeNull()
+    expect(cluster.querySelector('.navRewardsTimer')).toBeNull()
+    expect(container.querySelector('a[href="/rewards"]')).toBeNull()
+    expect(cluster.querySelector('.navCenterDivider')).toBeNull()
 
-    const timer = cluster.querySelector('.navRewards .navRewardsTimer')
-    expect(timer).toBeTruthy()
-    expect(timer.textContent).toMatch(/^\d+d \d{1,2}h$/)
-
-    // divider separates the rewards readout from the price ticker
-    expect(cluster.querySelector('.navCenterDivider')).toBeTruthy()
-
-    // the price ticker Nav.Item also lives in the centered cluster
-    expect(cluster.querySelectorAll('.nav-item').length).toBeGreaterThanOrEqual(2)
-  })
-
-  it('caps the rewards amount at 3 decimal places (truncated, trailing zeros trimmed)', async () => {
-    mockRewardsTotal = '4163900000' // 0.004163 XMR
-    await renderHeader(TURF_PROPS)
-
-    const amount = container.querySelector('a[href="/rewards"]')
-    expect(amount.textContent).toMatch(/^0\.004 XMR in \d+d \d{1,2}h$/)
+    // the price ticker's Nav.Item is the cluster's only occupant
+    const items = cluster.querySelectorAll('.nav-item')
+    expect(items.length).toBe(1)
+    expect(items[0].className).toMatch(/price/)
   })
 })
 

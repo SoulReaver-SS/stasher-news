@@ -19,7 +19,7 @@ test('piconerosToXmrDecimal rejects non-BigInt input', () => {
 
 test('piconerosToXmrDecimal maxDecimals truncates toward zero and trims trailing zeros', () => {
   expect(piconerosToXmrDecimal(1_234_567_890_123n, 3)).toBe('1.234')
-  expect(piconerosToXmrDecimal(4_163_900_000n, 3)).toBe('0.004') // 0.004163 XMR -> nav rewards readout
+  expect(piconerosToXmrDecimal(4_163_900_000n, 3)).toBe('0.004') // 0.004163 XMR -> rewards pool readout
   expect(piconerosToXmrDecimal(1_200_000_000_000n, 3)).toBe('1.2') // trailing zeros trimmed
   expect(piconerosToXmrDecimal(999_900_000_000n, 3)).toBe('0.999') // truncates, never rounds up
   expect(piconerosToXmrDecimal(-1_234_567_890_123n, 3)).toBe('-1.234')

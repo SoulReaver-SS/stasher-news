@@ -6,7 +6,7 @@ import BackArrow from '../../svgs/arrow-left-line.svg'
 import { useCallback, useEffect, useState } from 'react'
 import Price from '../price'
 import SubSelect from '../sub-select'
-import { LONG_POLL_INTERVAL_MS, PUBLIC_MEDIA_URL, SSR } from '../../lib/constants'
+import { PUBLIC_MEDIA_URL } from '../../lib/constants'
 import NoteIcon from '../../svgs/notification-4-fill.svg'
 import { useMe } from '../me'
 import { DISPLAY_FONT } from '@/lib/rebrand'
@@ -22,11 +22,8 @@ import { useWalletIndicator } from '@/wallets/client/hooks'
 import SwitchAccountList, { useIsLurker } from '@/components/account'
 import { useShowModal } from '@/components/modal'
 import { ObstacleButtons } from '@/components/obstacle'
-import { piconerosToXmr, piconerosToMXmr } from '@/lib/format'
+import { piconerosToMXmr } from '@/lib/format'
 import { useBranding } from '@/components/territory-branding'
-import { gql } from '@apollo/client'
-import { useQuery } from '@apollo/client/react'
-import { DaysHoursCountdown } from '@/components/countdown'
 
 export function Brand ({ className, compact }) {
   const branding = useBranding()
@@ -114,29 +111,6 @@ export function NavPrice ({ className }) {
       {/* no text-monospace: the price inherits the top bars' Chakra Petch (the
         cluster's font on desktop; the bar font on mobile/sticky bars) */}
       <Price className='nav-link' />
-    </Nav.Item>
-  )
-}
-
-const REWARDS = gql`
-{
-  rewards {
-    total
-    time
-  }
-}`
-
-export function NavRewards () {
-  const { data } = useQuery(REWARDS,
-    SSR ? { ssr: false } : { pollInterval: LONG_POLL_INTERVAL_MS, nextFetchPolicy: 'cache-and-network' })
-  const total = data?.rewards?.[0]?.total
-  const time = data?.rewards?.[0]?.time
-  if (!total) return null
-  return (
-    <Nav.Item className='navRewards d-none d-md-flex align-items-center gap-2'>
-      <Link href='/rewards' className='nav-link p-0 navRewardsAmount'>
-        {piconerosToXmr(BigInt(total), 3)} in {time && <DaysHoursCountdown className='navRewardsTimer' date={time} />}
-      </Link>
     </Nav.Item>
   )
 }

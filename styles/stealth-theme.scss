@@ -73,7 +73,7 @@
 
 // ---- merged single-row desktop header (rebrand) ----
 // One row holds back arrow, brand, turf selector, sorts, search, centered
-// rewards/price cluster, comment navigator, post button and the user corner.
+// price ticker, comment navigator, post button and the user corner.
 // The row wraps (instead of clipping or dropping elements) at narrow desktop
 // widths; every element of the previous two-bar header is retained. The wrap
 // and height live on the inner flex row (stable .navMergedRow class, set in
@@ -89,11 +89,11 @@
     position: relative;
   }
 
-  // centered cluster: rewards readout + price ticker, absolutely centered on
-  // the merged row (left:50% of the relative .navMergedRow). The in-flow left
-  // and right content fits well under the md+ breakpoint, so the cluster never
-  // overlaps the wrapped row. The Chakra Petch font lives on the cluster so the
-  // rewards link, countdown and price ticker all inherit it.
+  // centered cluster: price ticker, absolutely centered on the merged row
+  // (left:50% of the relative .navMergedRow). The in-flow left and right
+  // content fits well under the md+ breakpoint, so the cluster never overlaps
+  // the wrapped row. The Chakra Petch font lives on the cluster so the price
+  // ticker inherits it.
   .navCenterCluster {
     position: absolute;
     left: 50%;
@@ -107,32 +107,9 @@
     font-size: calc(0.8rem + 2pt);
   }
 
-  .navCenterDivider {
-    width: 1px;
-    height: 16px;
-    background: rgba(255, 255, 255, 0.14);
-  }
-
-  // rewards pool amount + payout countdown: plain grey Chakra Petch text in the
-  // centered cluster, matching the mockup
-  .navMergedRow .navRewards {
-    color: var(--stealth-muted);
-    white-space: nowrap;
-  }
-
-  .navMergedRow .navRewards a {
-    color: inherit;
-    text-decoration: none;
-  }
-
-  .navMergedRow .navRewards a:hover {
-    color: var(--bs-body-color);
-    text-decoration: underline;
-  }
-
-  // price ticker in the centered cluster: the same plain muted Chakra Petch
-  // text as the rewards readout — no pill, no ◉ symbol. The Price component
-  // still cycles fiat / XMR-per-fiat / block-height on click.
+  // price ticker in the centered cluster: plain muted Chakra Petch text — no
+  // pill, no ◉ symbol. The Price component still cycles fiat / XMR-per-fiat /
+  // block-height on click.
   .navCenterCluster .nav-link {
     color: var(--stealth-muted) !important;
     padding: 0.25rem 0;
@@ -158,7 +135,7 @@
     }
 
     // neutralize the price ticker's flex-grow:1 (header.module.css .price) so
-    // the cluster's justify-content:center centers both items on the line
+    // the cluster's justify-content:center centers the ticker on the line
     .navMergedRow .navCenterCluster .nav-item {
       flex-grow: 0;
     }
