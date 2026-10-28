@@ -1,9 +1,10 @@
-# Extends the default gitleaks rule set (useDefault) and allowlists three
-# synthetic test fixtures that the generic-api-key rule flags as secrets.
-# Audited 2026-10-07 / 2026-10-09: none is a credential (two are alert dedupe
-# keys, one is an obviously fake `cr_live_1a2b3c4d5e6f` fixture). Patterns are
-# exact line matches so default detection stays fully on and nothing broader
-# is suppressed.
+# Extends the default gitleaks rule set (useDefault) and allowlists synthetic
+# test fixtures that the generic-api-key rule flags as secrets. Audited
+# 2026-10-07 / 2026-10-09 / 2026-10-28: none is a credential (two are alert
+# dedupe keys, one is an obviously fake `cr_live_1a2b3c4d5e6f` fixture, and
+# one is the base64 of the literal "secret-key" fed to the log-redaction
+# test). Patterns are exact line matches so default detection stays fully on
+# and nothing broader is suppressed.
 [extend]
 useDefault = true
 
@@ -14,4 +15,15 @@ regexes = [
   "dedupeKey: 'bounty-missing-frozen-fee-42'",
   "credentialCode = 'cr_live_1a2b3c4d5e6f'",
   "dedupeKey: 'subfee-pid-misattribution-7'",
+]
+
+# The rewardsDistributor redaction test plants credential-shaped text
+# (postgres URL, password, token, this private_key whose value is the base64
+# of "secret-key") to assert log redaction scrubs it; gitleaks cannot know
+# it is bait.
+[[allowlists]]
+description = "Fake private_key fixture in the log-redaction test (not a credential)"
+regexTarget = "line"
+regexes = [
+  "'private_key=\"c2VjcmV0LWtleQ==\"'",
 ]
