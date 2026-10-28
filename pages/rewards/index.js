@@ -56,7 +56,7 @@ export function RewardLine ({ total, time, xmr }) {
   return (
     <>
       <span style={{ whiteSpace: 'nowrap' }}>
-        {xmr ? piconerosToXmr(BigInt(total), 3) : piconerosToMXmr(BigInt(total))} in rewards pool
+        {xmr ? piconerosToXmr(BigInt(total), 3) : piconerosToMXmr(BigInt(total), 0)} in rewards pool
       </span>
       {time &&
         <small style={{ whiteSpace: 'nowrap' }}>
@@ -101,7 +101,7 @@ export function CuratorBudgetCopy ({ budget }) {
   const multiple = formatMultiple(budget?.multBps) ?? '0×'
 
   if (mode === 'ACTIVE' && projected != null) {
-    const multipleText = budget.windingDown ? `${multiple}: pool winding down` : `${multiple} recent curator tips`
+    const multipleText = budget.windingDown ? `${multiple}: pool winding down` : null
     return (
       <>
         <p className='text-center text-muted mb-0'>
@@ -109,11 +109,6 @@ export function CuratorBudgetCopy ({ budget }) {
           {multipleText && <span> ({multipleText})</span>}
         </p>
         <p className='text-center text-muted'>
-          <small>
-            {budget.t4Piconeros != null && <>T4 {piconerosToXmr(toBigInt(budget.t4Piconeros))} · </>}
-            {limitSentence(budget)}
-          </small>
-          <br />
           <small><small>This is a projection; it is final at Monday 00:00 UTC.</small></small>
         </p>
       </>

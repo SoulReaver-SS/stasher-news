@@ -204,6 +204,9 @@ export function WhenComposedChart ({
   )
 }
 
+// whole mXMR; sub-1 slices would truncate to a misleading 0
+const pieLabel = value => BigInt(value) < 1000000000n ? '<1 mXMR' : piconerosToMXmr(BigInt(value), 0)
+
 export function GrowthPieChart ({ data }) {
   const nonZeroData = data.filter(d => d.value > 0)
 
@@ -220,7 +223,7 @@ export function GrowthPieChart ({ data }) {
           paddingAngle={0}
           outerRadius={80}
           fill='var(--bs-secondary)'
-          label={({ value }) => piconerosToMXmr(BigInt(value))}
+          label={({ value }) => pieLabel(value)}
         >
           {
             data.map((entry, index) => (
@@ -228,7 +231,7 @@ export function GrowthPieChart ({ data }) {
             ))
           }
         </Pie>
-        <Tooltip formatter={(value, name) => [piconerosToMXmr(BigInt(value)), name]} />
+        <Tooltip formatter={(value, name) => [pieLabel(value), name]} />
       </PieChart>
     </ResponsiveContainer>
   )
