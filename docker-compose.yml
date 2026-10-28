@@ -167,6 +167,11 @@ services:
       - "8080"
     labels:
       - "CONNECT=localhost:3001"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     cpu_shares: "${CPU_SHARES_LOW}"
   # Media uploads (S3): SeaweedFS 4.48 all-in-one backend (master+volume+filer+
   # S3 in one process) reached ONLY through the `media` HTTP proxy below, on the

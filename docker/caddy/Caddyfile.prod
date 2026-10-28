@@ -76,7 +76,12 @@ stasher.news {
 # onto this host. Cert is issued via the global Let's Encrypt automation above.
 media.stasher.news {
 	encode zstd gzip
-	reverse_proxy imgproxy:8080
+	reverse_proxy imgproxy:8080 {
+		# imgproxy trusts these headers for client_ip logging; keep visitor IPs out.
+		header_up -X-Forwarded-For
+		header_up -CF-Connecting-IP
+		header_up -X-Real-IP
+	}
 }
 
 # Capture service host. Serves the 1200x630 og:image screenshots wired in

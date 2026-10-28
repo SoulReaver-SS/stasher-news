@@ -245,7 +245,7 @@ ${meta.data.items.items.slice(0, 10).map((item, i) =>
 -------
 
 ##### Top Monday meme
-![](${new URL(topMeme?.winner.image, 'https://imgprxy.stasher.news').href})
+![](${new URL(topMeme?.winner.image, 'https://media.stasher.news').href})
 
 [**all monday memes**](https://stasher.news/items/${topMeme?.item})
 
