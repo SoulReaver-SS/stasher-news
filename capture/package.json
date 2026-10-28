@@ -13,7 +13,7 @@
     "ipaddr.js": "^2.2.0",
     "magic-bytes.js": "^1.12.1",
     "proxy-addr": "^2.0.8",
-    "puppeteer-core": "^25.9.0",
+    "puppeteer-core": "^25.16.0",
     "undici": "^6.29.1"
   },
   "type": "module"
