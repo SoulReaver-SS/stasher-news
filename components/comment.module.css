@@ -50,8 +50,33 @@
     height: 0;
 }
 
-.collapser {
+/* reset the UA button chrome so these read as the plain text/icons they
+   replaced (aria/role/labels live on the elements in comment.js); no color
+   rule here — the eyeball icon is fill-colored and the muted expander takes
+   its grey from item.module.css .other (this file loads later, so any
+   color rule here would override it) */
+.bareButton {
+    background: none;
+    border: 0;
+    padding: 0;
     cursor: pointer;
+}
+
+/* shared focus ring for both collapse affordances */
+.bareButton:focus-visible {
+    outline: 2px solid var(--bs-body-color);
+    outline-offset: -2px;
+}
+
+/* collapse/expand toggle: same geometry the old bare svg had (45px slot at
+   the row's right edge; the icon letterboxes to ~10px inside it), plus a
+   24px min-height for the WCAG 2.5.8 touch-target floor */
+.collapser {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 24px;
+    border-radius: 4px;
     fill: var(--theme-grey);
     width: 45px;
     margin-left: auto;

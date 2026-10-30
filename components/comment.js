@@ -143,6 +143,26 @@ export default function Comment ({
     })
   }, [editMode])
 
+  const collapsed = collapse === 'yep'
+  // both collapse affordances (eyeball + muted-reply expander) go through here;
+  // the localStorage value is the persisted source of truth and must keep its
+  // exact 'yep'/'nope' shape
+  const setCollapsed = useCallback((value) => {
+    setCollapse(value)
+    window.localStorage.setItem(`commentCollapse:${item.id}`, value)
+  }, [item.id])
+  const toggleCollapse = useCallback(() => {
+    setCollapsed(collapsed ? 'nope' : 'yep')
+  }, [collapsed, setCollapsed])
+
+  const collapserRef = useRef(null)
+  // expanding a muted reply swaps this button out for <ItemInfo>; park focus
+  // on the eyeball toggle instead of dropping it to <body>
+  const expandMutedReply = useCallback(() => {
+    setCollapsed('nope')
+    collapserRef.current?.focus()
+  }, [setCollapsed])
+
   const { cache } = useApolloClient()
 
   const unsetOutline = () => {
@@ -253,13 +273,11 @@ export default function Comment ({
           <div className='d-flex align-items-center'>
             {item.user?.meMute && !includeParent && collapse === 'yep'
               ? (
-                <span
-                  className={`${itemStyles.other} ${styles.other} pointer`} onClick={() => {
-                    setCollapse('nope')
-                    window.localStorage.setItem(`commentCollapse:${item.id}`, 'nope')
-                  }}
+                <button
+                  type='button'
+                  className={`${itemStyles.other} ${styles.bareButton} pointer`} onClick={expandMutedReply}
                 >reply from someone you muted
-                </span>)
+                </button>)
               : <ItemInfo
                   full={topLevel}
                   item={item}
@@ -280,19 +298,20 @@ export default function Comment ({
                   editText={edit ? 'cancel' : 'edit'}
                 />}
 
-            {!includeParent && (collapse === 'yep'
-              ? <Eye
-                  className={styles.collapser} height={10} width={10} onClick={() => {
-                    setCollapse('nope')
-                    window.localStorage.setItem(`commentCollapse:${item.id}`, 'nope')
-                  }}
-                />
-              : <EyeClose
-                  className={styles.collapser} height={10} width={10} onClick={() => {
-                    setCollapse('yep')
-                    window.localStorage.setItem(`commentCollapse:${item.id}`, 'yep')
-                  }}
-                />)}
+            {!includeParent && (
+              <button
+                type='button'
+                ref={collapserRef}
+                className={classNames(styles.bareButton, styles.collapser)}
+                aria-label={collapsed ? 'expand comment' : 'collapse comment'}
+                aria-expanded={!collapsed}
+                onClick={toggleCollapse}
+              >
+                {collapsed
+                  ? <Eye aria-hidden='true' focusable='false' height={10} width={10} />
+                  : <EyeClose aria-hidden='true' focusable='false' height={10} width={10} />}
+              </button>
+            )}
             {topLevel && (
               <span className='d-flex ms-auto align-items-center'>
                 <Share title={item?.title} path={`/items/${item?.id}`} />
