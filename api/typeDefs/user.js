@@ -11,7 +11,7 @@ export default gql`
     topCowboys(cursor: String): UsersNullable!
     searchUsers(q: String!, limit: Limit! = 5, similarity: Float): [User!]!
     userSuggestions(q: String, limit: Limit! = 5): [User!]!
-    hasNewNotes: Boolean!
+    hasNewNotes(viewedItemId: ID): Boolean!
     mySubscribedUsers(cursor: String): Users!
     myMutedUsers(cursor: String): Users!
   }

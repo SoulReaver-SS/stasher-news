@@ -309,7 +309,7 @@ export default {
       return users
     },
     topUsers,
-    hasNewNotes: async (parent, args, ctx) => {
+    hasNewNotes: async (parent, { viewedItemId } = {}, ctx) => {
       const { me, models, userLoader } = ctx
       if (!me) {
         return false
@@ -321,9 +321,24 @@ export default {
       }
       const lastChecked = user.checkedNotesAt || new Date(0)
 
+      // viewedItemId: the user just opened this item, so the item page already
+      // shows any post, reply or mention inside its subtree. Leave those out of
+      // the item checks below; if nothing else is new, the checkedNotesAt bump
+      // at the end clears the bell.
+      let viewedPath = null
+      const viewedId = Number(viewedItemId)
+      if (Number.isSafeInteger(viewedId) && viewedId > 0) {
+        const [viewed] = await models.$queryRaw`
+          SELECT path::text AS path FROM "Item" WHERE id = ${viewedId}`
+        viewedPath = viewed?.path || null
+      }
+      const notViewed = viewedPath ? 'NOT COALESCE("Item".path <@ $3::ltree, false)' : null
+      const viewedParams = viewedPath ? [viewedPath] : []
+
       // if we've already recorded finding notes after they last checked, return true
       // this saves us from rechecking notifications
-      if (user.foundNotesAt > lastChecked) {
+      // (an item view rechecks, since the viewed item may be what was found)
+      if (!viewedPath && user.foundNotesAt > lastChecked) {
         return true
       }
 
@@ -381,8 +396,9 @@ export default {
             activeOrMine(me),
             await filterClause(null, null, null, ctx),
             muteClause(me),
-            ...(user.noteAllDescendants ? [] : ['r.level = 1'])
-          )})`, me.id, lastChecked)
+            ...(user.noteAllDescendants ? [] : ['r.level = 1']),
+            notViewed
+          )})`, me.id, lastChecked, ...viewedParams)
       if (newThreadSubReply.exists) {
         foundNotes()
         return true
@@ -403,7 +419,8 @@ export default {
             )`,
             activeOrMine(me),
             await filterClause(null, null, null, ctx),
-            muteClause(me))})`, me.id, lastChecked)
+            muteClause(me),
+            notViewed)})`, me.id, lastChecked, ...viewedParams)
       if (newUserSubs.exists) {
         foundNotes()
         return true
@@ -422,7 +439,8 @@ export default {
             '"Item"."userId" <> $1',
             activeOrMine(me),
             await filterClause(null, null, null, ctx),
-            muteClause(me))})`, me.id, lastChecked)
+            muteClause(me),
+            notViewed)})`, me.id, lastChecked, ...viewedParams)
       if (newSubPost.exists) {
         foundNotes()
         return true
@@ -441,8 +459,9 @@ export default {
             '"Item"."userId" <> $1',
             activeOrMine(me),
             await filterClause(null, null, null, ctx),
-            muteClause(me)
-          )})`, me.id, lastChecked)
+            muteClause(me),
+            notViewed
+          )})`, me.id, lastChecked, ...viewedParams)
         if (newMentions.exists) {
           foundNotes()
           return true
@@ -462,8 +481,9 @@ export default {
             '"Referee"."userId" = $1',
             activeOrMine(me),
             await filterClause(null, null, null, ctx),
-            muteClause(me)
-          )})`, me.id, lastChecked)
+            muteClause(me),
+            notViewed
+          )})`, me.id, lastChecked, ...viewedParams)
         if (newMentions.exists) {
           foundNotes()
           return true
