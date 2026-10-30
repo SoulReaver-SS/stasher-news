@@ -5,7 +5,7 @@ import typeDefs from '@/api/typeDefs'
 
 const SENSITIVE = [
   'act',
-  'unlinkAuth', 'generateApiKey', 'deleteApiKey', 'setName', 'setSettings',
+  'unlinkAuth', 'generateApiKey', 'deleteApiKey', 'setApiKeyEnabled', 'setName', 'setSettings',
   'registerMoneroAccount', 'unregisterMoneroAccount', 'initiateTip',
   'fundBounty', 'payBounty', 'reclaimBounty', 'rolloverBounty',
   'createInvite', 'revokeInvite', 'linkPhrase', 'createAuth',
