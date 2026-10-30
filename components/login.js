@@ -18,8 +18,6 @@ import PhraseLoginForm from './phrase-login-form'
 import { COPY } from '@/lib/rebrand-copy'
 
 export function EmailLoginForm ({ text, callbackUrl, multiAuth }) {
-  const disabled = multiAuth
-
   return (
     <Form
       initial={{
@@ -37,9 +35,8 @@ export function EmailLoginForm ({ text, callbackUrl, multiAuth }) {
         placeholder='email@example.com'
         required
         autoFocus
-        disabled={disabled}
       />
-      <SubmitButton disabled={disabled} variant='outline-primary' className={styles.providerButton}>{text || 'Login'} with Email</SubmitButton>
+      <SubmitButton variant='outline-primary' className={styles.providerButton}>{text || 'Login'} with Email</SubmitButton>
     </Form>
   )
 }
@@ -79,7 +76,7 @@ export function authErrorMessage (error, signin) {
   return message
 }
 
-const multiAuthProviders = ['Nostr']
+const multiAuthProviders = ['Nostr', 'Phrase', 'Email']
 
 export default function Login ({ providers, callbackUrl, multiAuth, error, text, Header, Footer, signin, domainData }) {
   const [errorMessage, setErrorMessage] = useState(authErrorMessage(error, signin))
@@ -152,17 +149,10 @@ export default function Login ({ providers, callbackUrl, multiAuth, error, text,
         switch (provider.name) {
           case 'Email':
             return (
-              <OverlayTrigger
-                key={provider.id}
-                placement='bottom'
-                overlay={multiAuth ? <Tooltip>not available for account switching yet</Tooltip> : <></>}
-                trigger={['hover', 'focus']}
-              >
-                <div className='w-100' key={provider.id}>
-                  <EmailLoginForm text={text} callbackUrl={callbackUrl} multiAuth={multiAuth} />
-                  <div className='my-3 mt-4 text-center text-muted fw-bold'>or</div>
-                </div>
-              </OverlayTrigger>
+              <div className='w-100' key={provider.id}>
+                <EmailLoginForm text={text} callbackUrl={callbackUrl} multiAuth={multiAuth} />
+                <div className='my-3 mt-4 text-center text-muted fw-bold'>or</div>
+              </div>
             )
           case 'Slashtags':
           case 'Nostr':

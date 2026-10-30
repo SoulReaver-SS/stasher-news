@@ -8,6 +8,9 @@
 import prisma from '../../../api/models'
 import { consumeChallenge } from '../../../api/resolvers/phrase'
 import { getAuthOptions } from '../../../pages/api/auth/[...nextauth]'
+import { getToken, encode } from 'next-auth/jwt'
+import { MULTI_AUTH_LIST, MULTI_AUTH_POINTER, MULTI_AUTH_JWT } from '../../../lib/auth'
+import * as cookie from 'cookie'
 
 jest.mock('../../../api/models', () => ({
   __esModule: true,
@@ -33,9 +36,8 @@ jest.mock('../../../lib/recoveryPhrase', () => ({
 
 jest.mock('../../../lib/auth', () => ({
   __esModule: true,
-  multiAuthMiddleware: jest.fn(async req => req),
-  setMultiAuthCookies: jest.fn(),
-  cookieOptions: jest.fn(() => ({}))
+  ...jest.requireActual('../../../lib/auth'),
+  multiAuthMiddleware: jest.fn(async req => req)
 }))
 
 jest.mock('next-auth/jwt', () => ({
@@ -100,8 +102,51 @@ function phraseAuthorize () {
 
 beforeEach(() => {
   jest.clearAllMocks()
+  getToken.mockResolvedValue(null)
   consumeChallenge.mockResolvedValue(true)
   prisma.user.findUnique.mockResolvedValue(null)
+})
+
+test('adding an existing phrase account authenticates it without modifying either identity', async () => {
+  const existing = { id: 7, name: 'existing' }
+  prisma.user.findUnique.mockResolvedValue(existing)
+  getToken.mockResolvedValue({ id: 42 })
+  const req = makeReq({ signinCookie: true })
+  req.body.multiAuth = 'true'
+
+  await expect(phraseAuthorize()({ k1: 'k1', pubkey: PUBKEY, sig: 'sig' }, req)).resolves.toEqual(existing)
+  expect(prisma.user.create).not.toHaveBeenCalled()
+  expect(prisma.user.update).not.toHaveBeenCalled()
+})
+
+test.each(['email', 'phrase'])('%s login selects the added account while retaining the previous account', async provider => {
+  const previous = { id: 42, name: 'previous', photoId: null }
+  const existing = { id: 7, name: 'existing', photoId: null }
+  const req = {
+    headers: {},
+    cookies: {
+      signin: 'true',
+      [MULTI_AUTH_LIST]: Buffer.from(JSON.stringify([previous])).toString('base64'),
+      [MULTI_AUTH_POINTER]: '42',
+      [MULTI_AUTH_JWT(42)]: 'previous-jwt'
+    }
+  }
+  const headers = []
+  const res = { appendHeader: (name, value) => headers.push([name, value]) }
+  prisma.user.findUnique.mockResolvedValue(existing)
+  encode.mockResolvedValue('existing-jwt')
+
+  const token = await getAuthOptions(req, res).callbacks.jwt({ token: {}, user: existing, account: { provider } })
+  const cookies = Object.assign({}, ...headers.map(([, value]) => cookie.parse(value)))
+
+  expect(token.id).toBe(7)
+  expect(cookies[MULTI_AUTH_POINTER]).toBe('7')
+  expect(cookies[MULTI_AUTH_JWT(7)]).toBe('existing-jwt')
+  expect(JSON.parse(Buffer.from(cookies[MULTI_AUTH_LIST], 'base64').toString())).toEqual([previous, existing])
+  expect(req.cookies[MULTI_AUTH_JWT(42)]).toBe('previous-jwt')
+  expect(cookies[MULTI_AUTH_JWT(42)]).toBeUndefined()
+  expect(prisma.user.create).not.toHaveBeenCalled()
+  expect(prisma.user.update).not.toHaveBeenCalled()
 })
 
 test('login mode with an unregistered phrase throws the distinct no-account error', async () => {
