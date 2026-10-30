@@ -73,6 +73,11 @@ export default gql`
     meMute: Boolean!
     meSubscriptionPosts: Boolean!
     meSubscriptionComments: Boolean!
+
+    """
+    whether this user may generate an API key; only returned to admins, null otherwise
+    """
+    apiKeyEnabled: Boolean
   }
 
   input SettingsInput {

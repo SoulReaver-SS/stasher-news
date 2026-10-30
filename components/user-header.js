@@ -21,6 +21,7 @@ import SubscribeUserDropdownItem from './subscribeUser'
 import ActionDropdown from './action-dropdown'
 import CodeIcon from '@/svgs/terminal-box-fill.svg'
 import MuteDropdownItem from './mute'
+import ApiKeyAdminDropdownItem from './api-key-admin'
 import { hexToBech32 } from '@/lib/nostr'
 import NostrIcon from '@/svgs/nostr.svg'
 import { isNostrEnabled } from '@/lib/nostrFeatures'
@@ -187,6 +188,7 @@ export function NymActionDropdown ({ user, className = 'ms-2' }) {
         <SubscribeUserDropdownItem user={user} target='posts' />
         <SubscribeUserDropdownItem user={user} target='comments' />
         <MuteDropdownItem user={user} />
+        {typeof user.apiKeyEnabled === 'boolean' && <ApiKeyAdminDropdownItem user={user} />}
       </ActionDropdown>
     </div>
   )

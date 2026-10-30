@@ -185,6 +185,7 @@ export const USER_FIELDS = gql`
     meSubscriptionPosts
     meSubscriptionComments
     meMute
+    apiKeyEnabled
 
     optional {
       stacked

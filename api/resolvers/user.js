@@ -25,6 +25,7 @@ import { checkNewsletterConfig, enrollContact, unsubscribeContact } from '@/lib/
 import { decryptEmail } from '@/lib/emailCrypto'
 import { maskEmail } from '@/lib/crypto'
 import { logWarn } from '@/lib/logger'
+import { isAdmin } from './admin'
 
 // The local newsletterOptIn flag is the source of truth; this best-effort push
 // keeps Resend in step immediately (the daily newsletterSync reconcile
@@ -968,6 +969,13 @@ export default {
       if (typeof user.meMute !== 'undefined') return user.meMute
 
       return await isMuted({ models, muterId: me.id, mutedId: user.id })
+    },
+    apiKeyEnabled: async (user, args, { me, models }) => {
+      if (!isAdmin(me)) return null
+      if (typeof user.apiKeyEnabled === 'boolean') return user.apiKeyEnabled
+
+      const row = await models.user.findUnique({ where: { id: Number(user.id) }, select: { apiKeyEnabled: true } })
+      return row?.apiKeyEnabled ?? null
     },
     since: async (user, args, { models }) => {
       // get the user's first item
