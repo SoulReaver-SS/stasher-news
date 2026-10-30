@@ -1,6 +1,38 @@
 /* eslint-env jest */
-import { settingsSchema, territorySchema, filterXmrValidator, bountySchema } from '@/lib/validate'
-import { BOUNTY_MIN_PICONEROS } from '@/lib/constants'
+import { settingsSchema, territorySchema, filterXmrValidator, bountySchema, actSchema, validateSchema } from '@/lib/validate'
+import { BOUNTY_MIN_PICONEROS, BOOST_MIN, BOOST_MAX } from '@/lib/constants'
+import { GqlInputError, E_BAD_INPUT } from '@/lib/error'
+import { formatGraphqlError } from '@/lib/formatGraphqlError'
+
+describe('validateSchema input errors (#23)', () => {
+  it('rethrows a yup failure as GqlInputError with the field path', async () => {
+    const err = await validateSchema(actSchema, { piconeros: BOOST_MIN - 1, act: 'BOOST' }).catch(e => e)
+    expect(err).toBeInstanceOf(GqlInputError)
+    expect(err.extensions.code).toBe(E_BAD_INPUT)
+    expect(err.message).toBe('piconeros: must be at least 0.001 XMR')
+  })
+  it('is not masked as an internal server error in prod', async () => {
+    const err = await validateSchema(actSchema, { piconeros: BOOST_MIN - 1, act: 'BOOST' }).catch(e => e)
+    const formatted = formatGraphqlError(
+      { message: err.message, extensions: err.extensions },
+      err,
+      { isProd: true, logError: () => {} }
+    )
+    expect(formatted.message).toBe('piconeros: must be at least 0.001 XMR')
+    expect(formatted.extensions.code).toBe(E_BAD_INPUT)
+  })
+  it('passes valid data through', async () => {
+    await expect(validateSchema(actSchema, { piconeros: BOOST_MIN, act: 'BOOST' }))
+      .resolves.toEqual(expect.objectContaining({ piconeros: BOOST_MIN }))
+  })
+})
+
+describe('boost bounds are reported in XMR (#23)', () => {
+  it('min and max messages use XMR, not sats', async () => {
+    await expect(actSchema.validate({ piconeros: BOOST_MIN - 1, act: 'BOOST' })).rejects.toThrow('must be at least 0.001 XMR')
+    await expect(actSchema.validate({ piconeros: BOOST_MAX + 1, act: 'BOOST' })).rejects.toThrow('must be less than or equal to 1 XMR')
+  })
+})
 
 describe('settingsSchema piconero server bounds', () => {
   it('accepts the -0.1 XMR floor, the posting-fee default, and 0 comments filter', async () => {
