@@ -12,7 +12,8 @@ import { useToast } from './toast'
 import { useMe } from './me'
 import { canUseBoostCreditOnItem } from '@/lib/boost-credit'
 import { BOOST_CREDIT_PICONEROS } from '@/lib/quests'
-import { piconerosToMXmr, piconerosToMXmrDual, xmrToPiconeros } from '@/lib/format'
+import { piconerosToMXmr, piconerosToMXmrDual, piconerosToXmr, xmrToPiconeros } from '@/lib/format'
+import { BOOST_MIN } from '@/lib/constants'
 import BoostIcon from '@/svgs/arrow-up-double-line.svg'
 import MXmrHint from './mxmr-hint'
 
@@ -144,6 +145,10 @@ export default function BoostModal ({ item, onClose }) {
       piconeros = Number(xmrToPiconeros(String(amount)))
     } catch {
       toaster.danger('enter a valid XMR amount (min 0.001)')
+      return
+    }
+    if (piconeros < BOOST_MIN) {
+      toaster.danger(`boost must be at least ${piconerosToXmr(BigInt(BOOST_MIN))}`)
       return
     }
     if (submittingRef.current || lostCreditRef.current) return
