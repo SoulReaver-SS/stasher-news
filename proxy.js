@@ -9,6 +9,7 @@ import {
   DOMAINS_AUTH_VERIFIER_TTL_S
 } from '@/lib/domains/auth'
 import { getDomainMapping, createDomainsDebugLogger } from '@/lib/domains'
+import { onionLocationFor } from '@/lib/onion'
 import { GATE_COOKIE, shouldGateRequest } from '@/lib/invite-gate'
 
 const REFERRER_TTL_S = 60 * 60 * 24
@@ -301,6 +302,15 @@ export async function proxy (req) {
     const domainResp = await customDomainMiddleware(request, domain, mapping.subName)
     // apply referrer cookies to the custom domain response
     resp = applyReferrerCookies(domainResp, resp)
+  } else {
+    const onionLocation = onionLocationFor({
+      onionUrl: process.env.ONION_URL,
+      host: domain,
+      mainUrl: process.env.NEXT_PUBLIC_URL,
+      pathname: request.nextUrl.pathname,
+      search: request.nextUrl.search
+    })
+    if (onionLocation) resp.headers.set('Onion-Location', onionLocation)
   }
 
   return applySecurityHeaders(resp)
